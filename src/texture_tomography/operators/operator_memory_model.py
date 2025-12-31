@@ -63,14 +63,11 @@ class OperatorMemoryModel:
 
         # PF GPU inputs (persistent, per material)
         for i_mat in range(self.N_mat):
-            dims = self.op.pf_dims_list[i_mat]
-            R, C, P, K, G = (
-                dims["R"],
-                dims["C"],
-                dims["P"],
-                dims["K"],
-                dims["G"],
-            )
+            R = self.N_rot
+            C = self.N_chi
+            K = self.op.K_list[i_mat]
+            P = self.op.N_peaks_list[i_mat]
+            G = len(self.op.pf_sym_ops_cpu_list[i_mat])
 
             mem.alloc(f"pf_coords[{i_mat}]", (R, C, P, 3))
             mem.alloc(f"pf_grid_inv[{i_mat}]", (K, 9))
@@ -281,17 +278,10 @@ class OperatorMemoryModel:
         op = self.op
 
         # ---------------- constants / shapes ----------------
-        R = op.N_rot
         Mx = op.Nx
-        K_i = op.K_list[i_mat]
-
-        idx_size = op.full_idx_list[i_mat].size
-        Nsub = int(idx_size)
-
-        dims = op.pf_dims_list[i_mat]
-        C = int(dims["C"])
-        P = int(dims["P"])
-
+        R = self.N_rot
+        C = self.N_chi
+        P = self.op.N_peaks_list[i_mat]
         # ---------------- batching plan ----------------
         batches = op.get_pf_batches_for_material(i_mat)
 
@@ -353,9 +343,7 @@ class OperatorMemoryModel:
         R = op.N_rot
         C = op.N_chi
         T = op.N_theta_mask_list[i_mat]   # masked theta count
-
-        dims = op.pf_dims_list[i_mat]
-        P = int(dims["P"])
+        P = self.op.N_peaks_list[i_mat]
 
         # ---- Gaussian weights GPU buffer ----
         mem.alloc(
@@ -468,9 +456,8 @@ class OperatorMemoryModel:
 
         Nsub = int(op.full_idx_list[i_mat].size)
 
-        dims = op.pf_dims_list[i_mat]
-        C = int(dims["C"])
-        P = int(dims["P"])
+        C = self.N_chi
+        P = self.op.N_peaks_list[i_mat]
 
         # ---------------- out_gpu (returned to caller) ----------------
         # In the real code: out_gpu = clarray.empty(...); returned to adjoint_cl
