@@ -247,6 +247,52 @@ class OrientationTree:
             indices = [i for i in indices if self.nodes[i].active]
         return np.array([self.nodes[i].score for i in indices])
 
+    @classmethod
+    def from_rotation_matrices(
+        cls,
+        R_mats: np.ndarray,
+        sigma: float,
+    ):
+        """
+        Initialize an OrientationTree from a given set of orientation matrices.
+
+        Parameters
+        ----------
+        R_mats : (N, 3, 3) ndarray
+            Rotation matrices.
+        sigma : float
+            Sigma value assigned to all orientations (level 0).
+
+        Returns
+        -------
+        tree : OrientationTree
+        """
+        if R_mats.ndim != 3 or R_mats.shape[1:] != (3, 3):
+            raise ValueError("R_mats must have shape (N, 3, 3)")
+
+        rotations = Rotation.from_matrix(R_mats)
+
+        tree = cls(sigma_levels=[sigma])
+
+        for R in rotations:
+            node = OrientationNode(
+                R=R,
+                level=0,
+                sigma=sigma,
+                parent=None,
+                children=[],
+                active=True,
+            )
+            idx = len(tree.nodes)
+            tree.nodes.append(node)
+            tree.levels[0].append(idx)
+
+        return tree
+
+
+
+
+
 
 
 def generate_hopf_grid_fzone(material, grid_resolution_parameter, kernel_sigma):

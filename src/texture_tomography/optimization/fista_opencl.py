@@ -242,6 +242,7 @@ class FISTAOpenCL:
                 Ax = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
                 r  = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
 
+
             self.op.direct_cl(y, Ax)
             q.finish()
 

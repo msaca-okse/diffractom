@@ -1,14 +1,6 @@
-# odf_sh_image_operator.py
-from typing import Optional, Sequence, Tuple
-from numpy.typing import NDArray
 import numpy as np
-import h5py
 import time
-import os
 import gc
-
-from cil.framework import ImageGeometry, ImageData, BlockDataContainer, AcquisitionGeometry, AcquisitionData
-from cil.optimisation.operators import LinearOperator
 
 
 import pyopencl as cl
@@ -19,11 +11,7 @@ from pyclblast import gemmStridedBatched
 
 from scipy.spatial.transform import Rotation as R
 from pole_figure_geometry import GeometryContainerM
-from odftt.texture import grids, odfs, point_groups
-from package.utils.lattice import (
-    cubic, tetragonal, orthorhombic, hexagonal,
-    trigonal_rhombohedral, monoclinic, triclinic
-)
+
 from package.utils.coordinates import get_probed_coordinates
 
 from package.texture_tomography.operators.create_pfo_matrix import (
@@ -35,7 +23,7 @@ from package.texture_tomography.operators.pfo_kernels import build_all_opencl
 
 
 
-class PFO_OPENCL_BATCHED(LinearOperator):
+class PFO_OPENCL_BATCHED:
 
     def __init__(
         self,
@@ -47,11 +35,6 @@ class PFO_OPENCL_BATCHED(LinearOperator):
     ):
         
 
-        # -------------------------
-        # Memory planning (NO allocations)
-        # -------------------------
-
-
         self.cfg = cfg
         self.materials = materials
         self.grids = grids
@@ -59,17 +42,12 @@ class PFO_OPENCL_BATCHED(LinearOperator):
         self.peak_width = self.cfg['peak_width']
         self.verbose = verbose
 
-
-        # Shapes from SH projection matrix
-        #N_rot, K, N_chi, N_theta = map(int, B_matrix.shape)
         self.N_chi = self.cfg['N_chi']
         self.N_theta = len(two_thetas)
         self.N_seg = self.N_theta * self.N_chi
         self.Nx = self.cfg['Nx']
         self.Ny = self.cfg['Ny']
         self.N_rot = self.cfg['N_rot']
-        self.kernel_sigma = self.cfg['kernel_sigma']
-        self.grid_resolution_parameter = self.cfg["grid_resolution_parameter"]
         self.angle_range = np.array(self.cfg['angle_range'])/180*np.pi
         self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_rot, endpoint=True)
         self.N_mat = len(self.materials)
@@ -83,27 +61,6 @@ class PFO_OPENCL_BATCHED(LinearOperator):
         self.prg, self.k, self.pf_prg = build_all_opencl(self.ctx, ts=16)
         self.pf_prg = build_pf_program(self.ctx)
         self.pfmatrix_eval_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval")
-
-        # --- expose kernels under the SAME NAMES as before ---
-        # self.expand_kernel = k.expand_kernel
-        # self.transpose_kernel = k.transpose_kernel
-        # self.accumulate_kernel = k.accumulate_kernel
-        # self.gather_kernel = k.gather_kernel
-        # self.btranspose_kernel = k.btranspose_kernel
-        # self.transpose_r_mx_k_to_k_r_mx_kernel = k.transpose_r_mx_k_to_k_r_mx_kernel
-        # self.gather_coeffs_kernel = k.gather_coeffs_kernel
-        # self.transpose_d_omega_k_f_to_c = k.transpose_d_omega_k_f_to_c
-        # self.slice_k_lastaxis_f = k.slice_k_lastaxis_f
-        # self.transpose_omega_d_k_c_to_d_omega_k_f = k.transpose_omega_d_k_c_to_d_omega_k_f
-        # self.scatter_k_lastaxis_f = k.scatter_k_lastaxis_f
-        # self.SLICE_COEFFS_K_BATCH = k.SLICE_COEFFS_K_BATCH
-        # self.SLICE_GRIDINV_K_BATCH = k.SLICE_GRIDINV_K_BATCH
-        # self.SCALE_PF_BY_INTENSITY_INPLACE = k.SCALE_PF_BY_INTENSITY_INPLACE
-        # self.scatter_k_batch_c = k.scatter_k_batch_c
-
-
-
-
 
 
         self.transfer_material_parameters_to_gpu()
@@ -572,53 +529,6 @@ class PFO_OPENCL_BATCHED(LinearOperator):
     def set_peak_width(self, peak_width):
         self.peak_width = peak_width
 
-    def set_kernel_sigma(self, kernel_sigma):
-        self.kernel_sigma = kernel_sigma
-
-
-    def forward_kernel_width(self, coeffs_gpu_full, peak_width = None, kernel_sigma = None, coefficient_constant = None):
-        """
-        Allocating convenience wrapper for the OpenCL forward operator.
-
-        Returns
-        -------
-        yin_gpu : clarray
-            Shape (N_rot, Nx, N_seg), C order
-        """
-        # save the old parameters
-        old_peak_width = self.peak_width
-        old_kernel_sigma = self.kernel_sigma
-
-        if peak_width is not None:
-            self.set_peak_width(peak_width=peak_width)
-
-        if kernel_sigma is not None:
-            self.set_kernel_sigma(kernel_sigma=kernel_sigma)
-
-        self.set_material_lists()
-        self.allocate_out_buffer()
-        self.allocate_coefficient_buffer()
-
-        if coefficient_constant is not None:
-            coeffs_gpu_full *= np.float32(coefficient_constant)
-
-
-        yin_gpu = clarray.zeros(
-            self.queue,
-            (self.N_rot, self.Nx, self.N_chi * self.N_theta),
-            dtype=np.float32,
-            order="C",
-        )
-
-        self.direct_cl(coeffs_gpu_full, yin_gpu)
-
-        if peak_width is not None:
-            self.set_peak_width(peak_width=old_peak_width)
-
-        if kernel_sigma is not None:
-            self.set_kernel_sigma(kernel_sigma=old_kernel_sigma)
-
-        return yin_gpu
 
 
     def direct(self, coeffs_gpu_full):
@@ -688,7 +598,6 @@ class PFO_OPENCL_BATCHED(LinearOperator):
 
         coeffs_gpu_full_sino = self._coeffs_gpu_full_sino
         coeffs_gpu_full_sino.fill(0)
-
         gratopy.forwardprojection(
             coeffs_gpu_full,
             self.PS,
