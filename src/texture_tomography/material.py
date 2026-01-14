@@ -328,6 +328,64 @@ class Material:
         self.h_vecs_normed = self.h_vecs / (norms + 1e-12)
 
 
+    # def compute_h_vectors(self):
+    #     B = self._compute_reciprocal_lattice_matrix()
+
+    #     hkl_list = []
+    #     h_vecs = []
+
+    #     def fcc_allowed(h,k,l):
+    #         return (h&1) == (k&1) == (l&1)
+
+    #     def canonical_friedel(h,k,l):
+    #         v = np.array([h,k,l],dtype=int)
+    #         for i in range(3):
+    #             if v[i] != 0:
+    #                 if v[i] < 0:
+    #                     v = -v
+    #                 break
+    #         return tuple(v.tolist())
+
+    #     seen = set()
+
+    #     for r in self.reflections:
+    #         raw_hkl = r["hkl"]
+
+    #         if len(raw_hkl) == 4:
+    #             hkl = self._hkil_to_hkl(raw_hkl)
+    #         else:
+    #             hkl = np.asarray(raw_hkl, dtype=float)
+
+    #         hkl = np.round(hkl).astype(int)
+    #         h,k,l = hkl
+
+    #         # remove origin
+    #         if h==0 and k==0 and l==0:
+    #             continue
+
+    #         # FCC extinction
+    #         if not fcc_allowed(h,k,l):
+    #             continue
+
+    #         # Friedel merge (optional but recommended for PF)
+    #         key = canonical_friedel(h,k,l)
+    #         if key in seen:
+    #             continue
+    #         seen.add(key)
+
+    #         h_vec = B @ np.array([h,k,l],dtype=float)
+
+    #         hkl_list.append([h,k,l])
+    #         h_vecs.append(h_vec)
+
+    #     self.hkl = np.asarray(hkl_list, dtype=int)
+    #     self.h_vecs = np.asarray(h_vecs, dtype=float)
+
+    #     norms = np.linalg.norm(self.h_vecs, axis=1, keepdims=True)
+    #     self.h_vecs_normed = self.h_vecs / (norms + 1e-12)
+
+
+
 
     def attach_point_group(self, point_group_map):
             """

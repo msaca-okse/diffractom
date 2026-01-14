@@ -238,11 +238,10 @@ class FISTAHuberOpenCL:
             raise ValueError("out_gpu context != operator context")
 
         # ---- persistent buffers ----
-        x = clarray.empty(q, x0_gpu.shape, dtype=np.float32, order="F")
-        y = clarray.empty(q, x0_gpu.shape, dtype=np.float32, order="F")
-        x_old = clarray.empty(q, x0_gpu.shape, dtype=np.float32, order="F")
-        v = clarray.empty(q, x0_gpu.shape, dtype=np.float32, order="F")
-        grad = clarray.empty(q, x0_gpu.shape, dtype=np.float32, order="F")
+        x = x0_gpu
+        y = clarray.empty(q, x.shape, dtype=np.float32, order="F")
+        x_old = clarray.empty(q, x.shape, dtype=np.float32, order="F")
+        grad = clarray.empty(q, x.shape, dtype=np.float32, order="F")
 
         # TV buffers: allocate once per run, reuse each iter
         if self.prox_kind == "nonneg_tv":
@@ -256,26 +255,13 @@ class FISTAHuberOpenCL:
             }
 
         # copy x0 -> x,y,x_old
-        total_x = np.int32(x0_gpu.size)
-        self.k_copy_buf(q, (int(total_x),), None, x0_gpu.data, x.data, total_x)
-        self.k_copy_buf(q, (int(total_x),), None, x0_gpu.data, y.data, total_x)
-        self.k_copy_buf(q, (int(total_x),), None, x0_gpu.data, x_old.data, total_x)
-        q.finish()
+        total_x = np.int32(x.size)
+        self.k_copy_buf(q, (int(total_x),), None, x.data, y.data, total_x)
+        self.k_copy_buf(q, (int(total_x),), None, x.data, x_old.data, total_x)
 
         Ax = None
-        r = None
         t = 1.0
 
-        # timers (optional)
-        t_forward = 0.0
-        t_residual = 0.0
-        t_adjoint = 0.0
-        t_gradstep = 0.0
-        t_prox = 0.0
-        t_extrap = 0.0
-        t_obj = 0.0
-
-        t_total_start = time.perf_counter()
         # ---- diagnostics storage (always collected) ----
         self.iter_stats = []   # list of dicts, one per iteration
         self.final_stats = {}  # summary at the end
@@ -283,19 +269,13 @@ class FISTAHuberOpenCL:
 
         for it in range(niter):
             # ---- Ax = A(y) ----
-            t0 = time.perf_counter()
             if Ax is None:
                 Ax = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
-                r_raw = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
                 r  = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
 
             self.op.direct_cl(y, Ax)
-            q.finish()
-
-            t_forward += time.perf_counter() - t0
 
 
-            # ---- r = Ax - b ----
             # ---- r = Ax - b ----
             total_Ax = np.int32(Ax.size)
             self.k_residual_axpb(
@@ -303,11 +283,6 @@ class FISTAHuberOpenCL:
                 Ax.data, out_gpu.data, r.data,
                 total_Ax
             )
-            q.finish()
-
-            self.k_copy_buf(q, (int(total_Ax),), None, r.data, r_raw.data, total_Ax)
-            q.finish()
-
 
             # ---- huber: r <- clip(r, -delta, +delta) ----
             self.k_huber_clip_inplace(
@@ -316,75 +291,43 @@ class FISTAHuberOpenCL:
                 np.float32(self.huber_delta),
                 total_Ax
             )
-            q.finish()
-
 
             # ---- grad = A*(r) ----
-            t0 = time.perf_counter()
             self.op.adjoint_cl(r, grad)  # (Nx,Ny,K) Fortran
-            q.finish()
-            t_adjoint += time.perf_counter() - t0
-
 
             # ---- v = y - tau*grad ----
-            t0 = time.perf_counter()
             total_x = np.int32(y.size)
             self.k_grad_step(
                 q, (int(total_x),), None,
-                y.data, grad.data, v.data,
+                y.data, grad.data, y.data,   # in-place update of y
                 np.float32(self.tau),
                 total_x
             )
-            q.finish()
-            t_gradstep += time.perf_counter() - t0
 
             # ---- prox: apply in-place on v, then copy v -> x ----
-            t0 = time.perf_counter()
-            self._apply_prox(v)   # MUST modify v in-place and return v
-            q.finish()
-
-            self.k_copy_buf(q, (int(total_x),), None, v.data, x.data, total_x)
-            q.finish()
-            t_prox += time.perf_counter() - t0
+            self._apply_prox(y)   # MUST modify v in-place and return v
+            self.k_copy_buf(q, (int(total_x),), None, y.data, x.data, total_x)
 
             # ---- momentum update ----
             t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
             beta = (t - 1.0) / t_new
 
-            # ---- y = x + beta*(x - x_old) ----
-            t0 = time.perf_counter()
             self.k_extrapolate(
                 q, (int(total_x),), None,
                 x.data, x_old.data, y.data,
                 np.float32(beta),
                 total_x
             )
-            q.finish()
-            t_extrap += time.perf_counter() - t0
 
             # ---- x_old <- x ----
             self.k_copy_buf(q, (int(total_x),), None, x.data, x_old.data, total_x)
 
             t = t_new
 
-            # ---- diagnostics ----
-            t0 = time.perf_counter()
 
-            # ---- Huber data term ----
-            tmp = clarray.empty(q, r.shape, dtype=np.float32, order="C")
-
-            total_r = np.int32(r.size)
-            self.k_huber_loss(
-                q, (int(total_r),), None,
-                r.data,
-                tmp.data,
-                np.float32(self.huber_delta),
-                total_r
-            )
-            q.finish()
-
-            fval = float(clarray.sum(tmp).get())
-            del tmp
+            # ---- L2 data term ----
+            r2 = float(np.dot(Ax.get().ravel(), Ax.get().ravel()))
+            fval = 0.5 * float(r2)
 
 
             gval = 0.0
@@ -423,8 +366,6 @@ class FISTAHuberOpenCL:
             if self.prox_kind == "nonneg_tv":
                 tv_res = self._last_tv_residual
 
-            t_obj += time.perf_counter() - t0
-
             # ---- store per-iteration stats ----
             self.iter_stats.append({
                 "iter": it + 1,
@@ -453,22 +394,6 @@ class FISTAHuberOpenCL:
                 )
 
 
-        total_time = time.perf_counter() - t_total_start
-
-        if verbose:
-            print("\n=== FISTA(OpenCL) TIMING SUMMARY ===")
-            print(f"forward (A) total     : {t_forward:.4f} s")
-            print(f"residual total        : {t_residual:.4f} s")
-            print(f"adjoint (A*) total    : {t_adjoint:.4f} s")
-            print(f"grad step total       : {t_gradstep:.4f} s")
-            print(f"prox total            : {t_prox:.4f} s")
-            print(f"extrap total          : {t_extrap:.4f} s")
-            print(f"diagnostics total     : {t_obj:.4f} s")
-            print("-----------------------------------")
-            print(f"TOTAL                 : {total_time:.4f} s")
-            print("===================================\n")
-
-
                 # ---- final summary stats ----
         self.final_stats = {
             "niter": niter,
@@ -477,17 +402,4 @@ class FISTAHuberOpenCL:
             "final_obj": self.iter_stats[-1]["obj"],
             "final_xnorm": self.iter_stats[-1]["xnorm"],
             "final_gradnorm": self.iter_stats[-1]["gradnorm"],
-            "total_time": total_time,
-            "timing": {
-                "forward": t_forward,
-                "residual": t_residual,
-                "adjoint": t_adjoint,
-                "grad_step": t_gradstep,
-                "prox": t_prox,
-                "extrap": t_extrap,
-                "diagnostics": t_obj,
-            },
         }
-
-
-        return x

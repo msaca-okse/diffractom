@@ -11,6 +11,7 @@
 // slice_k_lastaxis_f
 // scatter_k_lastaxis_f
 // SLICE_COEFFS_K_BATCH
+// SLICE_COEFFS_K_BATCH_F
 // SLICE_GRIDINV_K_BATCH
 // SCALE_PF_BY_INTENSITY_INPLACE
 // scatter_k_batch_c
@@ -397,6 +398,33 @@ __kernel void SLICE_COEFFS_K_BATCH(
     COEFFS_OUT[(r * Mx + x) * K_OUT + k] =
         COEFFS_IN[(r * Mx + x) * K_IN + kin];
 }
+
+__kernel void SLICE_COEFFS_K_BATCH_F(
+    __global const float *COEFFS_IN,   // (Nx, Ny, K_IN), Fortran order
+    __global float *COEFFS_OUT,        // (Nx, Ny, K_OUT), Fortran order
+    const int Nx,
+    const int Ny,
+    const int K_IN,
+    const int K_OUT,
+    const int K_START
+){
+    int gid = get_global_id(0);
+
+    int plane_size = Nx * Ny;
+    int total = plane_size * K_OUT;
+    if (gid >= total) return;
+
+    int k = gid / plane_size;
+    int rem = gid % plane_size;
+
+    int kin = k + K_START;
+
+    // Fortran-order flattening:
+    // idx = i + Nx * (j + Ny * k)
+    COEFFS_OUT[rem + plane_size * k] =
+        COEFFS_IN[rem + plane_size * kin];
+}
+
 
 
 __kernel void SLICE_GRIDINV_K_BATCH(

@@ -52,6 +52,7 @@ def bind_pfo_kernels(prg: cl.Program):
 
     # ---- PF batching helpers ----
     k.SLICE_COEFFS_K_BATCH = prg.SLICE_COEFFS_K_BATCH
+    k.SLICE_COEFFS_K_BATCH_F = prg.SLICE_COEFFS_K_BATCH_F
     k.SLICE_GRIDINV_K_BATCH = prg.SLICE_GRIDINV_K_BATCH
     k.SCALE_PF_BY_INTENSITY_INPLACE = prg.SCALE_PF_BY_INTENSITY_INPLACE
 
