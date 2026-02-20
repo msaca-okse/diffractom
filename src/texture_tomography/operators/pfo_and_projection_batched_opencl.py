@@ -1,5 +1,4 @@
 import numpy as np
-import time
 import gc
 
 
@@ -10,15 +9,8 @@ from pyclblast import gemmStridedBatched
 
 
 from scipy.spatial.transform import Rotation as R
-from pole_figure_geometry import GeometryContainerM
-
-from package.utils.coordinates import get_probed_coordinates
-
-from package.texture_tomography.operators.create_pfo_matrix import (
-    pfmatrix_eval_gpu,
-    build_pf_program
-)
-from package.texture_tomography.operators.pfo_kernels import build_all_opencl
+from .create_pfo_matrix import build_pf_program
+from .pfo_kernels import build_all_opencl
 
 
 
@@ -31,8 +23,20 @@ class PFO_OPENCL_BATCHED:
         materials: None,
         grids: None,
         two_thetas: None,
+        max_gb: None,
         verbose: bool = False,
+        ctx=None,
+        queue=None,
     ):
+
+        # --- context / queue ---
+        if ctx is not None and queue is not None:
+            self.ctx = ctx
+            self.queue = queue
+        else:
+            self.ctx = cl.create_some_context(interactive=False)
+            self.queue = cl.CommandQueue(self.ctx)
+
         
 
         self.cfg = cfg
@@ -49,13 +53,11 @@ class PFO_OPENCL_BATCHED:
         self.Ny = self.cfg['Ny']
         self.N_rot = self.cfg['N_rot']
         self.angle_range = np.array(self.cfg['angle_range'])/180*np.pi
-        self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_rot, endpoint=True)
+        self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_rot, endpoint=False)
         self.N_mat = len(self.materials)
+        self.pf_batch_max_gb = float(max_gb)
 
 
-        # --- context / queue ---
-        self.ctx = cl.create_some_context(interactive=False)
-        self.queue = cl.CommandQueue(self.ctx)
 
         # --- build kernels ---
         self.prg, self.k, self.pf_prg = build_all_opencl(self.ctx, ts=16)
@@ -66,7 +68,7 @@ class PFO_OPENCL_BATCHED:
         self.transfer_material_parameters_to_gpu()
         self.detector_coordinates()
         self.transfer_grid_parameters_to_gpu()
-        self.set_convolution_masks()
+        self.get_pf_batches_for_material()
 
         self.K_sum  = int(self.K_list.sum())
 
@@ -87,80 +89,85 @@ class PFO_OPENCL_BATCHED:
         assert self.queue.context.int_ptr == self.ctx.int_ptr
 
 
-
-        # Allocate buffers
-        self.allocate_out_buffer()
         self.allocate_coefficient_buffer()
 
 
-    def detector_coordinates(self):
+    def detector_coordinates(self, integration_samples=1, full_circle_covered=True):
+        """ Calculates and returns the probed polar and azimuthal coordinates on the unit sphere at
+        each angle of projection and for each detector segment in the system's geometry.
+        """
         wavelength_angstrom = 12.398 / self.cfg["wavelength"]
+        self.two_theta_peaks = 2.0 * np.arcsin(
+            np.linalg.norm(self.h_cpu, axis=1) / (4.0 * np.pi) * wavelength_angstrom
+        ).astype(np.float32)
 
-        j0 = np.asarray(self.cfg["j_direction_0"])
-        k0 = np.asarray(self.cfg["k_direction_0"])
-        p0 = np.asarray(self.cfg["p_direction_0"])
-        det_o = np.asarray(self.cfg["detector_direction_origin"])
-        det_p90 = np.asarray(self.cfg["detector_direction_positive_90"])
+        coords_list = []
+        for tt in self.two_theta_peaks:
 
-        # ---------------- rotations ----------------
-        projections = {
-            str(i): {
-                "rotation_matrix": R.from_rotvec(
-                    angle * k0 / np.linalg.norm(k0)
-                ).as_matrix()
-            }
-            for i, angle in enumerate(self.angles)
-        }
+            probed_directions_zero_rot = np.zeros((self.N_chi, integration_samples, 3))
+            # Impose symmetry if needed.
+            if not full_circle_covered:
+                shift = np.pi
+            else:
+                shift = 0
+            det_bin_middles_extended = np.linspace(0, 2*np.pi, self.N_chi, endpoint=False)
+            det_bin_middles_extended = np.insert(det_bin_middles_extended, 0, det_bin_middles_extended[-1] + shift)
+            det_bin_middles_extended = np.append(det_bin_middles_extended, det_bin_middles_extended[1] + shift)
 
-        detector_angles = np.linspace(0, 2*np.pi, self.N_chi, endpoint=False)
+            for ii in range(self.N_chi):
 
-        geom_dict = {
-            "projections": projections,
-            "p_direction_0": p0,
-            "j_direction_0": j0,
-            "k_direction_0": k0,
-            "detector_direction_origin": det_o,
-            "detector_direction_positive_90": det_p90,
-            "detector_angles": detector_angles,
-        }
+                # Check if the interval from the previous to the next bin goes over the -pi +pi discontinuity
+                before = det_bin_middles_extended[ii]
+                now = det_bin_middles_extended[ii + 1]
+                after = det_bin_middles_extended[ii + 2]
 
-        self.pf_coords_cpu_list = []
-        self.pf_coords_gpu_list = []
+                if abs(before - now + 2 * np.pi) < abs(before - now):
+                    before = before + 2 * np.pi
+                elif abs(before - now - 2 * np.pi) < abs(before - now):
+                    before = before - 2 * np.pi
 
-        for i_mat in range(self.N_mat):
-    
+                if abs(now - after + 2 * np.pi) < abs(now - after):
+                    after = after - 2 * np.pi
+                elif abs(now - after - 2 * np.pi) < abs(now - after):
+                    after = after + 2 * np.pi
 
-            h_cpu = self.pf_h_cpu_list[i_mat]
+                # Generate a linearly spaced set of angles covering the detector segment
+                start = 0.5 * (before + now)
+                end = 0.5 * (now + after)
+                inc = (end - start) / integration_samples
+                angles = np.linspace(start + inc / 2, end - inc / 2, integration_samples)
 
-            two_theta_peaks = 2.0 * np.arcsin(
-                np.linalg.norm(h_cpu, axis=1) / (4.0 * np.pi) * wavelength_angstrom
-            ).astype(np.float32)
+                # Make the zero-rotation-frame vectors corresponding to the given angles
+                probed_directions_zero_rot[ii, :, :] = np.cos(angles[:, np.newaxis]) * \
+                    np.array(self.cfg["detector_direction_origin"])[np.newaxis,:]
 
+                probed_directions_zero_rot[ii, :, :] += np.sin(angles[:, np.newaxis]) * \
+                    np.array(self.cfg["detector_direction_positive_90"])[np.newaxis,:]
 
+            twothetahalf = tt/2
 
-            # ---------------- probed coordinates ----------------
-            coords_list = []
-            for tt in two_theta_peaks:
-                geom_dict["two_theta"] = np.array([tt])
-                geom = GeometryContainerM(
-                    dictionary=geom_dict,
-                    data_type="dictionary"
-                ).geometry
-                coords = get_probed_coordinates(geom)[:, :, 0, :]
-                coords_list.append(coords)
+            probed_directions_zero_rot = +probed_directions_zero_rot * np.cos(twothetahalf)\
+                - np.sin(twothetahalf) * np.array(self.cfg['p_direction_0'])
+            probed_direction_vectors = np.zeros((self.N_rot, self.N_chi, integration_samples, 3), dtype=np.float64)
+            k0 = np.asarray(self.cfg["k_direction_0"])
+            Rmats = R.from_rotvec(self.angles[:, None] * k0).as_matrix()
+            probed_direction_vectors[...] = \
+                np.einsum('kij,mli->kmlj', Rmats, probed_directions_zero_rot)
 
-            coords_cpu = np.stack(coords_list, axis=-1)
-            coords_cpu = coords_cpu.transpose((0, 1, 3, 2))
-            coords_cpu = np.asarray(coords_cpu, dtype=np.float32, order="C")
-            coords_gpu = clarray.to_device(self.queue, coords_cpu)
+            coords = probed_direction_vectors[:,:,0,:]
+            coords_list.append(coords)
 
-            self.pf_coords_cpu_list.append(coords_cpu)
-            self.pf_coords_gpu_list.append(coords_gpu)
+        coords_cpu = np.stack(coords_list, axis=-1)
+        coords_cpu = coords_cpu.transpose((0, 1, 3, 2))
+        self.coords_cpu = np.asarray(coords_cpu, dtype=np.float32, order="C")
+        self.coords_gpu = clarray.to_device(self.queue, self.coords_cpu)
+
 
 
 
     def transfer_material_parameters_to_gpu(self):
-        self.pf_h_gpu_list = []
+        self.pf_h_gpu_normed_list = []
+        self.pf_h_cpu_normed_list = []
         self.pf_h_cpu_list = []
         self.pf_intensity_gpu_list = []
         self.pf_intensity_cpu_list = []
@@ -171,9 +178,11 @@ class PFO_OPENCL_BATCHED:
 
         for mat in self.materials:
             # ---- normalized reciprocal lattice vectors ----
-            h_cpu = np.asarray(mat.h_vecs_normed, dtype=np.float32, order="C")
-            h_gpu = clarray.to_device(self.queue, h_cpu)
-            self.pf_h_gpu_list.append(h_gpu)
+            h_cpu_normed = np.asarray(mat.h_vecs_normed, dtype=np.float32, order="C")
+            h_cpu = np.asarray(mat.h_vecs, dtype=np.float32, order="C")
+            h_gpu_normed = clarray.to_device(self.queue, h_cpu_normed)
+            self.pf_h_gpu_normed_list.append(h_gpu_normed)
+            self.pf_h_cpu_normed_list.append(h_cpu_normed)
             self.pf_h_cpu_list.append(h_cpu)
 
             # ---- peak intensities ----
@@ -199,7 +208,7 @@ class PFO_OPENCL_BATCHED:
         from OrientationTree objects to GPU.
         """
 
-        self.pf_grid_inv_gpu_list = []
+        self.grid_inv_gpu_list = []
         self.sigma_cpu_list = []
         self.K_list = []
 
@@ -217,7 +226,7 @@ class PFO_OPENCL_BATCHED:
             ).astype(np.float32)
 
             grid_inv_gpu = clarray.to_device(self.queue, grid_inv_cpu)
-            self.pf_grid_inv_gpu_list.append(grid_inv_gpu)
+            self.grid_inv_gpu_list.append(grid_inv_gpu)
 
             # --- sigma per node ---
             sigma_cpu = np.array(
@@ -237,118 +246,179 @@ class PFO_OPENCL_BATCHED:
 
 
 
-
-
-    def allocate_out_buffer(self):
-        # Allocate buffer for forward computation
-        self._out_sub = []
-
-        for i_mat in range(self.N_mat):
-            Nsub = len(self.full_idx_list[i_mat])
-
-            out_sub = clarray.empty(
-                self.queue,
-                (self.N_rot, self.Nx, Nsub),
-                dtype=np.float32,
-                order="C",
-            )
-
-            self._out_sub.append(out_sub)
-
-
     def allocate_coefficient_buffer(self):
             # ---- reusable transpose buffers (per material) ----
-        self._coeffs_t_gpu = []
+        buffers = []
 
-        for i_mat, Ki in enumerate(self.K_list):
-            coeffs_t_gpu = clarray.empty(
-                self.queue,
-                (self.N_rot, self.Nx, Ki),
-                dtype=np.float32,
-                order="C",
+        def _alloc(name, shape, dtype, order):
+            arr = clarray.empty(self.queue, shape, dtype=dtype, order=order)
+            buffers.append((name, arr))
+            return arr
+        
+        self.coeffs_sino_F = _alloc(
+            "coeffs_sino_F",
+            (self.PS.n_detectors, self.PS.n_angles, self.K_batch_max),
+            np.float32,
+            "F",
+        )
+
+        self.coeffs_sino_C = _alloc(
+            "coeffs_sino_C",
+            (self.N_rot, self.Nx, self.K_batch_max),
+            np.float32,
+            "C",
+        )
+
+        self._coeffs_batch_F = _alloc(
+            "_coeffs_batch_F",
+            (self.Nx, self.Ny, self.K_batch_max),
+            np.float32,
+            "F",
+        )
+
+        self._basis_batch_list = []
+        for i_mat in range(self.N_mat):
+            self._basis_batch_list.append(
+                _alloc(
+                    f"_basis_batch[{i_mat}]",
+                    (self.N_rot, self.K_batch_max, self.N_chi, self.N_peaks_list[i_mat]),
+                    np.float32,
+                    "C",
+                    )
             )
 
-            self._coeffs_t_gpu.append(coeffs_t_gpu)
 
 
-    def set_convolution_masks(self):
-        # --- PF-matrix / peak info / masks (per material) ---
-        self.theta_mask_list = []
-        self.full_mask_list = []
-        self.full_idx_list = []
-        self.N_theta_mask_list = []
-
-        for i_mat in range(self.N_mat):
-
-            diff = np.abs(self.two_thetas[:, None] - self.peak_positions_np_list[i_mat][None, :])
-            min_dist = np.min(diff, axis=1)  # (N_theta,)
-            theta_mask = min_dist < (1.8 * self.peak_width)  # (N_theta,)
-
-            full_mask = np.tile(theta_mask, self.N_chi)      # (N_theta*N_chi,)
-            full_idx = np.nonzero(full_mask)[0]              # indices into full detector axis
-
-            self.theta_mask_list.append(theta_mask)
-            self.full_mask_list.append(full_mask)
-            self.full_idx_list.append(full_idx)
-            self.N_theta_mask_list.append(int(np.sum(theta_mask)))
+        self._basis_batch_convolved = _alloc(
+            "_basis_batch_convolved",
+            (self.N_rot, self.K_batch_max, self.N_seg),
+            np.float32,
+            "C",
+        )
 
 
-        self.full_idx_gpu_list = []
+        self._basis_batch_convolved_T = _alloc(
+            "_basis_batch_convolvedT",
+            (self.N_rot, self.N_seg, self.K_batch_max),
+            np.float32,
+            "C",
+        )
 
-        for idx in self.full_idx_list:
-            idx_np = np.asarray(idx, dtype=np.int32)
-            idx_gpu = clarray.to_device(self.queue, idx_np)
-            self.full_idx_gpu_list.append(idx_gpu)
+        self._grid_inv_kmax = _alloc(
+            "_grid_inv_kmax",
+            (self.K_batch_max, 9),
+            np.float32,
+            "C",
+        )
+
+        self._inv_sigma2_kmax = _alloc(
+            "_inv_sigma2_kmax",
+            (self.K_batch_max,),
+            np.float32,
+            "C",
+        )
+
+        self._norm_factor_kmax = _alloc(
+            "_norm_factor_kmax",
+            (self.K_batch_max,),
+            np.float32,
+            "C",
+        )
+
+        if self.verbose:
+            print("\n=== OpenCL buffer allocation summary ===")
+
+            total_bytes = 0
+
+            for name, arr in buffers:
+                nbytes = arr.size * arr.dtype.itemsize
+                total_bytes += nbytes
+
+                shape_str = "x".join(str(s) for s in arr.shape)
+                size_mb = nbytes / 1024**2
+
+                print(f"{name:30s}: shape=({shape_str}), {size_mb:8.2f} MB")
+
+            print("---------------------------------------")
+            print(f"TOTAL GPU buffer memory: {total_bytes/1024**2:8.2f} MB")
+            print("=======================================\n")
+            self.total_bytes = total_bytes
+
+
 
 
 
     def free_memory(self):
+        """
+        Free OpenCL buffers allocated by allocate_coefficient_buffer().
+        Handles both single buffers and the per-material list buffers.
+        """
 
-        gpu_lists = [
-            "_coeffs_t_gpu",
-            "_out_sub",
-            "pf_coords_gpu_list",
-            "pf_grid_inv_gpu_list",
-            "pf_sym_ops_gpu_list",
-            "pf_h_gpu_list",
-            "pf_intensity_gpu_list",
-            "full_idx_gpu_list",
+        # 1) Release list buffers (_basis_batch_list)
+        if hasattr(self, "_basis_batch_list"):
+            try:
+                for arr in getattr(self, "_basis_batch_list", []) or []:
+                    try:
+                        if getattr(arr, "base_data", None) is not None:
+                            arr.base_data.release()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    delattr(self, "_basis_batch_list")
+                except Exception:
+                    pass
+
+        # 2) Release named buffers
+        buffer_names = [
+            "coeffs_sino_F",
+            "coeffs_sino_C",
+            "_coeffs_batch_F",
+            "_basis_batch_convolved",
+            "_basis_batch_convolved_T",
+            "_grid_inv_kmax",
+            "_inv_sigma2_kmax",
+            "_norm_factor_kmax",
         ]
 
-        for name in gpu_lists:
-            lst = getattr(self, name, None)
-            if lst is not None:
-                for buf in lst:
-                    del buf
-                lst.clear()
+        for name in buffer_names:
+            arr = getattr(self, name, None)
+            if arr is None:
+                continue
 
-        for name in [
-            "_coeffs_gpu_full_sino",
-            "_x_full_gpu",
-            "B_gpu",
-        ]:
-            if hasattr(self, name):
+            try:
+                if getattr(arr, "base_data", None) is not None:
+                    arr.base_data.release()
+            except Exception:
+                pass
+
+            try:
                 delattr(self, name)
+            except Exception:
+                pass
+
+        # 3) Optional bookkeeping
+        if hasattr(self, "total_bytes"):
+            try:
+                delattr(self, "total_bytes")
+            except Exception:
+                pass
+
+        # 4) Ensure queue is done, then collect
+        try:
+            if getattr(self, "queue", None) is not None:
+                self.queue.finish()
+        except Exception:
+            pass
 
         gc.collect()
-        
+
+        if getattr(self, "verbose", False):
+            print("OpenCL GPU memory for operator freed.")
 
 
 
-
-
-    def set_pf_batch_max_gb(self, max_gb: float):
-        """
-        Set maximum allowed GPU memory (in GB) for ONE convolved PF batch.
-
-        This controls batching over K.
-        """
-        self.pf_batch_max_gb = float(max_gb)
-
-
-
-
-    def get_pf_batches_for_material(self, i_mat: int):
+    def get_pf_batches_for_material(self):
         """
         Compute K-batching for PF-matrix generation for ONE material.
 
@@ -361,16 +431,13 @@ class PFO_OPENCL_BATCHED:
                 - K_batch
         """
 
-        if not hasattr(self, "pf_batch_max_gb"):
-            raise RuntimeError(
-                "pf_batch_max_gb not set. Call set_pf_batch_max_gb(...) first."
-            )
+
 
         # ---- dimensions ----
         R = self.N_rot
         C = self.N_chi
-        T = self.N_theta_mask_list[i_mat]   # masked theta count
-        K_total = self.K_list[i_mat]
+        T = self.N_theta   # masked theta count
+        K_largest = np.max(np.array(self.K_list))
 
         bytes_per_float = 4
 
@@ -384,25 +451,31 @@ class PFO_OPENCL_BATCHED:
         if bytes_per_K >0.01:
             K_batch_max = max(int(max_bytes // bytes_per_K), 1)
              # Safety: never exceed available K
-            K_batch_max = min(K_batch_max, K_total)
+            K_batch_max = min(K_batch_max, K_largest)
         else:
             K_batch_max = 1
 
+        self.K_batch_max = K_batch_max
 
 
-        batches = []
+        self.batches_list = []
 
-        k0 = 0
-        while k0 < K_total:
-            k1 = min(k0 + K_batch_max, K_total)
-            batches.append({
-                "k_start": k0,
-                "k_end": k1,
-                "K_batch": k1 - k0,
-            })
-            k0 = k1
+        for i_mat in range(self.N_mat):
+            K_total_material = self.K_list[i_mat]
+            batches = []
 
-        return batches
+            k0 = 0
+            while k0 < K_total_material:
+                k1 = min(k0 + K_batch_max, K_total_material)
+                batches.append({
+                    "k_start": k0,
+                    "k_end": k1,
+                    "K_batch": k1 - k0,
+                })
+                k0 = k1
+
+            self.batches_list.append(batches)
+        
 
     
     
@@ -456,21 +529,19 @@ class PFO_OPENCL_BATCHED:
 
     def convolve_matrix_from_pf_batch(
         self,
-        *,
+        basis_batch: clarray.Array,
+        basis_convolved: clarray.Array,
         i_mat: int,
-        pf_basis_batch: clarray.Array,   # (R, Kb, C, P)
     ):
         queue = self.queue
 
         # ---------------- shapes ----------------
         R  = int(self.N_rot)
         C  = int(self.N_chi)
-        Kb = int(pf_basis_batch.shape[1])
-        P  = int(pf_basis_batch.shape[3])
-
-        # Masked theta count
-        T = int(self.N_theta_mask_list[i_mat])
-        Nsub = C * T
+        Kmax = int(self.K_batch_max)
+        P  = int(self.N_peaks_list[i_mat])
+        T = int(self.N_theta)
+        two_thetas = self.two_thetas
 
         # ---------------- Gaussian weights (CPU → GPU) ----------------
         # peak_positions_np_list[i_mat]: (P,)
@@ -479,14 +550,11 @@ class PFO_OPENCL_BATCHED:
             dtype=np.float32
         )
 
-        theta_mask = self.theta_mask_list[i_mat]
-        two_theta_masked = self.two_thetas[theta_mask]
-
-        dt = float(self.two_thetas[1] - self.two_thetas[0])
+        dt = float(self.two_thetas[1] - self.two_thetas[0]) # Linear spacing
         inv_norm = 1.0 / np.sqrt(2.0 * np.pi * (self.peak_width ** 2))
 
         # diff: (P, T)
-        diff = peaks_np[:, None] - two_theta_masked[None, :]
+        diff = peaks_np[:, None] - two_thetas[None, :]
         gaussian_np = (
             inv_norm
             * np.exp(-0.5 * (diff / self.peak_width) ** 2)
@@ -497,33 +565,24 @@ class PFO_OPENCL_BATCHED:
 
         # ---------------- output buffer ----------------
         # (R, Kb, C, T)
-        out_gpu = clarray.empty(
-            queue,
-            (R, Kb, C, T),
-            dtype=np.float32,
-            order="C",
-        )
 
         # ---------------- kernel launch ----------------
-        global_size = (R * Kb * C * T,)
+        total = (R * Kmax * C * T,)
 
         self.k.expand_kernel(
             queue,
-            global_size,
+            total,
             None,
-            pf_basis_batch.data,     # basis
+            basis_batch.data,     # basis
             gaussian_gpu.data,       # gaussian
-            out_gpu.data,            # out
+            basis_convolved.data,            # out
             np.int32(R),
-            np.int32(Kb),
+            np.int32(Kmax),
             np.int32(C),
             np.int32(P),
             np.int32(T),
         )
 
-        # ---------------- reshape to GEMM-compatible layout ----------------
-        # (R, Kb, C*T) == (R, Kb, Nsub)
-        return out_gpu.reshape(R, Kb, Nsub)
 
 
     def set_peak_width(self, peak_width):
@@ -531,7 +590,7 @@ class PFO_OPENCL_BATCHED:
 
 
 
-    def direct(self, coeffs_gpu_full):
+    def direct(self, coeffs):
         """
         Allocating convenience wrapper for the OpenCL forward operator.
 
@@ -541,19 +600,19 @@ class PFO_OPENCL_BATCHED:
             Shape (N_rot, Nx, N_seg), C order
         """
 
-        yin_gpu = clarray.zeros(
+        data = clarray.zeros(
             self.queue,
             (self.N_rot, self.Nx, self.N_chi * self.N_theta),
             dtype=np.float32,
             order="C",
         )
 
-        self.direct_cl(coeffs_gpu_full, yin_gpu)
-        return yin_gpu
+        self.direct_cl(coeffs, data)
+        return data
 
 
 
-    def direct_cl(self, coeffs_gpu_full, out_y):
+    def direct_cl(self, coeffs, data):
         """
         In-place OpenCL forward operator.
 
@@ -566,236 +625,133 @@ class PFO_OPENCL_BATCHED:
             Accumulated into (will be zeroed here)
         """
 
-        t_total_start = time.perf_counter()
 
-        t_get_c_total     = 0.0
-        t_transpose_total = 0.0
-        t_forward_total   = 0.0
-
-        # --- checks ---
-        assert coeffs_gpu_full.shape == (self.Nx, self.Ny, self.K_sum)
-        assert coeffs_gpu_full.flags.f_contiguous
-
-        assert out_y.shape == (self.N_rot, self.Nx, self.N_chi * self.N_theta)
-        assert out_y.flags.c_contiguous
-        assert out_y.queue is self.queue
 
         # --- zero output (important!) ---
-        out_y.fill(0)
-        self.queue.finish()
+        assert coeffs.flags.f_contiguous
+        assert coeffs.shape == (self.Nx, self.Ny, self.K_sum)
+        assert data.flags.c_contiguous
+        assert data.shape == (self.N_rot, self.Nx, self.N_seg)
+        
+        data.fill(0)
+        R = int(self.N_rot)
+        C = int(self.N_chi)
+        T = int(self.N_theta)
+        Kmax = self.K_batch_max
+        Nx = self.Nx
+        Ny = self.Ny
+        N_rot = self.N_rot
 
-        # ---------------- gratopy projection ----------------
-        if not hasattr(self, "_coeffs_gpu_full_sino"):
-            coeffs_gpu_full_sino = clarray.empty(
-                self.queue,
-                (self.PS.n_detectors, self.PS.n_angles, self.K_sum),
-                dtype=np.float32,
-                order="F",
-            )
-
-            self._coeffs_gpu_full_sino = coeffs_gpu_full_sino
-
-
-        coeffs_gpu_full_sino = self._coeffs_gpu_full_sino
-        coeffs_gpu_full_sino.fill(0)
-        gratopy.forwardprojection(
-            coeffs_gpu_full,
-            self.PS,
-            sino=coeffs_gpu_full_sino
-        )
-
-        # Must finish before slicing/transposing
-        self.queue.finish()
-        assert coeffs_gpu_full_sino.flags.f_contiguous
-
-        # ---------------- main loop over materials ----------------
         for i_mat in range(self.N_mat):
+            P = int(self.N_peaks_list[i_mat])
+            G = int(len(self.pf_sym_ops_cpu_list[i_mat]))
+            coords_gpu   = self.pf_coords_gpu_list[i_mat]
+            sym_ops_gpu  = self.pf_sym_ops_gpu_list[i_mat]
+            h_gpu_normed        = self.pf_h_gpu_normed_list[i_mat]
+            intensity_gpu = self.pf_intensity_gpu_list[i_mat]
+            i0 = self.offsets[i_mat] # The index for the first index of the material
+            sigma_cpu = self.sigma_cpu_list[i_mat]
+            grid_inv_gpu = self.grid_inv_gpu_list[i_mat]
 
-            K_i = self.K_list[i_mat]
-            total = self.N_rot * self.Nx * K_i
+            batches = self.batches_list[i_mat]
 
-            # ---- slice K on GPU (Fortran → Fortran) ----
-            t0 = time.perf_counter()
-            coeffs_sub_gpu = self.get_c_opencl_fortran(
-                coeffs_gpu_full_sino,
-                i_mat
-            )
-            self.queue.finish()
-            t_get_c_total += time.perf_counter() - t0
+            for b in batches:
+                k0 = b["k_start"]
+                k1 = b["k_end"]
+                Kb = b["K_batch"]
 
-            # ---- transpose (d,ω,K)[F] → (ω,d,K)[C] ----
-            coeffs_t_gpu = self._coeffs_t_gpu[i_mat]
+                self._coeffs_batch_F.fill(0.0)
+                self.coeffs_sino_C.fill(0.0)
+                self.coeffs_sino_F.fill(0.0)
 
+                total = Nx * Ny * Kb
+                self.k.SLICE_COEFFS_K_BATCH_F(
+                    self.queue,
+                    (total,),
+                    None,
+                    coeffs.data,               # COEFFS_IN
+                    self._coeffs_batch_F.data,       # COEFFS_OUT
+                    np.int32(Nx),
+                    np.int32(Ny),
+                    np.int32(self.K_sum),
+                    np.int32(Kb),
+                    np.int32(k0 + i0),
+                )
 
-            t0 = time.perf_counter()
-            self.k.transpose_d_omega_k_f_to_c(
-                self.queue,
-                (total,),
-                None,
-                coeffs_sub_gpu.data,
-                coeffs_t_gpu.data,
-                np.int32(self.Nx),        # D
-                np.int32(self.N_rot),     # O
-                np.int32(K_i),            # K
-                np.int32(total),
-            )
-            self.queue.finish()
-            t_transpose_total += time.perf_counter() - t0
+                gratopy.forwardprojection(
+                    self._coeffs_batch_F,
+                    self.PS,
+                    sino=self.coeffs_sino_F,
+                )
 
-            del coeffs_sub_gpu
-
-            # ---- forward kernel (accumulates into out_y) ----
-            t0 = time.perf_counter()
-            self.forward_gpu_opencl(out_y, coeffs_t_gpu, i_mat)
-            self.queue.finish()
-            t_forward_total += time.perf_counter() - t0
-
-
-        t_total = time.perf_counter() - t_total_start
-
-        if self.verbose:
-            print("\n=== DIRECT_CL() OpenCL TIMING ===")
-            print(f"get_c (GPU slice) total : {t_get_c_total:.4f} s")
-            print(f"transpose total        : {t_transpose_total:.4f} s")
-            print(f"forward_gpu total      : {t_forward_total:.4f} s")
-            print("--------------------------------")
-            print(f"TOTAL direct_cl() time : {t_total:.4f} s")
-            print("================================\n")
-
-
-
-
-    def adjoint_cl(self, y_gpu, out_x):
-        """
-        In-place OpenCL adjoint operator.
-
-        Parameters
-        ----------
-        y_gpu : clarray
-            Shape (N_rot, Nx, N_seg), C-order
-        out_x : clarray
-            Shape (Nx, Nx, K_sum), Fortran-order
-            Will be overwritten
-        """
-
-        t_total_start = time.perf_counter()
-
-        t_adjoint_total   = 0.0
-        t_transpose_total = 0.0
-
-        queue = self.queue
-
-        # ---------------- checks ----------------
-        assert y_gpu.shape == (self.N_rot, self.Nx, self.N_chi * self.N_theta)
-        assert y_gpu.flags.c_contiguous
-        assert y_gpu.queue is queue
-
-        assert out_x.shape == (self.Nx, self.Ny, self.K_sum)
-        assert out_x.flags.f_contiguous
-        assert out_x.queue is queue
-
-        # ---------------- zero output ----------------
-        out_x.fill(0)
-        queue.finish()
-
-        # ---------------- allocate intermediate (sino-space adjoint result) ----------------
-        O = self.N_rot
-        D = self.Nx
-
-        if not hasattr(self, "_x_full_gpu"):
-            x_full_gpu = clarray.empty(
-                queue,
-                (D, O, self.K_sum),
-                dtype=np.float32,
-                order="F",
-            )
-
-            self._x_full_gpu = x_full_gpu
+                total = N_rot * Nx * Kmax
+                self.k.transpose_d_omega_k_f_to_c(
+                    self.queue,
+                    (total,),
+                    None,
+                    self.coeffs_sino_F.data,
+                    self.coeffs_sino_C.data,
+                    np.int32(Nx),
+                    np.int32(N_rot),
+                    np.int32(Kmax),
+                    np.int32(total),
+                )
 
 
-        x_full_gpu = self._x_full_gpu
-        x_full_gpu.fill(0)
+                self._norm_factor_kmax.fill(0.0) # make sure that this is set to zero!
+                self._inv_sigma2_kmax.fill(0.0)
+                sigma = np.asarray(sigma_cpu[k0:k1], dtype=np.float32)
+                inv_sigma2_cpu = (1.0 / (sigma * sigma)).astype(np.float32)
+                norm_factor_cpu = (1.0 / (8.0 * np.pi * sigma * sigma)).astype(np.float32)
+                cl.enqueue_copy(self.queue, self._inv_sigma2_kmax.data, inv_sigma2_cpu, device_offset=0)
+                cl.enqueue_copy(self.queue, self._norm_factor_kmax.data, norm_factor_cpu, device_offset=0)
 
 
-        # ---------------- loop over materials ----------------
-        for i_mat in range(self.N_mat):
+                total = Kb * 9
+                self.k.SLICE_GRIDINV_K_BATCH(
+                    self.queue,
+                    (total,),
+                    None,
+                    grid_inv_gpu.data,      # input: (K_total, 9)
+                    self._grid_inv_kmax.data,    # output: (K_batch_max, 9)
+                    np.int32(self.K_list[i_mat]),            # K_IN  (total grid size)
+                    np.int32(Kb),                # K_OUT (this batch size)
+                    np.int32(k0),                # K_START
+                )
 
-            K_i = self.K_list[i_mat]
-            total = O * D * K_i
 
-            # ---- adjoint pole-figure operator ----
-            t0 = time.perf_counter()
-            xin_gpu = self.adjoint_gpu_opencl(y_gpu, i_mat)  # (ω, d, K_i), C
-            queue.finish()
-            t_adjoint_total += time.perf_counter() - t0
+                total = R * Kmax * C * P
+                self.pfmatrix_eval_kernel(
+                    self.queue,
+                    (total,),
+                    None,
+                    coords_gpu.data,
+                    self._grid_inv_kmax.data,
+                    sym_ops_gpu.data,
+                    h_gpu_normed.data,
+                    self._inv_sigma2_kmax.data,
+                    self._norm_factor_kmax.data,
+                    self._basis_batch_list[i_mat].data,
+                    np.int32(R),
+                    np.int32(Kmax),
+                    np.int32(C),
+                    np.int32(P),
+                    np.int32(G),
+                )
 
-            # ---- transpose (ω, d, K)[C] → (d, ω, K)[F] ----
-            xin_gpu_t = clarray.empty(
-                queue,
-                (D, O, K_i),
-                dtype=np.float32,
-                order="F",
-            )
+                self._scale_pf_by_intensity_inplace(self._basis_batch_list[i_mat], intensity_gpu)
 
-            t0 = time.perf_counter()
-            self.k.transpose_omega_d_k_c_to_d_omega_k_f(
-                queue,
-                (total,),
-                None,
-                xin_gpu.data,
-                xin_gpu_t.data,
-                np.int32(O),
-                np.int32(D),
-                np.int32(K_i),
-                np.int32(total),
-            )
-            queue.finish()
-            t_transpose_total += time.perf_counter() - t0
+                # Convolve
+                self.convolve_matrix_from_pf_batch(
+                    self._basis_batch_list[i_mat],
+                    self._basis_batch_convolved,
+                    i_mat=i_mat,
+                )
 
-            del xin_gpu
+                batched_gemm_clblast(self.queue, self.coeffs_sino_C, self._basis_batch_convolved, data, R=R, M=Nx, K=Kmax, N=T*C)
 
-            # ---- scatter into full K axis ----
-            i0 = self.offsets[i_mat]
-            total = D * O * K_i
 
-            self.k.scatter_k_lastaxis_f(
-                queue,
-                (total,),
-                None,
-                x_full_gpu.data,
-                xin_gpu_t.data,
-                np.int32(D),
-                np.int32(O),
-                np.int32(self.K_sum),
-                np.int32(i0),
-                np.int32(K_i),
-                np.int32(total),
-            )
-            queue.finish()
-
-            del xin_gpu_t
-
-        # ---------------- X-ray backprojection ----------------
-        gratopy.backprojection(
-            x_full_gpu,
-            self.PS,
-            img=out_x
-        )
-        queue.finish()
-
-        t_total = time.perf_counter() - t_total_start
-
-        if self.verbose:
-            print("\n=== ADJOINT_CL() OpenCL TIMING ===")
-            print(f"adjoint_gpu total     : {t_adjoint_total:.4f} s")
-            print(f"transpose total       : {t_transpose_total:.4f} s")
-            print("--------------------------------")
-            print(f"TOTAL adjoint_cl() time: {t_total:.4f} s")
-            print("================================\n")
-
-                
-
-    def adjoint(self, y_gpu):
+    def adjoint(self, data):
         """
         Allocating convenience wrapper for the OpenCL adjoint.
 
@@ -810,294 +766,174 @@ class PFO_OPENCL_BATCHED:
             Shape (Nx, Nx, K_sum), Fortran-order
         """
 
-        x_gpu = clarray.zeros(
+        coeffs = clarray.zeros(
             self.queue,
             (self.Nx, self.Ny, self.K_sum),
             dtype=np.float32,
             order="F",
         )
 
-        self.adjoint_cl(y_gpu, x_gpu)
-        return x_gpu
-
-                
+        self.adjoint_cl(data, coeffs)
+        return coeffs
 
 
 
-
-
-
-    def adjoint_gpu_opencl(self, data_gpu: clarray.Array, i_mat: int) -> clarray.Array:
+    def adjoint_cl(self, data, coeffs):
         """
-        Batched OpenCL adjoint operator for one material.
+        In-place OpenCL adjoint operator.
 
         Parameters
         ----------
-        data_gpu : clarray.Array
-            Shape (R, Mx, Nseg_full), C-order
-        i_mat : int
-            Material index
-
-        Returns
-        -------
-        out_gpu : clarray.Array
-            Shape (R, Mx, K_i), C-order
+        y_gpu : clarray
+            Shape (N_rot, Nx, N_seg), C-order
+        out_x : clarray
+            Shape (Nx, Nx, K_sum), Fortran-order
+            Will be overwritten
         """
-        queue = self.queue
 
-        # ---------------- constants / shapes ----------------
+                # --- zero output (important!) ---
+        assert coeffs.flags.f_contiguous
+        assert coeffs.shape == (self.Nx, self.Ny, self.K_sum)
+        assert data.flags.c_contiguous
+        assert data.shape == (self.N_rot, self.Nx, self.N_seg)
+
+        coeffs.fill(0)
         R = int(self.N_rot)
-        Mx = int(self.Nx)
-        K_i = int(self.K_list[i_mat])
-
-        Nfull = int(self.N_chi * self.N_theta)
-        idx_gpu = self.full_idx_gpu_list[i_mat]
-        Nsub = int(idx_gpu.size)
-
-        # ---------------- PF GPU inputs (prepared in __init__) ----------------
-        coords_gpu   = self.pf_coords_gpu_list[i_mat]     # (R, C, P, 3)
-        grid_inv_gpu = self.pf_grid_inv_gpu_list[i_mat]   # (K_i, 9)
-        sigma_cpu = self.sigma_cpu_list[i_mat]
-        sym_ops_gpu  = self.pf_sym_ops_gpu_list[i_mat]    # (G, 9)
-        h_gpu        = self.pf_h_gpu_list[i_mat]          # (P, 3)
-
-        C = self.N_chi
-        P = self.N_peaks_list[i_mat]
-        G = len(self.pf_sym_ops_cpu_list[i_mat])
-
-        # Intensities cached on GPU per material: (P,)
-        intensity_gpu = self.pf_intensity_gpu_list[i_mat]
-        assert int(intensity_gpu.size) == P
-
-        # ---------------- 1) gather masked detector segments once ----------------
-        data_gpu_sub = clarray.empty(queue, (R, Mx, Nsub), dtype=np.float32, order="C")
-
-        total_gather = np.int32(R) * np.int32(Mx) * np.int32(Nsub)
-        self.k.gather_kernel(
-            queue,
-            (int(total_gather),),
-            None,
-            data_gpu.data,
-            data_gpu_sub.data,
-            idx_gpu.data,
-            np.int32(R),
-            np.int32(Mx),
-            np.int32(Nsub),
-            np.int32(Nfull),
-        )
-
-        # ---------------- output (R, Mx, K_i) ----------------
-        out_gpu = clarray.empty(queue, (R, Mx, K_i), dtype=np.float32, order="C")
-        out_gpu.fill(0.0)
-
-        # ---------------- batching plan over K ----------------
-        batches = self.get_pf_batches_for_material(i_mat)  # list of dicts
-
-        # ---------------- batch loop ----------------
-        for b in batches:
-            k0 = int(b["k_start"])
-            k1 = int(b["k_end"])
-            Kb = int(b["K_batch"])
-            assert Kb == (k1 - k0)
-
-            # ---- 2) slice grid_inv -> (Kb, 9) ----
-            grid_inv_batch = self._slice_gridinv_k_batch(grid_inv_gpu, k0, k1)
-            sigma_cpu_batch = sigma_cpu[k0:k1]
-
-            # ---- 3) PF basis batch: (R, Kb, C, P) ----
-            pf_basis_batch = clarray.empty(queue, (R, Kb, C, P), dtype=np.float32, order="C")
-
-            pfmatrix_eval_gpu(
-                queue=queue,
-                pfo_kernel=self.pfmatrix_eval_kernel,
-                coords_gpu=coords_gpu,
-                grid_inv_gpu=grid_inv_batch,
-                sym_ops_gpu=sym_ops_gpu,
-                hvecs_gpu=h_gpu,
-                R=R,
-                K=Kb,
-                C=C,
-                P=P,
-                G=G,
-                sigma=sigma_cpu_batch,   # ensure you store this on self
-                out_gpu=pf_basis_batch,
-            )
-
-            # ---- 4) scale by intensities in-place ----
-            # pf_basis_batch[r,k,c,p] *= intensity[p]
-            self._scale_pf_by_intensity_inplace(pf_basis_batch, intensity_gpu)
-
-            # ---- 5) convolve -> B_gpu_batch (R, Kb, Nsub) ----
-            # (this is your rewritten version that accepts batches)
-            B_gpu_batch = self.convolve_matrix_from_pf_batch(
-                i_mat=i_mat,
-                pf_basis_batch=pf_basis_batch,  # (R,Kb,C,P)
-            )  # expects (R, Kb, Nsub) C-order
-
-            # ---- 6) transpose B for adjoint GEMM: BT = (R, Nsub, Kb) ----
-            BT_gpu_batch = clarray.empty(queue, (R, Nsub, Kb), dtype=np.float32, order="C")
-            total_bt = np.int32(R) * np.int32(Kb) * np.int32(Nsub)
-
-            self.k.btranspose_kernel(
-                queue,
-                (int(total_bt),),
-                None,
-                B_gpu_batch.data,
-                BT_gpu_batch.data,
-                np.int32(R),
-                np.int32(Kb),
-                np.int32(Nsub),
-                np.int32(total_bt),
-            )
-
-            # ---- 7) adjoint GEMM: x_batch = data_sub * BT ----
-            # data_gpu_sub:   (R, Mx,   Nsub)
-            # BT_gpu_batch:   (R, Nsub, Kb)
-            # x_batch:        (R, Mx,   Kb)
-            x_batch = clarray.empty(queue, (R, Mx, Kb), dtype=np.float32, order="C")
-            batched_gemm_adj_clblast(queue, data_gpu_sub, BT_gpu_batch, x_batch, R, Mx, Nsub, Kb)
-
-            # ---- 8) scatter x_batch into out_gpu[:, :, k0:k1] ----
-            total_scatter = np.int32(R) * np.int32(Mx) * np.int32(Kb)
-            self.k.scatter_k_batch_c(
-                queue,
-                (int(total_scatter),),
-                None,
-                out_gpu.data,
-                x_batch.data,
-                np.int32(R),
-                np.int32(Mx),
-                np.int32(K_i),
-                np.int32(k0),
-                np.int32(Kb),
-                np.int32(total_scatter),
-            )
-
-            # cleanup batch temporaries
-            del grid_inv_batch, pf_basis_batch, B_gpu_batch, BT_gpu_batch, x_batch
-
-        return out_gpu
-
-
-
-
-    def forward_gpu_opencl(self, out_gpu_full, coeffs_gpu, i_mat: int):
-        """
-        Batched OpenCL forward operator for one material.
-
-        out_gpu_full : (R, Mx, Nseg_full) C-order, accumulated in-place
-        coeffs_gpu   : (R, Mx, K_i)       C-order (already per-material coeffs)
-        i_mat        : material index
-        """
-        queue = self.queue
-
-        # ---------------- constants / shapes ----------------
-        R = int(self.N_rot)
-        Mx = int(self.Nx)
-        K_i = int(self.K_list[i_mat])
-
-        # idx for scattering sub-segments (theta masked)
-        idx_gpu = self.full_idx_gpu_list[i_mat]
-        Nsub = int(idx_gpu.size)
-
-        # Reuse output buffer (R, Mx, Nsub)
-        out_sub = self._out_sub[i_mat]
-
-        # ---------------- PF GPU inputs (prepared in __init__) ----------------
-        # coords_gpu:   (R, C, P, 3) float32 C-order
-        # grid_inv_gpu: (K_i, 9)     float32 C-order
-        # sym_ops_gpu:  (G, 9)       float32 C-order
-        # h_gpu:        (P, 3)       float32 C-order   (P == number of peaks/hkls)
-        coords_gpu   = self.pf_coords_gpu_list[i_mat]
-        grid_inv_gpu = self.pf_grid_inv_gpu_list[i_mat]
-        sigma_cpu = self.sigma_cpu_list[i_mat]
-        sym_ops_gpu  = self.pf_sym_ops_gpu_list[i_mat]
-        h_gpu        = self.pf_h_gpu_list[i_mat]
-
-        # Sanity checks (cheap and saves pain)
-        assert int(coords_gpu.shape[0]) == R
-        assert int(coords_gpu.shape[1]) == int(self.N_chi)
-        assert int(coords_gpu.shape[2]) == int(self.N_peaks_list[i_mat])
-        assert int(coords_gpu.shape[3]) == 3
-        assert int(grid_inv_gpu.shape[0]) == K_i
-        assert int(grid_inv_gpu.shape[1]) == 9
-
         C = int(self.N_chi)
-        P = int(self.N_peaks_list[i_mat])
-        G = int(len(self.pf_sym_ops_cpu_list[i_mat]))
+        T = int(self.N_theta)
+        Kmax = self.K_batch_max
+        Nx = self.Nx
+        Ny = self.Ny
 
-        # Intensities should be cached on GPU per material
-        intensity_gpu = self.pf_intensity_gpu_list[i_mat]  # (P,) float32 GPU
-        assert int(intensity_gpu.size) == P
+        for i_mat in range(self.N_mat):
+            P = int(self.N_peaks_list[i_mat])
+            G = int(len(self.pf_sym_ops_cpu_list[i_mat]))
+            coords_gpu   = self.pf_coords_gpu_list[i_mat]
+            sym_ops_gpu  = self.pf_sym_ops_gpu_list[i_mat]
+            h_gpu_normed        = self.pf_h_gpu_normed_list[i_mat]
+            intensity_gpu = self.pf_intensity_gpu_list[i_mat]
+            i0 = self.offsets[i_mat] # The index for the first index of the material
+            sigma_cpu = self.sigma_cpu_list[i_mat]
+            grid_inv_gpu = self.grid_inv_gpu_list[i_mat]
 
-        # ---------------- batching plan over K ----------------
-        batches = self.get_pf_batches_for_material(i_mat)  # list of dicts
+            batches = self.batches_list[i_mat]
 
-        # ---------------- batch loop ----------------
-        for b in batches:
-            k0 = int(b["k_start"])
-            k1 = int(b["k_end"])
-            Kb = int(b["K_batch"])
-            assert Kb == (k1 - k0)
+            for b in batches:
+                k0 = b["k_start"]
+                k1 = b["k_end"]
+                Kb = b["K_batch"]
 
-            # ---- 1) slice coeffs_gpu -> (R, Mx, Kb) ----
-            coeffs_batch = self._slice_coeffs_k_batch(coeffs_gpu, k0, k1)
-
-            # ---- 2) slice grid_inv -> (Kb, 9) ----
-            grid_inv_batch = self._slice_gridinv_k_batch(grid_inv_gpu, k0, k1)
-
-            sigma_cpu_batch = sigma_cpu[k0:k1]
-
-            # ---- 3) PF basis batch: (R, Kb, C, P) ----
-            pf_basis_batch = clarray.empty(queue, (R, Kb, C, P), dtype=np.float32, order="C")
-
-            # IMPORTANT: call pfmatrix_eval_gpu with correct signature
-            pfmatrix_eval_gpu(
-                queue=queue,
-                pfo_kernel=self.pfmatrix_eval_kernel,
-                coords_gpu=coords_gpu,
-                grid_inv_gpu=grid_inv_batch,
-                sym_ops_gpu=sym_ops_gpu,
-                hvecs_gpu=h_gpu,
-                R=R,
-                K=Kb,
-                C=C,
-                P=P,
-                G=G,
-                sigma=sigma_cpu_batch,   # or wherever you store sigma
-                out_gpu=pf_basis_batch,
-            )
-
-            # ---- 4) scale by intensities: pf_basis_batch[r,k,c,p] *= intensity[p] ----
-            self._scale_pf_by_intensity_inplace(pf_basis_batch, intensity_gpu)
-
-            # ---- 5) CONVOLUTION----
-            B_gpu_batch = self.convolve_matrix_from_pf_batch(
-                i_mat=i_mat,
-                pf_basis_batch=pf_basis_batch,
-            )
-
-            # ---- 6) GEMM and accumulate GO AFTER convolution ----
-            out_sub.fill(0.0)
-            batched_gemm_clblast(queue, coeffs_batch, B_gpu_batch, out_sub, R=R, M=Mx, K=Kb, N=Nsub)
+                self._coeffs_batch_F.fill(0.0)
+                self.coeffs_sino_C.fill(0.0)
+                self.coeffs_sino_F.fill(0.0)
 
 
-            # ---- 7) accumulate out_sub into out_gpu_full ----
-            total = np.int32(R) * np.int32(Mx) * np.int32(Nsub)
-            self.k.accumulate_kernel(
-                queue,
-                (int(total),),
-                None,
-                out_gpu_full.data,
-                out_sub.data,
-                idx_gpu.data,
-                np.int32(R),
-                np.int32(Mx),
-                np.int32(Nsub),
-                np.int32(out_gpu_full.shape[2]),
-                total,
-            )
-            del pf_basis_batch, B_gpu_batch, coeffs_batch, grid_inv_batch
+                self._norm_factor_kmax.fill(0.0) # make sure that this is set to zero!
+                self._inv_sigma2_kmax.fill(0.0)
+                sigma = np.asarray(sigma_cpu[k0:k1], dtype=np.float32)
+                inv_sigma2_cpu = (1.0 / (sigma * sigma)).astype(np.float32)
+                norm_factor_cpu = (1.0 / (8.0 * np.pi * sigma * sigma)).astype(np.float32)
+                cl.enqueue_copy(self.queue, self._inv_sigma2_kmax.data, inv_sigma2_cpu, device_offset=0)
+                cl.enqueue_copy(self.queue, self._norm_factor_kmax.data, norm_factor_cpu, device_offset=0)
+
+
+                total = Kb * 9
+                self.k.SLICE_GRIDINV_K_BATCH(
+                    self.queue,
+                    (total,),
+                    None,
+                    grid_inv_gpu.data,      # input: (K_total, 9)
+                    self._grid_inv_kmax.data,    # output: (K_batch_max, 9)
+                    np.int32(self.K_list[i_mat]),            # K_IN  (total grid size)
+                    np.int32(Kb),                # K_OUT (this batch size)
+                    np.int32(k0),                # K_START
+                )
+
+
+                total = R * Kmax * C * P
+                self.pfmatrix_eval_kernel(
+                    self.queue,
+                    (total,),
+                    None,
+                    coords_gpu.data,
+                    self._grid_inv_kmax.data,
+                    sym_ops_gpu.data,
+                    h_gpu_normed.data,
+                    self._inv_sigma2_kmax.data,
+                    self._norm_factor_kmax.data,
+                    self._basis_batch_list[i_mat].data,
+                    np.int32(R),
+                    np.int32(Kmax),
+                    np.int32(C),
+                    np.int32(P),
+                    np.int32(G),
+                )
+
+                self._scale_pf_by_intensity_inplace(self._basis_batch_list[i_mat], intensity_gpu)
+
+                # Convolve
+                self.convolve_matrix_from_pf_batch(
+                    self._basis_batch_list[i_mat],
+                    self._basis_batch_convolved,
+                    i_mat=i_mat,
+                )
+
+                ## transpose the convolved matrix
+                total = R*Kmax*C*T
+                self.k.btranspose_kernel(
+                    self.queue,
+                    (total,),
+                    None,
+                    self._basis_batch_convolved.data,
+                    self._basis_batch_convolved_T.data,
+                    np.int32(R),
+                    np.int32(Kmax),
+                    np.int32(C*T),
+                    np.int32(total),
+                )
+
+                batched_gemm_adj_clblast(self.queue, data, self._basis_batch_convolved_T, self.coeffs_sino_C, R, Nx, C*T, Kmax, R/np.pi)
+
+
+                # Transpose
+                total = R*Nx*Kmax
+                self.k.transpose_omega_d_k_c_to_d_omega_k_f(
+                    self.queue,
+                    (total,),
+                    None,
+                    self.coeffs_sino_C.data,
+                    self.coeffs_sino_F.data,
+                    np.int32(R),
+                    np.int32(Nx),
+                    np.int32(Kmax),
+                    np.int32(total),
+                )
+
+                # Backproject
+                gratopy.backprojection(
+                    self.coeffs_sino_F,
+                    self.PS,
+                    img=self._coeffs_batch_F,
+                )
+
+
+
+
+                total = Nx * Ny * Kb
+                self.k.scatter_k_lastaxis_f(
+                    self.queue,
+                    (total,),
+                    None,
+                    coeffs.data,              # dst
+                    self._coeffs_batch_F.data,# src
+                    np.int32(Nx),
+                    np.int32(Ny),
+                    np.int32(self.K_sum),
+                    np.int32(i0+k0),
+                    np.int32(Kb),
+                    np.int32(total),
+                )
+
 
 
 
@@ -1217,13 +1053,13 @@ def batched_gemm_clblast(queue, A3, B3, C3, R, M, K, N):
         a_ld, b_ld, c_ld,
         a_stride, b_stride, c_stride,
         alpha=1.0,
-        beta=0.0,
+        beta=1.0, # 1.0=accumulate, 0.0=overwrite
     )
 
 
 
 
-def batched_gemm_adj_clblast(queue, Y3, BT3, X3, R, Mx, Nsub, K):
+def batched_gemm_adj_clblast(queue, Y3, BT3, X3, R, Mx, Nsub, K, alpha):
     """
     Y3:  (R, Mx,   Nsub)  clarray
     BT3: (R, Nsub, K)     clarray  (explicitly transposed B)
@@ -1252,8 +1088,75 @@ def batched_gemm_adj_clblast(queue, Y3, BT3, X3, R, Mx, Nsub, K):
         A, B, C,
         a_ld, b_ld, c_ld,
         a_stride, b_stride, c_stride,
-        alpha=1.0,
-        beta=0.0,
+        alpha=alpha,
+        beta=0.0, # 1.0=accumulate, 0.0=overwrite
         a_transp=False,
-        b_transp=False,  # <<< now no ambiguity
+        b_transp=False, 
     )
+
+
+
+
+
+def estimate_L_power(
+    op,
+    niter: int = 20,
+    seed: int = 0,
+    eps: float = 1e-30,
+    verbose: int = 1,
+) -> float:
+    if niter < 1:
+        raise ValueError("niter must be >= 1")
+
+    q = op.queue
+    rng = np.random.default_rng(seed)
+
+    # x in domain, Fortran
+    x = clarray.empty(q, (op.Nx, op.Ny, op.K_sum), np.float32, order="F")
+    # y in range, C
+    Ax = clarray.empty(q, (op.N_rot, op.Nx, op.N_seg), np.float32, order="C")
+    # z = A^*Ax in domain
+    z = clarray.empty(q, x.shape, np.float32, order="F")
+
+    # init x random
+    x_host = rng.standard_normal(x.shape).astype(np.float32, copy=False, order="F")
+    assert x.data is not None
+    cl.enqueue_copy(q, x.data, x_host)
+    q.finish()
+
+    # normalize x
+    xnorm = float(np.sqrt(clarray.vdot(x, x).get()) + eps)
+    x *= np.float32(1.0 / xnorm)
+    q.finish()
+
+    L_est: float = 0.0
+    for it in range(niter):
+        op.direct_cl(x, Ax)
+        op.adjoint_cl(Ax, z)
+        q.finish()
+
+        num = float(clarray.vdot(x, z).get())
+        den = float(clarray.vdot(x, x).get()) + eps
+        L_est = num / den
+
+        znorm = float(np.sqrt(clarray.vdot(z, z).get()) + eps)
+        x[:] = z * np.float32(1.0 / znorm)
+        q.finish()
+
+        if verbose:
+            print(f"[power {it+1:02d}] L_est={L_est:.6e}  ||z||={znorm:.6e}")
+
+    # ---------- GPU cleanup ----------
+    if x.base_data is not None:
+        x.base_data.release()
+    if Ax.base_data is not None:
+        Ax.base_data.release()
+    if z.base_data is not None:
+        z.base_data.release()
+
+    del x, Ax, z, x_host
+    gc.collect()
+    q.finish()
+    # --------------------------------
+
+    return float(L_est)

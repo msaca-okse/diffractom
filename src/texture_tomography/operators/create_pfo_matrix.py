@@ -476,8 +476,8 @@ def pfmatrix_sparseeval_gpu(
     sym_ops_gpu: clarray.Array,
     hvecs_gpu: clarray.Array,
     R: int, K: int, C: int, P: int, G: int,
-    sigma: float,
-    cutoff: float,
+    sigma: np.float32,
+    cutoff: np.float32,
 ):
     # --- sanity checks ---
     assert coords_gpu.dtype == np.float32
@@ -487,7 +487,6 @@ def pfmatrix_sparseeval_gpu(
 
     inv_sigma2 = np.float32(1.0 / (sigma * sigma))
     norm_factor = np.float32(1.0 / (8.0 * np.pi * sigma * sigma))
-    cutoff = np.float32(cutoff)
 
 
     # ------------------------------------------------------------

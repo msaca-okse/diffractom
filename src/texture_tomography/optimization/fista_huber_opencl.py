@@ -1,25 +1,3 @@
-# fista_opencl.py
-import time
-import numpy as np
-import pyopencl as cl
-import pyopencl.array as clarray
-import pyopencl.clmath as clmath
-from package.texture_tomography.optimization.prox import prox_nonneg, prox_l1, prox_nonneg_l1
-from package.texture_tomography.optimization.prox import ProxKernels
-
-from package.texture_tomography.optimization.prox_tv import (
-    TVProxKernels,
-    prox_tv_nonneg_inplace,
-)
-#######################
-#
-#    AN EXTRA DATA ARRAY IS ALLOCATED FOR DIAGNOSTICS
-#
-######################
-
-
-# -------------------- FISTA helper kernels --------------------
-
 FISTA_KERNELS = r"""
 __kernel void residual_axpb(
     __global const float *Ax,
@@ -109,6 +87,28 @@ __kernel void huber_loss(
 """
 
 
+# fista_opencl.py
+import time
+import numpy as np
+import pyopencl as cl
+import pyopencl.array as clarray
+import pyopencl.clmath as clmath
+from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels
+
+from .prox_tv import (
+    TVProxKernels,
+    prox_tv_nonneg_inplace,
+)
+#######################
+#
+#    AN EXTRA DATA ARRAY IS ALLOCATED FOR DIAGNOSTICS
+#
+######################
+
+
+# -------------------- FISTA helper kernels --------------------
+
+
 def build_fista_program(ctx: cl.Context) -> cl.Program:
     return cl.Program(ctx, FISTA_KERNELS + HUBER_KERNELS + HUBER_DIAG_KERNEL).build()
 
@@ -124,7 +124,7 @@ class FISTAHuberOpenCL:
     Ax layout: (O, D, Nseg) C
     """
 
-    def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50, huber_delta=1e-2):
+    def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=float, tau=float, tv_niter=50, huber_delta=1e-2):
         self.op = operator
         self.ctx = operator.ctx
         self.queue = operator.queue
@@ -284,6 +284,16 @@ class FISTAHuberOpenCL:
                 total_Ax
             )
 
+            # ---- L2 data term ----
+
+            self.k_residual_axpb(
+                q, (int(total_Ax),), None,
+                Ax.data, out_gpu.data, Ax.data,
+                total_Ax
+            )
+            r2 = float(np.dot(Ax.get().ravel(), Ax.get().ravel()))
+            fval = 0.5 * float(r2)
+
             # ---- huber: r <- clip(r, -delta, +delta) ----
             self.k_huber_clip_inplace(
                 q, (int(total_Ax),), None,
@@ -299,14 +309,14 @@ class FISTAHuberOpenCL:
             total_x = np.int32(y.size)
             self.k_grad_step(
                 q, (int(total_x),), None,
-                y.data, grad.data, y.data,   # in-place update of y
+                y.data, grad.data, x.data,   # in-place update of y
                 np.float32(self.tau),
                 total_x
             )
 
             # ---- prox: apply in-place on v, then copy v -> x ----
-            self._apply_prox(y)   # MUST modify v in-place and return v
-            self.k_copy_buf(q, (int(total_x),), None, y.data, x.data, total_x)
+            self._apply_prox(x)   # MUST modify v in-place and return v
+            #self.k_copy_buf(q, (int(total_x),), None, y.data, x.data, total_x)
 
             # ---- momentum update ----
             t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
@@ -323,11 +333,6 @@ class FISTAHuberOpenCL:
             self.k_copy_buf(q, (int(total_x),), None, x.data, x_old.data, total_x)
 
             t = t_new
-
-
-            # ---- L2 data term ----
-            r2 = float(np.dot(Ax.get().ravel(), Ax.get().ravel()))
-            fval = 0.5 * float(r2)
 
 
             gval = 0.0
@@ -403,3 +408,26 @@ class FISTAHuberOpenCL:
             "final_xnorm": self.iter_stats[-1]["xnorm"],
             "final_gradnorm": self.iter_stats[-1]["gradnorm"],
         }
+
+                # ---------------- GPU cleanup ----------------
+        q.finish()
+
+        for arr in (y, x_old, grad):
+            if arr is not None:
+                arr.base_data.release()
+
+        if Ax is not None:
+            Ax.base_data.release()
+        if r is not None:
+            r.base_data.release()
+
+        if self.prox_kind == "nonneg_tv":
+            for arr in self._tv_buffers.values():
+                arr.base_data.release()
+            del self._tv_buffers
+
+        del y, x_old, grad, Ax, r
+        import gc
+        gc.collect()
+        q.finish()
+        # --------------------------------------------

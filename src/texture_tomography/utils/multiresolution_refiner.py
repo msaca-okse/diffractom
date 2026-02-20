@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import Optional, List
 from scipy.spatial.transform import Rotation
 import numpy as np
-from odftt.texture import grids, odfs, point_groups
 
 @dataclass
 class OrientationNode:
@@ -21,59 +20,6 @@ class OrientationTree:
         self.nodes: list[OrientationNode] = []
         self.levels: dict[int, list[int]] = {i: [] for i in range(len(sigma_levels))}
         self.sigma_levels = list(sigma_levels)
-
-    # ------------------------------------------------------------
-    # NEW: initialize from Hopf grid in fundamental zone
-    # ------------------------------------------------------------
-    @classmethod
-    def from_hopf_fzone(
-        cls,
-        pg,
-        grid_resolution_parameter: int,
-        sigma_levels,
-    ):
-        
-        """
-        Initialize an OrientationTree from a Hopf grid
-        restricted to the fundamental zone of the material.
-
-        Parameters
-        ----------
-        material : Material
-            Material object with crystal system information.
-        grid_resolution_parameter : int
-            Hopf grid resolution parameter.
-        sigma_levels : list[float]
-            Sigma values per refinement level. Level 0 is used here.
-
-        Returns
-        -------
-        tree : OrientationTree
-        """
-        # --- generate Hopf grid in FZ ---
-        pg_mats = pg.reshape(-1, 3, 3)
-        pg_rotations = Rotation.from_matrix(pg_mats)
-        rotations = grids.hopf_grid(grid_resolution_parameter, pg_rotations)
-
-        # --- create tree ---
-        tree = cls(sigma_levels=sigma_levels)
-
-        sigma0 = sigma_levels[0]
-
-        for R in rotations:
-            node = OrientationNode(
-                R=R,
-                level=0,
-                sigma=sigma0,
-                parent=None,
-                children=[],
-                active=True,
-            )
-            idx = len(tree.nodes)
-            tree.nodes.append(node)
-            tree.levels[0].append(idx)
-
-        return tree
 
     def leaf_nodes(self):
         return [i for i, n in enumerate(self.nodes)
@@ -240,6 +186,10 @@ class OrientationTree:
             indices = [i for i in indices if self.nodes[i].active]
         return [self.nodes[i].R for i in indices]
 
+    def active_rotations(self, level, active_only=True):
+        indices = self.active_leaf_nodes()
+        return [self.nodes[i].R for i in indices]
+
 
     def scores_at_level(self, level, active_only=True):
         indices = self.levels.get(level, [])
@@ -292,39 +242,6 @@ class OrientationTree:
 
 
 
-
-
-
-def generate_hopf_grid_fzone(material, grid_resolution_parameter, kernel_sigma):
-    """
-    Prepare ODF grids and GaussianRBF objects per material.
-
-    Returns
-    -------
-    grid_list : list
-    odf_list  : list
-    """
-
-    point_group_map = {
-        "triclinic": point_groups.trivial,
-        "monoclinic": point_groups.cyclic_2,
-        "orthorhombic": point_groups.orthorhombic,
-        "tetragonal": point_groups.tetragonal,
-        "trigonal": point_groups.trigonal,
-        "hexagonal": point_groups.hexagonal,
-        "cubic": point_groups.cubic,
-    }
-
-
-    system = material["system"].lower()
-
-    if system not in point_group_map:
-        raise ValueError(system)
-
-    pg = point_group_map[system]
-    grid = grids.hopf_grid(grid_resolution_parameter, pg)
-
-    return grid
 
 def invert_grid(grid):
     grid_inv_cpu = np.stack([rot.inv().as_matrix().reshape(-1) for rot in grid],axis=0).astype(np.float32)

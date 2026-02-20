@@ -4,14 +4,12 @@ import numpy as np
 import pyopencl as cl
 import pyopencl.array as clarray
 import pyopencl.clmath as clmath
-from package.texture_tomography.optimization.prox import prox_nonneg, prox_l1, prox_nonneg_l1
-from package.texture_tomography.optimization.prox import ProxKernels
+from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels
 
-from package.texture_tomography.optimization.prox_tv import (
+from .prox_tv import (
     TVProxKernels,
     prox_tv_nonneg_inplace,
 )
-
 
 # -------------------- FISTA helper kernels --------------------
 
@@ -239,12 +237,14 @@ class FISTAOpenCL:
                 total_Ax
             )
 
+            r2 = clarray.vdot(Ax, Ax).get()
+            fval = 0.5 * float(r2)
+
             # ---- grad = A*(r) ----
             self.op.adjoint_cl(Ax, grad)  # (Nx,Ny,K) Fortran
 
 
             # ---- v = y - tau*grad ----
-            t0 = time.perf_counter()
             total_x = np.int32(y.size)
             self.k_grad_step(
                 q, (int(total_x),), None,
@@ -274,11 +274,6 @@ class FISTAOpenCL:
 
             t = t_new
 
-            # ---- diagnostics ----
-
-            r2 = r2 = clarray.vdot(Ax, Ax).get()
-            fval = 0.5 * float(r2)
-            #fval = 0.0
             gval = 0.0
             if self.prox_kind in ("l1", "nonneg_l1") and self.lam != 0.0:
                 gval = self.lam * float(clarray.sum(clmath.fabs(x)).get())
@@ -352,3 +347,25 @@ class FISTAOpenCL:
             "final_xnorm": self.iter_stats[-1]["xnorm"],
             "final_gradnorm": self.iter_stats[-1]["gradnorm"],
         }
+
+
+        # ---------------- GPU cleanup ----------------
+        q.finish()
+
+        for arr in (y, x_old, grad):
+            if arr is not None:
+                arr.base_data.release()
+
+        if Ax is not None:
+            Ax.base_data.release()
+
+        if self.prox_kind == "nonneg_tv":
+            for arr in self._tv_buffers.values():
+                arr.base_data.release()
+            del self._tv_buffers
+
+        del y, x_old, grad, Ax
+        import gc
+        gc.collect()
+        q.finish()
+        # --------------------------------------------

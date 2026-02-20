@@ -1,41 +1,40 @@
+from __future__ import annotations
 import numpy as np
 import time
 import gc
-
-
-
-
+from typing import Any, Mapping
 import pyopencl as cl
 import pyopencl.array as clarray
 import gratopy
 from pyclblast import gemmStridedBatched
-
-
+from package.texture_tomography.multiresolution_refiner import OrientationTree
+from package.texture_tomography.material import Material
 from scipy.spatial.transform import Rotation as R
-from package.odf_mumott.pole_figure_geometry import GeometryContainerM
-
-from package.utils.coordinates import get_probed_coordinates
-
-from package.texture_tomography.operators.create_pfo_matrix import (
-    pfmatrix_eval_gpu,
-    build_pf_program
-)
-from package.texture_tomography.operators.pfo_kernels import build_all_opencl
-
-
+from .create_pfo_matrix import build_pf_program
+from .pfo_kernels import build_all_opencl
 
 
 class PFO_SINGLE:
-
     def __init__(
         self,
-        cfg: None,
-        material: None,
-        grid: None,
-        max_gb: None,
+        cfg: Mapping[str, Any],
+        material: Material,
+        grid: OrientationTree,
+        max_gb: float,
         verbose: bool = False,
         normalized: bool = False,
+        ctx: cl.Context | None = None,
+        queue: cl.CommandQueue | None = None,
     ):
+
+            # --- context / queue ---
+        if ctx is not None and queue is not None:
+            self.ctx = ctx
+            self.queue = queue
+        else:
+            self.ctx = cl.create_some_context(interactive=False)
+            self.queue = cl.CommandQueue(self.ctx)
+
         
         self.cfg = cfg
         self.normalized = normalized
@@ -52,9 +51,6 @@ class PFO_SINGLE:
         self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_rot, endpoint=False)
         self.pf_batch_max_gb = float(max_gb)
 
-        # --- context / queue ---
-        self.ctx = cl.create_some_context(interactive=False)
-        self.queue = cl.CommandQueue(self.ctx)
 
         # --- build kernels ---
         self.prg, self.k, self.pf_prg = build_all_opencl(self.ctx, ts=16)
@@ -88,53 +84,69 @@ class PFO_SINGLE:
         self.allocate_coefficient_buffer()
 
 
-    def detector_coordinates(self):
+    def detector_coordinates(self, integration_samples=1, full_circle_covered=True):
+        """ Calculates and returns the probed polar and azimuthal coordinates on the unit sphere at
+        each angle of projection and for each detector segment in the system's geometry.
+        """
         wavelength_angstrom = 12.398 / self.cfg["wavelength"]
-
-        j0 = np.asarray(self.cfg["j_direction_0"])
-        k0 = np.asarray(self.cfg["k_direction_0"])
-        p0 = np.asarray(self.cfg["p_direction_0"])
-        det_o = np.asarray(self.cfg["detector_direction_origin"])
-        det_p90 = np.asarray(self.cfg["detector_direction_positive_90"])
-
-        # ---------------- rotations ----------------
-        projections = {
-            str(i): {
-                "rotation_matrix": R.from_rotvec(
-                    angle * k0 / np.linalg.norm(k0)
-                ).as_matrix()
-            }
-            for i, angle in enumerate(self.angles)
-        }
-
-        detector_angles = np.linspace(0, 2*np.pi, self.N_chi, endpoint=False)
-
-        geom_dict = {
-            "projections": projections,
-            "p_direction_0": p0,
-            "j_direction_0": j0,
-            "k_direction_0": k0,
-            "detector_direction_origin": det_o,
-            "detector_direction_positive_90": det_p90,
-            "detector_angles": detector_angles,
-        }
-
-
-        two_theta_peaks = 2.0 * np.arcsin(
+        self.two_theta_peaks = 2.0 * np.arcsin(
             np.linalg.norm(self.h_cpu, axis=1) / (4.0 * np.pi) * wavelength_angstrom
         ).astype(np.float32)
-        print(wavelength_angstrom)
-        print(two_theta_peaks)
 
-        # ---------------- probed coordinates ----------------
         coords_list = []
-        for tt in two_theta_peaks:
-            geom_dict["two_theta"] = np.array([tt])
-            geom = GeometryContainerM(
-                dictionary=geom_dict,
-                data_type="dictionary"
-            ).geometry
-            coords = get_probed_coordinates(geom)[:, :, 0, :]
+        for tt in self.two_theta_peaks:
+
+            probed_directions_zero_rot = np.zeros((self.N_chi, integration_samples, 3))
+            # Impose symmetry if needed.
+            if not full_circle_covered:
+                shift = np.pi
+            else:
+                shift = 0
+            det_bin_middles_extended = np.linspace(0, 2*np.pi, self.N_chi, endpoint=False)
+            det_bin_middles_extended = np.insert(det_bin_middles_extended, 0, det_bin_middles_extended[-1] + shift)
+            det_bin_middles_extended = np.append(det_bin_middles_extended, det_bin_middles_extended[1] + shift)
+
+            for ii in range(self.N_chi):
+
+                # Check if the interval from the previous to the next bin goes over the -pi +pi discontinuity
+                before = det_bin_middles_extended[ii]
+                now = det_bin_middles_extended[ii + 1]
+                after = det_bin_middles_extended[ii + 2]
+
+                if abs(before - now + 2 * np.pi) < abs(before - now):
+                    before = before + 2 * np.pi
+                elif abs(before - now - 2 * np.pi) < abs(before - now):
+                    before = before - 2 * np.pi
+
+                if abs(now - after + 2 * np.pi) < abs(now - after):
+                    after = after - 2 * np.pi
+                elif abs(now - after - 2 * np.pi) < abs(now - after):
+                    after = after + 2 * np.pi
+
+                # Generate a linearly spaced set of angles covering the detector segment
+                start = 0.5 * (before + now)
+                end = 0.5 * (now + after)
+                inc = (end - start) / integration_samples
+                angles = np.linspace(start + inc / 2, end - inc / 2, integration_samples)
+
+                # Make the zero-rotation-frame vectors corresponding to the given angles
+                probed_directions_zero_rot[ii, :, :] = np.cos(angles[:, np.newaxis]) * \
+                    np.array(self.cfg["detector_direction_origin"])[np.newaxis,:]
+
+                probed_directions_zero_rot[ii, :, :] += np.sin(angles[:, np.newaxis]) * \
+                    np.array(self.cfg["detector_direction_positive_90"])[np.newaxis,:]
+
+            twothetahalf = tt/2
+
+            probed_directions_zero_rot = +probed_directions_zero_rot * np.cos(twothetahalf)\
+                - np.sin(twothetahalf) * np.array(self.cfg['p_direction_0'])
+            probed_direction_vectors = np.zeros((self.N_rot, self.N_chi, integration_samples, 3), dtype=np.float64)
+            k0 = np.asarray(self.cfg["k_direction_0"])
+            Rmats = R.from_rotvec(self.angles[:, None] * k0).as_matrix()
+            probed_direction_vectors[...] = \
+                np.einsum('kij,mli->kmlj', Rmats, probed_directions_zero_rot)
+
+            coords = probed_direction_vectors[:,:,0,:]
             coords_list.append(coords)
 
         coords_cpu = np.stack(coords_list, axis=-1)
@@ -146,9 +158,7 @@ class PFO_SINGLE:
 
 
     def transfer_material_parameters_to_gpu(self):
-        self.pf_sym_ops_gpu_list = []
-        self.pf_sym_ops_cpu_list = []
-        self.N_peaks_list = []
+
 
         self.h_cpu_normed = np.asarray(self.material.h_vecs_normed, dtype=np.float32, order="C")
         self.h_cpu = np.asarray(self.material.h_vecs, dtype=np.float32, order="C")
@@ -278,34 +288,62 @@ class PFO_SINGLE:
             self.total_bytes = total_bytes
 
 
+
     def free_memory(self):
-
-
-        lst = getattr(self, "coeffs_sino_C", None)
-
-        gpu_lists = [
+        """
+        Release OpenCL buffers created by allocate_coefficient_buffer() and
+        remove the corresponding attributes from this object.
+        """
+        buffer_names = [
+            "coeffs_sino_F",
             "coeffs_sino_C",
-            "coords_gpu",
-            "grid_inv_gpu",
-            "sym_ops_gpu",
-            "h_gpu_normed",
-            "intens_gpu",
+            "_coeffs_batch_F",
+            "_basis_batch_kmax",
+            "_basis_batch_transpose_kmax",
+            "_grid_inv_kmax",
+            "_inv_sigma2_kmax",
+            "_norm_factor_kmax",
         ]
 
-        for name in gpu_lists:
-            lst = getattr(self, name, None)
-            if lst is not None:
-                del lst
+        # Release buffers if they exist
+        for name in buffer_names:
+            arr = getattr(self, name, None)
+            if arr is None:
+                continue
 
-        for name in [
-            "coeffs_sino_F",
-            "_x_full_gpu",
-            "B_gpu",
-        ]:
-            if hasattr(self, name):
+            # pyopencl.array.Array holds the underlying cl.Buffer in .base_data
+            try:
+                base = getattr(arr, "base_data", None)
+                if base is not None:
+                    base.release()
+            except Exception:
+                pass
+
+            # Remove attribute so refcount drops
+            try:
                 delattr(self, name)
+            except Exception:
+                pass
+
+        # If you stored a total_bytes summary, clear it too
+        if hasattr(self, "total_bytes"):
+            try:
+                delattr(self, "total_bytes")
+            except Exception:
+                pass
+
+        # Make sure queued commands are done (finish before/after is fine)
+        try:
+            if hasattr(self, "queue") and self.queue is not None:
+                self.queue.finish()
+        except Exception:
+            pass
 
         gc.collect()
+
+        if getattr(self, "verbose", False):
+            print("OpenCL GPU memory freed.")
+
 
 
 
@@ -322,12 +360,7 @@ class PFO_SINGLE:
                 - k_end
                 - K_batch
         """
-
-        if not hasattr(self, "pf_batch_max_gb"):
-            raise RuntimeError(
-                "pf_batch_max_gb not set. Call set_pf_batch_max_gb(...) first."
-            )
-
+        
         # ---- dimensions ----
         R = self.N_rot
         C = self.N_chi
@@ -395,13 +428,14 @@ class PFO_SINGLE:
 
         data.fill(0.0)
 
-        R  = self.N_rot
+        R  = int(self.N_rot)
         C = int(self.N_chi)
         P = int(self.N_peaks)
         G = int(len(self.sym_ops_cpu))
         Kmax = self.K_batch_max
         Nx = self.Nx
         Ny = self.Ny
+        N_rot = self.N_rot
         coords_gpu   = self.coords_gpu
         sym_ops_gpu  = self.sym_ops_gpu
         h_gpu_normed        = self.h_gpu_normed
@@ -445,15 +479,15 @@ class PFO_SINGLE:
             # 3) Transpose sino F → C (only Kb)
             # -------------------------------------------------
 
-            total = self.N_rot * self.Nx * Kmax
+            total = N_rot * Nx * Kmax
             self.k.transpose_d_omega_k_f_to_c(
                 self.queue,
                 (total,),
                 None,
                 self.coeffs_sino_F.data,
                 self.coeffs_sino_C.data,
-                np.int32(self.Nx),
-                np.int32(self.N_rot),
+                np.int32(Nx),
+                np.int32(N_rot),
                 np.int32(Kmax),
                 np.int32(total),
             )
@@ -626,7 +660,7 @@ class PFO_SINGLE:
                 self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, intensity_gpu)
 
             # Transpose the pf matrix
-            total = R*Kmax*P*C
+            total = R*Kmax*C*P
             self.k.btranspose_kernel(
                 self.queue,
                 (total,),
@@ -635,12 +669,12 @@ class PFO_SINGLE:
                 self._basis_batch_transpose_kmax.data,
                 np.int32(R),
                 np.int32(Kmax),
-                np.int32(P*C),
+                np.int32(C*P),
                 np.int32(total),
             )
 
             # batched gemm overwrites self.coeffs_sino_C
-            batched_gemm_adj_clblast(self.queue, data, self._basis_batch_transpose_kmax, self.coeffs_sino_C, R, Nx, P*C, Kmax, self.N_rot/np.pi)
+            batched_gemm_adj_clblast(self.queue, data, self._basis_batch_transpose_kmax, self.coeffs_sino_C, R, Nx, P*C, Kmax, R/np.pi)
             # Now transpose, backproject and depose the coefficients in the "coeffs" array
 
             # Transpose
@@ -790,8 +824,16 @@ def gpu_norm(x):
     return float(clarray.sum(x*x).get() ** 0.5)
 
 
+def estimate_L_power(
+    op,
+    niter: int = 20,
+    seed: int = 0,
+    eps: float = 1e-30,
+    verbose: int = 1,
+) -> float:
+    if niter < 1:
+        raise ValueError("niter must be >= 1")
 
-def estimate_L_power(op, niter=20, seed=0, eps=1e-30, verbose=1):
     q = op.queue
     rng = np.random.default_rng(seed)
 
@@ -804,7 +846,7 @@ def estimate_L_power(op, niter=20, seed=0, eps=1e-30, verbose=1):
 
     # init x random
     x_host = rng.standard_normal(x.shape).astype(np.float32, copy=False, order="F")
-    import pyopencl as cl
+    assert x.data is not None
     cl.enqueue_copy(q, x.data, x_host)
     q.finish()
 
@@ -813,7 +855,7 @@ def estimate_L_power(op, niter=20, seed=0, eps=1e-30, verbose=1):
     x *= np.float32(1.0 / xnorm)
     q.finish()
 
-    L_est = None
+    L_est: float = 0.0
     for it in range(niter):
         # Ax = A x
         op.direct_cl(x, Ax)
@@ -821,12 +863,10 @@ def estimate_L_power(op, niter=20, seed=0, eps=1e-30, verbose=1):
         op.adjoint_cl(Ax, z)
         q.finish()
 
-        # Rayleigh quotient: <x, z> / <x, x> ; since x normalized, denom=1
         num = float(clarray.vdot(x, z).get())
         den = float(clarray.vdot(x, x).get()) + eps
         L_est = num / den
 
-        # next x = z / ||z||
         znorm = float(np.sqrt(clarray.vdot(z, z).get()) + eps)
         x[:] = z * np.float32(1.0 / znorm)
         q.finish()
@@ -834,4 +874,17 @@ def estimate_L_power(op, niter=20, seed=0, eps=1e-30, verbose=1):
         if verbose:
             print(f"[power {it+1:02d}] L_est={L_est:.6e}  ||z||={znorm:.6e}")
 
-    return L_est
+    # ---------- GPU cleanup ----------
+    if x.base_data is not None:
+        x.base_data.release()
+    if Ax.base_data is not None:
+        Ax.base_data.release()
+    if z.base_data is not None:
+        z.base_data.release()
+
+    del x, Ax, z, x_host
+    gc.collect()
+    q.finish()
+    # --------------------------------
+
+    return float(L_est)

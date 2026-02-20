@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "texture-tomography"
+version = "0.1.0"
+description = "GPU-based texture tomography reconstruction framework"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Your Name" }
+]
+
+dependencies = [
+  "numpy",
+  "scipy",
+  "pyopencl",
+  "ase",
+  "pymatgen",
+  "gratopy",
+  "pyclblast"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+texture_tomography = ["**/*.cl"]
