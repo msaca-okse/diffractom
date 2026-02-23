@@ -7,8 +7,8 @@ import pyopencl as cl
 import pyopencl.array as clarray
 import gratopy
 from pyclblast import gemmStridedBatched
-from package.texture_tomography.multiresolution_refiner import OrientationTree
-from package.texture_tomography.material import Material
+from ..utils.multiresolution_refiner import OrientationTree
+from ..crystallography.material import Material
 from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
 from .pfo_kernels import build_all_opencl
@@ -70,12 +70,12 @@ class PFO_SINGLE:
             self.queue,
             gratopy.PARALLEL,
             (self.Nx, self.Ny, self.K_batch_max),
-            self.N_rot,
+            self.angles,
+            #self.N_rot,
             n_detectors=self.Nx,
             image_width=self.Nx,
             detector_width=self.Nx,
             detector_shift=2,
-            angle_range=self.angle_range
         )
         assert self.queue.context.int_ptr == self.ctx.int_ptr
 

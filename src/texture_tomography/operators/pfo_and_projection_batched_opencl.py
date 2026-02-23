@@ -79,12 +79,12 @@ class PFO_OPENCL_BATCHED:
             self.queue,
             gratopy.PARALLEL,
             (self.Nx, self.Ny, self.K_sum),
-            self.N_rot,
+            self.angles,
+            #self.N_rot,
             n_detectors=self.Nx,
             image_width=self.Nx,
             detector_width=self.Nx,
             detector_shift=2,
-            angle_range=self.angle_range
         )
         assert self.queue.context.int_ptr == self.ctx.int_ptr
 

@@ -7,9 +7,9 @@ name = "texture-tomography"
 version = "0.1.0"
 description = "GPU-based texture tomography reconstruction framework"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 authors = [
-  { name = "Your Name" }
+  { name = "Martin Sæbye Carøe" }
 ]
 
 dependencies = [
