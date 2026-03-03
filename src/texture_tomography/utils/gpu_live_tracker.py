@@ -3,7 +3,10 @@ import time
 import threading
 
 class GPUMemoryLogger:
+    """Poll GPU memory usage in a background thread via nvidia-smi."""
+
     def __init__(self, interval=0.2, gpu_id = 0):
+        """Start a logger that polls every *interval* seconds on *gpu_id*."""
         self.interval = interval
         self.times = []      # seconds since start
         self.memory_mb = []  # GPU memory usage in MB
@@ -37,6 +40,7 @@ class GPUMemoryLogger:
 
 
     def start(self):
+        """Begin background polling."""
         if self._running:
             return
         self._running = True
@@ -44,10 +48,12 @@ class GPUMemoryLogger:
         self._thread.start()
 
     def stop(self):
+        """Stop background polling and join the thread."""
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=1.0)
 
     def as_arrays(self):
+        """Return (times, memory_mb) as numpy arrays."""
         import numpy as np
         return np.asarray(self.times), np.asarray(self.memory_mb)

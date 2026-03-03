@@ -28,9 +28,7 @@ __kernel void prox_nonneg_l1(__global float *x, float lambda, int total) {
 
 
 class ProxKernels:
-    """
-    Holds compiled program and cached kernels.
-    """
+    """Compiled proximal operator OpenCL kernels (nonneg, l1, nonneg_l1)."""
     def __init__(self, ctx: cl.Context):
         self.prg = cl.Program(ctx, PROX_KERNELS).build()
 
@@ -41,6 +39,7 @@ class ProxKernels:
 
 
 def prox_nonneg(queue, kernels: ProxKernels, x_gpu):
+    """Non-negativity projection in place."""
     total = np.int32(x_gpu.size)
     kernels.k_prox_nonneg(
         queue,
@@ -53,6 +52,7 @@ def prox_nonneg(queue, kernels: ProxKernels, x_gpu):
 
 
 def prox_l1(queue, kernels: ProxKernels, x_gpu, lam, tau):
+    """Soft-thresholding (L1 proximal) in place."""
     total = np.int32(x_gpu.size)
     kernels.k_prox_l1(
         queue,
@@ -66,6 +66,7 @@ def prox_l1(queue, kernels: ProxKernels, x_gpu, lam, tau):
 
 
 def prox_nonneg_l1(queue, kernels: ProxKernels, x_gpu, lam, tau):
+    """Non-negative soft-thresholding in place."""
     total = np.int32(x_gpu.size)
     kernels.k_prox_nonneg_l1(
         queue,

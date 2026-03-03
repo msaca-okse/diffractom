@@ -145,6 +145,7 @@ __kernel void tv_norm(
 
 
 class TVProxKernels:
+    """Compiled TV proximal operator OpenCL kernels (Chambolle algorithm)."""
     def __init__(self, ctx: cl.Context):
         self.prg = cl.Program(ctx, TV_KERNELS).build()
 

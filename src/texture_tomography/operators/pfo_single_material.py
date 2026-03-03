@@ -15,6 +15,13 @@ from .pfo_kernels import build_all_opencl
 
 
 class PFO_SINGLE:
+    """Single-material pole-figure forward operator on GPU.
+
+    Computes  data = PF @ Radon(coeffs)  and its adjoint, where PF is the
+    pole-figure transform and Radon is the parallel-beam projection.
+    All heavy computation runs on OpenCL.
+    """
+
     def __init__(
         self,
         cfg: Mapping[str, Any],
@@ -25,9 +32,32 @@ class PFO_SINGLE:
         normalized: bool = False,
         ctx: cl.Context | None = None,
         queue: cl.CommandQueue | None = None,
+        **kwargs,
     ):
+        """Initialise the single-material forward operator.
 
-            # --- context / queue ---
+        Parameters
+        ----------
+        cfg : dict
+            Experiment configuration (keys: Nx, Ny, N_Omega, N_eta, angle_range,
+            wavelength, detector_direction_origin, etc.).
+        material : Material
+            Crystallographic material with reflections and symmetry.
+        grid : OrientationTree
+            Orientation discretisation tree.
+        max_gb : float
+            GPU memory budget (GB) for K-batching.
+        verbose : bool
+            Print buffer allocation summary.
+        normalized : bool
+            If True, skip intensity scaling of the PF matrix.
+        ctx, queue : optional
+            Existing OpenCL context/queue; created automatically if None.
+        **kwargs
+            Override any cfg key (e.g. ``N_Omega=50``).
+        """
+
+        # --- context / queue ---
         if ctx is not None and queue is not None:
             self.ctx = ctx
             self.queue = queue
@@ -36,19 +66,26 @@ class PFO_SINGLE:
             self.queue = cl.CommandQueue(self.ctx)
 
         
-        self.cfg = cfg
+        # Keyword arguments override cfg values (e.g. N_Omega=50 overrides cfg['N_Omega'])
+        self.cfg = {**cfg, **kwargs}
         self.normalized = normalized
         self.material = material
         self.grid = grid
         self.verbose = verbose
-        self.N_chi = self.cfg['N_chi']
+        self.N_eta = self.cfg['N_eta']
         self.N_peaks = len(self.material.reflections)
-        self.N_seg = self.N_peaks * self.N_chi
+        self.N_seg = self.N_peaks * self.N_eta
         self.Nx = self.cfg['Nx']
         self.Ny = self.cfg['Ny']
-        self.N_rot = self.cfg['N_rot']
+        self.N_Omega = self.cfg['N_Omega']
+        self.N_Omega_subdivisions = self.cfg.get('N_Omega_subdivisions', 1)
         self.angle_range = np.array(self.cfg['angle_range'])/180*np.pi
-        self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_rot, endpoint=False)
+        delta = (self.angle_range[1] - self.angle_range[0]) / self.N_Omega
+        sub_delta = delta / self.N_Omega_subdivisions
+        # Coarse angles centered in their intervals (for gratopy projection)
+        self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega, endpoint=False) + delta / 2
+        # Fine angles centered in sub-intervals (for PF coordinate generation)
+        self.angles_subdivided = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega * self.N_Omega_subdivisions, endpoint=False) + sub_delta / 2
         self.pf_batch_max_gb = float(max_gb)
 
 
@@ -71,7 +108,7 @@ class PFO_SINGLE:
             gratopy.PARALLEL,
             (self.Nx, self.Ny, self.K_batch_max),
             self.angles,
-            #self.N_rot,
+            #self.N_Omega,
             n_detectors=self.Nx,
             image_width=self.Nx,
             detector_width=self.Nx,
@@ -92,21 +129,21 @@ class PFO_SINGLE:
         self.two_theta_peaks = 2.0 * np.arcsin(
             np.linalg.norm(self.h_cpu, axis=1) / (4.0 * np.pi) * wavelength_angstrom
         ).astype(np.float32)
-
+        print(self.two_theta_peaks)
         coords_list = []
         for tt in self.two_theta_peaks:
 
-            probed_directions_zero_rot = np.zeros((self.N_chi, integration_samples, 3))
+            probed_directions_zero_rot = np.zeros((self.N_eta, integration_samples, 3))
             # Impose symmetry if needed.
             if not full_circle_covered:
                 shift = np.pi
             else:
                 shift = 0
-            det_bin_middles_extended = np.linspace(0, 2*np.pi, self.N_chi, endpoint=False)
+            det_bin_middles_extended = np.linspace(0, 2*np.pi, self.N_eta, endpoint=False)
             det_bin_middles_extended = np.insert(det_bin_middles_extended, 0, det_bin_middles_extended[-1] + shift)
             det_bin_middles_extended = np.append(det_bin_middles_extended, det_bin_middles_extended[1] + shift)
 
-            for ii in range(self.N_chi):
+            for ii in range(self.N_eta):
 
                 # Check if the interval from the previous to the next bin goes over the -pi +pi discontinuity
                 before = det_bin_middles_extended[ii]
@@ -140,17 +177,19 @@ class PFO_SINGLE:
 
             probed_directions_zero_rot = +probed_directions_zero_rot * np.cos(twothetahalf)\
                 - np.sin(twothetahalf) * np.array(self.cfg['p_direction_0'])
-            probed_direction_vectors = np.zeros((self.N_rot, self.N_chi, integration_samples, 3), dtype=np.float64)
+            N_fine = self.N_Omega * self.N_Omega_subdivisions
+            probed_direction_vectors = np.zeros((N_fine, self.N_eta, integration_samples, 3), dtype=np.float64)
             k0 = np.asarray(self.cfg["k_direction_0"])
-            Rmats = R.from_rotvec(self.angles[:, None] * k0).as_matrix()
+            Rmats = R.from_rotvec(self.angles_subdivided[:, None] * k0).as_matrix()
             probed_direction_vectors[...] = \
                 np.einsum('kij,mli->kmlj', Rmats, probed_directions_zero_rot)
 
             coords = probed_direction_vectors[:,:,0,:]
+            coords = coords.reshape((self.N_Omega, self.N_Omega_subdivisions, self.N_eta, 3))
             coords_list.append(coords)
 
         coords_cpu = np.stack(coords_list, axis=-1)
-        coords_cpu = coords_cpu.transpose((0, 1, 3, 2))
+        coords_cpu = coords_cpu.transpose((0, 1, 2, 4, 3))
         self.coords_cpu = np.asarray(coords_cpu, dtype=np.float32, order="C")
         self.coords_gpu = clarray.to_device(self.queue, self.coords_cpu)
 
@@ -158,8 +197,7 @@ class PFO_SINGLE:
 
 
     def transfer_material_parameters_to_gpu(self):
-
-
+        """Upload reciprocal-lattice vectors, intensities and symmetry ops to GPU."""
         self.h_cpu_normed = np.asarray(self.material.h_vecs_normed, dtype=np.float32, order="C")
         self.h_cpu = np.asarray(self.material.h_vecs, dtype=np.float32, order="C")
         self.h_gpu_normed = clarray.to_device(self.queue, self.h_cpu_normed)
@@ -200,8 +238,7 @@ class PFO_SINGLE:
 
 
     def allocate_coefficient_buffer(self):
-        # ---- reusable transpose buffers (per material) ----
-
+        """Pre-allocate reusable GPU buffers for forward/adjoint computation."""
         buffers = []
 
         def _alloc(name, shape, dtype, order):
@@ -218,7 +255,7 @@ class PFO_SINGLE:
 
         self.coeffs_sino_C = _alloc(
             "coeffs_sino_C",
-            (self.N_rot, self.Nx, self.K_batch_max),
+            (self.N_Omega, self.Nx, self.K_batch_max),
             np.float32,
             "C",
         )
@@ -232,14 +269,14 @@ class PFO_SINGLE:
 
         self._basis_batch_kmax = _alloc(
             "_basis_batch_kmax",
-            (self.N_rot, self.K_batch_max, self.N_chi, self.N_peaks),
+            (self.N_Omega, self.K_batch_max, self.N_eta, self.N_peaks),
             np.float32,
             "C",
         )
 
         self._basis_batch_transpose_kmax = _alloc(
             "_basis_batch_transpose_kmax",
-            (self.N_rot, self.N_peaks * self.N_chi, self.K_batch_max),
+            (self.N_Omega, self.N_peaks * self.N_eta, self.K_batch_max),
             np.float32,
             "C",
         )
@@ -362,8 +399,8 @@ class PFO_SINGLE:
         """
         
         # ---- dimensions ----
-        R = self.N_rot
-        C = self.N_chi
+        R = self.N_Omega
+        C = self.N_eta
         T = self.N_peaks   # masked theta count
         K = self.K
 
@@ -409,12 +446,12 @@ class PFO_SINGLE:
         Returns
         -------
         yin_gpu : clarray
-            Shape (N_rot, Nx, N_seg), C order
+            Shape (N_Omega, Nx, N_seg), C order
         """
 
         data = clarray.zeros(
             self.queue,
-            (self.N_rot, self.Nx, self.N_seg),
+            (self.N_Omega, self.Nx, self.N_seg),
             dtype=np.float32,
             order="C",
         )
@@ -425,17 +462,23 @@ class PFO_SINGLE:
 
 
     def direct_cl(self, coeffs, data):
+        """In-place forward operator: data += PF @ Radon(coeffs).
 
+        Parameters
+        ----------
+        coeffs : clarray, (Nx, Ny, K), F-order
+        data : clarray, (N_Omega, Nx, N_seg), C-order — accumulated into.
+        """
         data.fill(0.0)
 
-        R  = int(self.N_rot)
-        C = int(self.N_chi)
+        R  = int(self.N_Omega)
+        C = int(self.N_eta)
         P = int(self.N_peaks)
         G = int(len(self.sym_ops_cpu))
         Kmax = self.K_batch_max
         Nx = self.Nx
         Ny = self.Ny
-        N_rot = self.N_rot
+        N_Omega = self.N_Omega
         coords_gpu   = self.coords_gpu
         sym_ops_gpu  = self.sym_ops_gpu
         h_gpu_normed        = self.h_gpu_normed
@@ -479,7 +522,7 @@ class PFO_SINGLE:
             # 3) Transpose sino F → C (only Kb)
             # -------------------------------------------------
 
-            total = N_rot * Nx * Kmax
+            total = N_Omega * Nx * Kmax
             self.k.transpose_d_omega_k_f_to_c(
                 self.queue,
                 (total,),
@@ -487,7 +530,7 @@ class PFO_SINGLE:
                 self.coeffs_sino_F.data,
                 self.coeffs_sino_C.data,
                 np.int32(Nx),
-                np.int32(N_rot),
+                np.int32(N_Omega),
                 np.int32(Kmax),
                 np.int32(total),
             )
@@ -534,6 +577,7 @@ class PFO_SINGLE:
                 np.int32(C),
                 np.int32(P),
                 np.int32(G),
+                np.int32(self.N_Omega_subdivisions),
             )
             if not self.normalized:
                 self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, intensity_gpu)
@@ -550,7 +594,7 @@ class PFO_SINGLE:
         Parameters
         ----------
         y_gpu : clarray
-            Shape (N_rot, Nx, N_seg), C-order
+            Shape (N_Omega, Nx, N_seg), C-order
 
         Returns
         -------
@@ -577,14 +621,14 @@ class PFO_SINGLE:
         Parameters
         ----------
         data : clarray
-            Shape (N_rot, Nx, N_seg), C-order
+            Shape (N_Omega, Nx, N_seg), C-order
         coeffs : clarray
             Shape (Nx, Nx, K_sum), Fortran-order
             Will be overwritten
         """
 
         # ---------------- checks ----------------
-        assert data.shape == (self.N_rot, self.Nx, self.N_seg)
+        assert data.shape == (self.N_Omega, self.Nx, self.N_seg)
         assert data.flags.c_contiguous
 
         assert coeffs.shape == (self.Nx, self.Ny, self.K)
@@ -594,8 +638,8 @@ class PFO_SINGLE:
         coeffs.fill(0.0)
 
         Kmax = self.K_batch_max
-        R  = self.N_rot
-        C = int(self.N_chi)
+        R  = self.N_Omega
+        C = int(self.N_eta)
         P = int(self.N_peaks)
         G = int(len(self.sym_ops_cpu))
         Nx = self.Nx
@@ -655,6 +699,7 @@ class PFO_SINGLE:
                 np.int32(C),
                 np.int32(P),
                 np.int32(G),
+                np.int32(self.N_Omega_subdivisions),
             )
             if not self.normalized:
                 self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, intensity_gpu)
@@ -718,10 +763,7 @@ class PFO_SINGLE:
 
 
     def _scale_pf_by_intensity_inplace(self, PF_GPU: clarray.Array, INTENSITY_GPU: clarray.Array) -> None:
-        """
-        PF_GPU:        (R, Kb, C, P) C-order
-        INTENSITY_GPU: (P,) float32 on GPU
-        """
+        """Element-wise multiply PF_GPU (R, Kb, C, P) by intensity per peak P."""
         R = int(PF_GPU.shape[0])
         Kb = int(PF_GPU.shape[1])
         C = int(PF_GPU.shape[2])
@@ -748,11 +790,7 @@ class PFO_SINGLE:
 
 
 def batched_gemm_clblast(queue, A3, B3, C3, R, M, K, N):
-    """
-    A3: (R, M, K) clarray
-    B3: (R, K, N) clarray
-    C3: (R, M, N) clarray
-    """
+    """Batched GEMM via CLBlast: C += A @ B, per-batch (beta=1 accumulate)."""
 
     # reshape views (NO COPY)
     A = A3.reshape((R*M, K))
@@ -784,11 +822,7 @@ def batched_gemm_clblast(queue, A3, B3, C3, R, M, K, N):
 
 
 def batched_gemm_adj_clblast(queue, Y3, BT3, X3, R, Mx, Nsub, K, alpha):
-    """
-    Y3:  (R, Mx,   Nsub)  clarray
-    BT3: (R, Nsub, K)     clarray  (explicitly transposed B)
-    X3:  (R, Mx,   K)     clarray (output)
-    """
+    """Batched adjoint GEMM: X = alpha * Y @ BT, per-batch (beta=0 overwrite)."""
 
     # 2D views (NO COPY)
     A = Y3.reshape((R * Mx, Nsub))   # (R*Mx, Nsub)
@@ -821,6 +855,7 @@ def batched_gemm_adj_clblast(queue, Y3, BT3, X3, R, Mx, Nsub, K, alpha):
 
 
 def gpu_norm(x):
+    """Compute L2 norm of a GPU array."""
     return float(clarray.sum(x*x).get() ** 0.5)
 
 
@@ -831,6 +866,7 @@ def estimate_L_power(
     eps: float = 1e-30,
     verbose: int = 1,
 ) -> float:
+    """Estimate the Lipschitz constant L = ||A^T A|| via power iteration."""
     if niter < 1:
         raise ValueError("niter must be >= 1")
 
@@ -840,7 +876,7 @@ def estimate_L_power(
     # x in domain, Fortran
     x = clarray.empty(q, (op.Nx, op.Ny, op.K), np.float32, order="F")
     # y in range, C
-    Ax = clarray.empty(q, (op.N_rot, op.Nx, op.N_seg), np.float32, order="C")
+    Ax = clarray.empty(q, (op.N_Omega, op.Nx, op.N_seg), np.float32, order="C")
     # z = A^*Ax in domain
     z = clarray.empty(q, x.shape, np.float32, order="F")
 

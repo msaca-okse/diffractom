@@ -1,6 +1,6 @@
 PF_KERNEL_SRC = r"""
 __kernel void pfmatrix_eval(
-    __global const float *coords,      // (R, C, P, 3) flattened
+    __global const float *coords,      // (R, S, C, P, 3) flattened
     __global const float *grid_inv,    // (K, 9) flattened row-major (3x3)
     __global const float *sym_ops,     // (G, 9) flattened row-major (3x3)
     __global const float *hvecs,       // (P, 3) normalized h-vectors
@@ -14,7 +14,8 @@ __kernel void pfmatrix_eval(
     const int K,
     const int C,
     const int P,
-    const int G
+    const int G,
+    const int S                        // number of omega subdivisions
 ){
     int gid = get_global_id(0);
     int total = R * K * C * P;
@@ -28,46 +29,54 @@ __kernel void pfmatrix_eval(
     int k = tmp % K;
     int r = tmp / K;
 
-    // --- load coordinate v = coords[r,c,p,:] ---
-    int coord_base = ((r * C + c) * P + p) * 3;
-    float vx = coords[coord_base + 0];
-    float vy = coords[coord_base + 1];
-    float vz = coords[coord_base + 2];
-
-    // --- apply inverse grid rotation q = grid_inv[k] * v ---
-    int Rb = k * 9;
-    float qx = grid_inv[Rb + 0]*vx + grid_inv[Rb + 1]*vy + grid_inv[Rb + 2]*vz;
-    float qy = grid_inv[Rb + 3]*vx + grid_inv[Rb + 4]*vy + grid_inv[Rb + 5]*vz;
-    float qz = grid_inv[Rb + 6]*vx + grid_inv[Rb + 7]*vy + grid_inv[Rb + 8]*vz;
-
     // --- load normalized h-vector for this reflection p ---
     int hb = p * 3;
     float hx0 = hvecs[hb + 0];
     float hy0 = hvecs[hb + 1];
     float hz0 = hvecs[hb + 2];
 
-    float w = 0.0f;
     float inv_sig2 = inv_sigma2[k];
+    int Rb = k * 9;
 
-    // loop over symmetry operations
-    for (int g = 0; g < G; ++g) {
-        int Sb = g * 9;
+    float w_total = 0.0f;
 
-        // h_rot = sym_ops[g] * h0
-        float hx = sym_ops[Sb + 0]*hx0 + sym_ops[Sb + 1]*hy0 + sym_ops[Sb + 2]*hz0;
-        float hy = sym_ops[Sb + 3]*hx0 + sym_ops[Sb + 4]*hy0 + sym_ops[Sb + 5]*hz0;
-        float hz = sym_ops[Sb + 6]*hx0 + sym_ops[Sb + 7]*hy0 + sym_ops[Sb + 8]*hz0;
+    // loop over omega subdivisions
+    for (int s = 0; s < S; ++s) {
+        // --- load coordinate v = coords[r,s,c,p,:] ---
+        int coord_base = (((r * S + s) * C + c) * P + p) * 3;
+        float vx = coords[coord_base + 0];
+        float vy = coords[coord_base + 1];
+        float vz = coords[coord_base + 2];
 
-        float dot = hx*qx + hy*qy + hz*qz;
+        // --- apply inverse grid rotation q = grid_inv[k] * v ---
+        float qx = grid_inv[Rb + 0]*vx + grid_inv[Rb + 1]*vy + grid_inv[Rb + 2]*vz;
+        float qy = grid_inv[Rb + 3]*vx + grid_inv[Rb + 4]*vy + grid_inv[Rb + 5]*vz;
+        float qz = grid_inv[Rb + 6]*vx + grid_inv[Rb + 7]*vy + grid_inv[Rb + 8]*vz;
 
-        float arg1 = -(1.0f - dot) * inv_sig2;
-        if (arg1 > -6.0f) w += exp(arg1);
+        float w = 0.0f;
 
-        float arg2 = -(1.0f + dot) * inv_sig2;
-        if (arg2 > -6.0f) w += exp(arg2);
+        // loop over symmetry operations
+        for (int g = 0; g < G; ++g) {
+            int Sb = g * 9;
+
+            // h_rot = sym_ops[g] * h0
+            float hx = sym_ops[Sb + 0]*hx0 + sym_ops[Sb + 1]*hy0 + sym_ops[Sb + 2]*hz0;
+            float hy = sym_ops[Sb + 3]*hx0 + sym_ops[Sb + 4]*hy0 + sym_ops[Sb + 5]*hz0;
+            float hz = sym_ops[Sb + 6]*hx0 + sym_ops[Sb + 7]*hy0 + sym_ops[Sb + 8]*hz0;
+
+            float dot = hx*qx + hy*qy + hz*qz;
+
+            float arg1 = -(1.0f - dot) * inv_sig2;
+            if (arg1 > -6.0f) w += exp(arg1);
+
+            float arg2 = -(1.0f + dot) * inv_sig2;
+            if (arg2 > -6.0f) w += exp(arg2);
+        }
+
+        w_total += w;
     }
 
-    out[gid] = w * norm_factor[k];
+    out[gid] = (w_total / (float)S) * norm_factor[k];
 }
 """
 
@@ -403,9 +412,11 @@ import pyopencl as cl
 import pyopencl.array as clarray
 
 def build_pf_program(ctx: cl.Context) -> cl.Program:
+    """Build the dense PF-matrix evaluation OpenCL program."""
     return cl.Program(ctx, PF_KERNEL_SRC).build()
 
 def build_pfsparse_program(ctx: cl.Context) -> cl.Program:
+    """Build the sparse PF-matrix evaluation OpenCL program."""
     return cl.Program(ctx, PFSPARSE_KERNEL_SRC).build()
 
 
@@ -417,9 +428,15 @@ def pfmatrix_eval_gpu(
     sym_ops_gpu: clarray.Array,
     hvecs_gpu: clarray.Array,
     R: int, K: int, C: int, P: int, G: int,
+    S: int,                     # number of omega subdivisions
     sigma,                      # array-like, shape (K,)
     out_gpu: clarray.Array = None
 ):
+    """Evaluate the dense PF matrix on GPU.
+
+    Launches the pfmatrix_eval kernel with per-node sigma and
+    returns the output array of shape (R, K, C, P).
+    """
 
     # --- sanity checks ---
     assert coords_gpu.dtype == np.float32
@@ -459,6 +476,7 @@ def pfmatrix_eval_gpu(
         np.int32(C),
         np.int32(P),
         np.int32(G),
+        np.int32(S),
     )
 
     return out_gpu
@@ -479,6 +497,11 @@ def pfmatrix_sparseeval_gpu(
     sigma: np.float32,
     cutoff: np.float32,
 ):
+    """Two-pass sparse PF matrix construction on GPU.
+
+    Pass 1 counts non-zeros per orientation node, pass 2 writes COO data.
+    Returns a dict with GPU COO arrays and CPU offset array.
+    """
     # --- sanity checks ---
     assert coords_gpu.dtype == np.float32
     assert grid_inv_gpu.dtype == np.float32
@@ -667,6 +690,7 @@ def interp_theta_4d_gpu(
     theta_new_gpu: clarray.Array,
     R: int, X: int, C: int, T: int, P: int,
 ):
+    """Interpolate a 4-D array along the theta axis (T -> P) on GPU."""
     assert in_gpu.dtype == np.float32
     assert out_gpu.dtype == np.float32
     assert theta_old_gpu.dtype == np.float32
@@ -701,6 +725,7 @@ def interp_theta_3d_gpu(
     theta_new_gpu: clarray.Array,
     R: int, C: int, T: int, P: int,
 ):
+    """Interpolate a 3-D array along the theta axis (T -> P) on GPU."""
     assert in_gpu.dtype == np.float32
     assert out_gpu.dtype == np.float32
     assert theta_old_gpu.dtype == np.float32
@@ -724,6 +749,7 @@ def interp_theta_3d_gpu(
 
 
 def sum_over_x_gpu(queue, kernel, in_gpu, out_gpu, R, X, C, T):
+    """Sum a 4-D array over the spatial (X) axis on GPU."""
     total = R * C * T
     kernel(
         queue,
@@ -743,6 +769,7 @@ def clip_nonnegative_gpu(
     kernel: cl.Kernel,
     arr_gpu: clarray.Array
 ):
+    """Clip array elements to non-negative values in place on GPU."""
     assert arr_gpu.dtype == np.float32
 
     n = arr_gpu.size

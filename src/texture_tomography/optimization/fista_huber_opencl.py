@@ -110,6 +110,7 @@ from .prox_tv import (
 
 
 def build_fista_program(ctx: cl.Context) -> cl.Program:
+    """Compile FISTA + Huber helper OpenCL kernels."""
     return cl.Program(ctx, FISTA_KERNELS + HUBER_KERNELS + HUBER_DIAG_KERNEL).build()
 
 
@@ -124,7 +125,25 @@ class FISTAHuberOpenCL:
     Ax layout: (O, D, Nseg) C
     """
 
-    def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=float, tau=float, tv_niter=50, huber_delta=1e-2):
+    def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50, huber_delta=1e-2):
+        """Set up FISTA-Huber solver.
+
+        Parameters
+        ----------
+        operator : PFO_SINGLE or PFO_OPENCL_BATCHED
+        prox_kind : str
+            One of 'nonneg', 'l1', 'nonneg_l1', 'nonneg_tv'.
+        lam : float
+            Regularisation weight.
+        L : float, optional
+            Lipschitz constant; tau = 1/L if tau not given.
+        tau : float, optional
+            Step size (overrides L).
+        tv_niter : int
+            Inner iterations for TV proximal operator.
+        huber_delta : float
+            Huber loss transition threshold.
+        """
         self.op = operator
         self.ctx = operator.ctx
         self.queue = operator.queue
@@ -172,6 +191,7 @@ class FISTAHuberOpenCL:
 
 
     def _apply_prox(self, x_gpu):
+            """Dispatch to the chosen proximal operator in place."""
             if self.prox_kind == "nonneg":
                 self._prox_nonneg(self.queue, self.prox_kernels, x_gpu)
 
@@ -206,18 +226,21 @@ class FISTAHuberOpenCL:
             return x_gpu
 
 
-
     def run(
         self,
         x0_gpu: clarray.Array,
         out_gpu: clarray.Array,
         niter: int,
+        weights: clarray.Array | None = None,
         verbose: int = 0,
         diagnostics_interval: int = 1,
     ):
         """
-        x0_gpu: clarray (Nx, Ny, K) float32, order='F'
+        x0_gpu:   clarray (Nx, Ny, K) float32, order='F'
         out_gpu:  clarray (O, D, Nseg) float32, order='C'
+        weights:  OPTIONAL clarray (O, D, Nseg) float32, order='C'
+                If provided, residuals are multiplied elementwise by weights.
+                weights==0 masks out (ignores) corrupted data points.
         returns x_gpu solution (same layout as x0_gpu)
         """
         q = self.queue
@@ -237,6 +260,20 @@ class FISTAHuberOpenCL:
         if out_gpu.queue.context.int_ptr != self.ctx.int_ptr:
             raise ValueError("out_gpu context != operator context")
 
+        # ---- optional weights checks ----
+        use_weights = weights is not None
+        if use_weights:
+            if not isinstance(weights, clarray.Array):
+                raise TypeError("weights must be a pyopencl.array.Array or None")
+            if weights.queue is None:
+                raise ValueError("weights must have a queue attached")
+            if weights.dtype != np.float32:
+                raise TypeError("weights must be float32")
+            if weights.queue.context.int_ptr != self.ctx.int_ptr:
+                raise ValueError("weights context != operator context")
+            if weights.shape != out_gpu.shape:
+                raise ValueError(f"weights.shape {weights.shape} must match out_gpu.shape {out_gpu.shape}")
+
         # ---- persistent buffers ----
         x = x0_gpu
         y = clarray.empty(q, x.shape, dtype=np.float32, order="F")
@@ -254,18 +291,18 @@ class FISTAHuberOpenCL:
                 "div": clarray.zeros(q, x.shape, np.float32, order="F"),
             }
 
-        # copy x0 -> x,y,x_old
+        # copy x0 -> y,x_old
         total_x = np.int32(x.size)
         self.k_copy_buf(q, (int(total_x),), None, x.data, y.data, total_x)
         self.k_copy_buf(q, (int(total_x),), None, x.data, x_old.data, total_x)
 
         Ax = None
+        r = None
         t = 1.0
 
         # ---- diagnostics storage (always collected) ----
         self.iter_stats = []   # list of dicts, one per iteration
         self.final_stats = {}  # summary at the end
-
 
         for it in range(niter):
             # ---- Ax = A(y) ----
@@ -275,23 +312,25 @@ class FISTAHuberOpenCL:
 
             self.op.direct_cl(y, Ax)
 
+            total_Ax = np.int32(Ax.size)
 
             # ---- r = Ax - b ----
-            total_Ax = np.int32(Ax.size)
             self.k_residual_axpb(
                 q, (int(total_Ax),), None,
                 Ax.data, out_gpu.data, r.data,
                 total_Ax
             )
 
-            # ---- L2 data term ----
+            # ---- optional weighting: r <- w * r ----
+            if use_weights:
+                # (requires weights to be contiguous like r/out_gpu; all are order='C' here)
+                # elementwise multiply in-place on r
+                r *= weights
 
-            self.k_residual_axpb(
-                q, (int(total_Ax),), None,
-                Ax.data, out_gpu.data, Ax.data,
-                total_Ax
-            )
-            r2 = float(np.dot(Ax.get().ravel(), Ax.get().ravel()))
+            # ---- L2 data term (diagnostic only) ----
+            # f = 0.5 * || (w*(Ax-b)) ||^2   if weights is provided
+            # f = 0.5 * || (Ax-b) ||^2       otherwise
+            r2 = float(np.dot(r.get().ravel(), r.get().ravel()))
             fval = 0.5 * float(r2)
 
             # ---- huber: r <- clip(r, -delta, +delta) ----
@@ -303,20 +342,19 @@ class FISTAHuberOpenCL:
             )
 
             # ---- grad = A*(r) ----
+            # NOTE: with weights, this is A*( clip( w*(Ax-b) ) )
             self.op.adjoint_cl(r, grad)  # (Nx,Ny,K) Fortran
 
             # ---- v = y - tau*grad ----
-            total_x = np.int32(y.size)
             self.k_grad_step(
                 q, (int(total_x),), None,
-                y.data, grad.data, x.data,   # in-place update of y
+                y.data, grad.data, x.data,   # update into x (your kernels treat 3rd arg as output)
                 np.float32(self.tau),
                 total_x
             )
 
-            # ---- prox: apply in-place on v, then copy v -> x ----
-            self._apply_prox(x)   # MUST modify v in-place and return v
-            #self.k_copy_buf(q, (int(total_x),), None, y.data, x.data, total_x)
+            # ---- prox: apply in-place on v (x), then extrapolation uses y ----
+            self._apply_prox(x)  # MUST modify x in-place and return x (or ignore return)
 
             # ---- momentum update ----
             t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
@@ -334,7 +372,7 @@ class FISTAHuberOpenCL:
 
             t = t_new
 
-
+            # ---- regularizer diagnostics ----
             gval = 0.0
             if self.prox_kind in ("l1", "nonneg_l1") and self.lam != 0.0:
                 gval = self.lam * float(clarray.sum(clmath.fabs(x)).get())
@@ -369,7 +407,7 @@ class FISTAHuberOpenCL:
 
             tv_res = None
             if self.prox_kind == "nonneg_tv":
-                tv_res = self._last_tv_residual
+                tv_res = getattr(self, "_last_tv_residual", None)
 
             # ---- store per-iteration stats ----
             self.iter_stats.append({
@@ -382,14 +420,16 @@ class FISTAHuberOpenCL:
                 "beta": beta,
                 "tau": self.tau,
                 "tv_residual": tv_res,
+                "weighted": use_weights,
             })
 
             # ---- conditional printing only ----
             if verbose and ((it + 1) % diagnostics_interval == 0 or it == 0 or it == niter - 1):
                 extra = ""
                 if tv_res is not None:
-                    extra = f"  tv_res={tv_res:.3e}"
-
+                    extra += f"  tv_res={tv_res:.3e}"
+                if use_weights:
+                    extra += "  (weighted)"
                 print(
                     f"[iter {it+1:4d}/{niter}] "
                     f"obj={obj:.6e}  f={fval:.6e}  g={gval:.6e}  "
@@ -398,8 +438,7 @@ class FISTAHuberOpenCL:
                     + extra
                 )
 
-
-                # ---- final summary stats ----
+        # ---- final summary stats ----
         self.final_stats = {
             "niter": niter,
             "final_f": self.iter_stats[-1]["f"],
@@ -407,9 +446,10 @@ class FISTAHuberOpenCL:
             "final_obj": self.iter_stats[-1]["obj"],
             "final_xnorm": self.iter_stats[-1]["xnorm"],
             "final_gradnorm": self.iter_stats[-1]["gradnorm"],
+            "weighted": use_weights,
         }
 
-                # ---------------- GPU cleanup ----------------
+        # ---------------- GPU cleanup ----------------
         q.finish()
 
         for arr in (y, x_old, grad):
@@ -431,3 +471,5 @@ class FISTAHuberOpenCL:
         gc.collect()
         q.finish()
         # --------------------------------------------
+
+        return x

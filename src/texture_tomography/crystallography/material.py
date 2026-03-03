@@ -49,6 +49,7 @@ class Material:
         lattice_params: dict,
         reflections: np.ndarray,
     ):
+        """Initialise from pre-computed attributes (prefer factory methods)."""
         self.name = name
         self.structure = structure
 
@@ -565,18 +566,23 @@ class Material:
     # Accessors (operator-friendly)
     # ----------------------------
     def hkls(self):
+        """Miller indices array, shape (N, 3)."""
         return self.reflections["hkl"]
 
     def multiplicities(self):
+        """Multiplicity of each reflection."""
         return self.reflections["multiplicity"]
 
     def two_theta(self):
+        """Two-theta values (radians) for each reflection."""
         return self.reflections["two_theta"]
 
     def d_spacings(self):
+        """d-spacings (Å) for each reflection."""
         return self.reflections["d_spacing"]
 
     def intensities(self):
+        """Normalised intensity of each reflection."""
         return self.reflections["intensity"]
 
     # ----------------------------
@@ -597,9 +603,11 @@ class Material:
     # Convenience
     # ----------------------------
     def __len__(self):
+        """Number of reflections."""
         return len(self.reflections)
 
     def summary(self):
+        """Return a dict summarising the material and its reflections."""
         return {
             "name": self.name,
             "space_group": f"{self.space_group_symbol} ({self.space_group_number})",

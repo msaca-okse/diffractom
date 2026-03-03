@@ -65,6 +65,7 @@ __kernel void copy_buf(
 """
 
 def build_fista_program(ctx: cl.Context) -> cl.Program:
+    """Compile FISTA helper OpenCL kernels (residual, gradient step, extrapolate, copy)."""
     return cl.Program(ctx, FISTA_KERNELS).build()
 
 
@@ -80,6 +81,22 @@ class FISTAOpenCL:
     """
 
     def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50):
+        """Set up FISTA solver.
+
+        Parameters
+        ----------
+        operator : PFO_SINGLE or PFO_OPENCL_BATCHED
+        prox_kind : str
+            One of 'nonneg', 'l1', 'nonneg_l1', 'nonneg_tv'.
+        lam : float
+            Regularisation weight.
+        L : float, optional
+            Lipschitz constant; tau = 1/L if tau not given.
+        tau : float, optional
+            Step size (overrides L).
+        tv_niter : int
+            Inner iterations for TV proximal operator.
+        """
         self.op = operator
         self.ctx = operator.ctx
         self.queue = operator.queue
@@ -124,6 +141,7 @@ class FISTAOpenCL:
 
 
     def _apply_prox(self, x_gpu):
+            """Dispatch to the chosen proximal operator in place."""
             if self.prox_kind == "nonneg":
                 self._prox_nonneg(self.queue, self.prox_kernels, x_gpu)
 

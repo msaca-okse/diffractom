@@ -16,6 +16,11 @@ from .pfo_kernels import build_all_opencl
 
 
 class PFO_OPENCL_BATCHED:
+    """Multi-material pole-figure + tomographic forward/adjoint operator on GPU.
+
+    Handles multiple crystallographic materials, each with its own orientation
+    grid, and applies Gaussian peak convolution before projecting.
+    """
 
     def __init__(
         self,
@@ -27,7 +32,29 @@ class PFO_OPENCL_BATCHED:
         verbose: bool = False,
         ctx=None,
         queue=None,
+        **kwargs,
     ):
+        """Initialise multi-material forward operator.
+
+        Parameters
+        ----------
+        cfg : dict
+            Experiment configuration.
+        materials : list[Material]
+            Crystallographic materials with reflections and symmetry.
+        grids : list[OrientationTree]
+            Per-material orientation discretisation trees.
+        two_thetas : array-like
+            Detector 2-theta bin centres (degrees).
+        max_gb : float
+            GPU memory budget (GB) for K-batching.
+        verbose : bool
+            Print buffer allocation summary.
+        ctx, queue : optional
+            Existing OpenCL context/queue; created automatically if None.
+        **kwargs
+            Override any cfg key.
+        """
 
         # --- context / queue ---
         if ctx is not None and queue is not None:
@@ -39,21 +66,28 @@ class PFO_OPENCL_BATCHED:
 
         
 
-        self.cfg = cfg
+        # Keyword arguments override cfg values (e.g. N_Omega=50 overrides cfg['N_Omega'])
+        self.cfg = {**cfg, **kwargs}
         self.materials = materials
         self.grids = grids
         self.two_thetas = np.array(two_thetas).astype(np.float32)
         self.peak_width = self.cfg['peak_width']
         self.verbose = verbose
 
-        self.N_chi = self.cfg['N_chi']
+        self.N_eta = self.cfg['N_eta']
         self.N_theta = len(two_thetas)
-        self.N_seg = self.N_theta * self.N_chi
+        self.N_seg = self.N_theta * self.N_eta
         self.Nx = self.cfg['Nx']
         self.Ny = self.cfg['Ny']
-        self.N_rot = self.cfg['N_rot']
+        self.N_Omega = self.cfg['N_Omega']
+        self.N_Omega_subdivisions = self.cfg.get('N_Omega_subdivisions', 1)
         self.angle_range = np.array(self.cfg['angle_range'])/180*np.pi
-        self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_rot, endpoint=False)
+        delta = (self.angle_range[1] - self.angle_range[0]) / self.N_Omega
+        sub_delta = delta / self.N_Omega_subdivisions
+        # Coarse angles centered in their intervals (for gratopy projection)
+        self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega, endpoint=False) + delta / 2
+        # Fine angles centered in sub-intervals (for PF coordinate generation)
+        self.angles_subdivided = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega * self.N_Omega_subdivisions, endpoint=False) + sub_delta / 2
         self.N_mat = len(self.materials)
         self.pf_batch_max_gb = float(max_gb)
 
@@ -80,7 +114,7 @@ class PFO_OPENCL_BATCHED:
             gratopy.PARALLEL,
             (self.Nx, self.Ny, self.K_sum),
             self.angles,
-            #self.N_rot,
+            #self.N_Omega,
             n_detectors=self.Nx,
             image_width=self.Nx,
             detector_width=self.Nx,
@@ -95,77 +129,88 @@ class PFO_OPENCL_BATCHED:
     def detector_coordinates(self, integration_samples=1, full_circle_covered=True):
         """ Calculates and returns the probed polar and azimuthal coordinates on the unit sphere at
         each angle of projection and for each detector segment in the system's geometry.
+        Per-material coordinate arrays are stored in self.pf_coords_gpu_list.
         """
         wavelength_angstrom = 12.398 / self.cfg["wavelength"]
-        self.two_theta_peaks = 2.0 * np.arcsin(
-            np.linalg.norm(self.h_cpu, axis=1) / (4.0 * np.pi) * wavelength_angstrom
-        ).astype(np.float32)
+        S = self.N_Omega_subdivisions
+        N_fine = self.N_Omega * S
 
-        coords_list = []
-        for tt in self.two_theta_peaks:
+        # Precompute azimuthal detector directions (shared across all materials/peaks)
+        probed_directions_zero_rot = np.zeros((self.N_eta, integration_samples, 3))
+        if not full_circle_covered:
+            shift = np.pi
+        else:
+            shift = 0
+        det_bin_middles_extended = np.linspace(0, 2*np.pi, self.N_eta, endpoint=False)
+        det_bin_middles_extended = np.insert(det_bin_middles_extended, 0, det_bin_middles_extended[-1] + shift)
+        det_bin_middles_extended = np.append(det_bin_middles_extended, det_bin_middles_extended[1] + shift)
 
-            probed_directions_zero_rot = np.zeros((self.N_chi, integration_samples, 3))
-            # Impose symmetry if needed.
-            if not full_circle_covered:
-                shift = np.pi
-            else:
-                shift = 0
-            det_bin_middles_extended = np.linspace(0, 2*np.pi, self.N_chi, endpoint=False)
-            det_bin_middles_extended = np.insert(det_bin_middles_extended, 0, det_bin_middles_extended[-1] + shift)
-            det_bin_middles_extended = np.append(det_bin_middles_extended, det_bin_middles_extended[1] + shift)
+        for ii in range(self.N_eta):
+            before = det_bin_middles_extended[ii]
+            now = det_bin_middles_extended[ii + 1]
+            after = det_bin_middles_extended[ii + 2]
 
-            for ii in range(self.N_chi):
+            if abs(before - now + 2 * np.pi) < abs(before - now):
+                before = before + 2 * np.pi
+            elif abs(before - now - 2 * np.pi) < abs(before - now):
+                before = before - 2 * np.pi
 
-                # Check if the interval from the previous to the next bin goes over the -pi +pi discontinuity
-                before = det_bin_middles_extended[ii]
-                now = det_bin_middles_extended[ii + 1]
-                after = det_bin_middles_extended[ii + 2]
+            if abs(now - after + 2 * np.pi) < abs(now - after):
+                after = after - 2 * np.pi
+            elif abs(now - after - 2 * np.pi) < abs(now - after):
+                after = after + 2 * np.pi
 
-                if abs(before - now + 2 * np.pi) < abs(before - now):
-                    before = before + 2 * np.pi
-                elif abs(before - now - 2 * np.pi) < abs(before - now):
-                    before = before - 2 * np.pi
+            start = 0.5 * (before + now)
+            end = 0.5 * (now + after)
+            inc = (end - start) / integration_samples
+            angles = np.linspace(start + inc / 2, end - inc / 2, integration_samples)
 
-                if abs(now - after + 2 * np.pi) < abs(now - after):
-                    after = after - 2 * np.pi
-                elif abs(now - after - 2 * np.pi) < abs(now - after):
-                    after = after + 2 * np.pi
+            probed_directions_zero_rot[ii, :, :] = np.cos(angles[:, np.newaxis]) * \
+                np.array(self.cfg["detector_direction_origin"])[np.newaxis,:]
 
-                # Generate a linearly spaced set of angles covering the detector segment
-                start = 0.5 * (before + now)
-                end = 0.5 * (now + after)
-                inc = (end - start) / integration_samples
-                angles = np.linspace(start + inc / 2, end - inc / 2, integration_samples)
+            probed_directions_zero_rot[ii, :, :] += np.sin(angles[:, np.newaxis]) * \
+                np.array(self.cfg["detector_direction_positive_90"])[np.newaxis,:]
 
-                # Make the zero-rotation-frame vectors corresponding to the given angles
-                probed_directions_zero_rot[ii, :, :] = np.cos(angles[:, np.newaxis]) * \
-                    np.array(self.cfg["detector_direction_origin"])[np.newaxis,:]
+        # Precompute rotation matrices for subdivided angles
+        k0 = np.asarray(self.cfg["k_direction_0"])
+        Rmats = R.from_rotvec(self.angles_subdivided[:, None] * k0).as_matrix()
 
-                probed_directions_zero_rot[ii, :, :] += np.sin(angles[:, np.newaxis]) * \
-                    np.array(self.cfg["detector_direction_positive_90"])[np.newaxis,:]
+        # Build per-material coordinate arrays
+        self.pf_coords_gpu_list = []
+        self.pf_coords_cpu_list = []
 
-            twothetahalf = tt/2
+        for i_mat in range(self.N_mat):
+            h_cpu = self.pf_h_cpu_list[i_mat]
+            two_theta_peaks = 2.0 * np.arcsin(
+                np.linalg.norm(h_cpu, axis=1) / (4.0 * np.pi) * wavelength_angstrom
+            ).astype(np.float32)
 
-            probed_directions_zero_rot = +probed_directions_zero_rot * np.cos(twothetahalf)\
-                - np.sin(twothetahalf) * np.array(self.cfg['p_direction_0'])
-            probed_direction_vectors = np.zeros((self.N_rot, self.N_chi, integration_samples, 3), dtype=np.float64)
-            k0 = np.asarray(self.cfg["k_direction_0"])
-            Rmats = R.from_rotvec(self.angles[:, None] * k0).as_matrix()
-            probed_direction_vectors[...] = \
-                np.einsum('kij,mli->kmlj', Rmats, probed_directions_zero_rot)
+            coords_list = []
+            for tt in two_theta_peaks:
+                twothetahalf = tt / 2
+                dirs = +probed_directions_zero_rot * np.cos(twothetahalf) \
+                    - np.sin(twothetahalf) * np.array(self.cfg['p_direction_0'])
 
-            coords = probed_direction_vectors[:,:,0,:]
-            coords_list.append(coords)
+                probed_direction_vectors = np.zeros((N_fine, self.N_eta, integration_samples, 3), dtype=np.float64)
+                probed_direction_vectors[...] = \
+                    np.einsum('kij,mli->kmlj', Rmats, dirs)
 
-        coords_cpu = np.stack(coords_list, axis=-1)
-        coords_cpu = coords_cpu.transpose((0, 1, 3, 2))
-        self.coords_cpu = np.asarray(coords_cpu, dtype=np.float32, order="C")
-        self.coords_gpu = clarray.to_device(self.queue, self.coords_cpu)
+                coords = probed_direction_vectors[:,:,0,:]
+                coords = coords.reshape((self.N_Omega, S, self.N_eta, 3))
+                coords_list.append(coords)
+
+            # coords_list: list of (N_Omega, S, N_eta, 3), length = N_peaks for this material
+            coords_cpu = np.stack(coords_list, axis=-1)         # (N_Omega, S, N_eta, 3, N_peaks)
+            coords_cpu = coords_cpu.transpose((0, 1, 2, 4, 3)) # (N_Omega, S, N_eta, N_peaks, 3)
+            coords_cpu = np.asarray(coords_cpu, dtype=np.float32, order="C")
+            self.pf_coords_cpu_list.append(coords_cpu)
+            self.pf_coords_gpu_list.append(clarray.to_device(self.queue, coords_cpu))
 
 
 
 
     def transfer_material_parameters_to_gpu(self):
+        """Upload h-vectors, intensities and symmetry ops for all materials to GPU."""
         self.pf_h_gpu_normed_list = []
         self.pf_h_cpu_normed_list = []
         self.pf_h_cpu_list = []
@@ -247,6 +292,7 @@ class PFO_OPENCL_BATCHED:
 
 
     def allocate_coefficient_buffer(self):
+        """Pre-allocate reusable GPU buffers for forward/adjoint computation."""
             # ---- reusable transpose buffers (per material) ----
         buffers = []
 
@@ -264,7 +310,7 @@ class PFO_OPENCL_BATCHED:
 
         self.coeffs_sino_C = _alloc(
             "coeffs_sino_C",
-            (self.N_rot, self.Nx, self.K_batch_max),
+            (self.N_Omega, self.Nx, self.K_batch_max),
             np.float32,
             "C",
         )
@@ -281,7 +327,7 @@ class PFO_OPENCL_BATCHED:
             self._basis_batch_list.append(
                 _alloc(
                     f"_basis_batch[{i_mat}]",
-                    (self.N_rot, self.K_batch_max, self.N_chi, self.N_peaks_list[i_mat]),
+                    (self.N_Omega, self.K_batch_max, self.N_eta, self.N_peaks_list[i_mat]),
                     np.float32,
                     "C",
                     )
@@ -291,7 +337,7 @@ class PFO_OPENCL_BATCHED:
 
         self._basis_batch_convolved = _alloc(
             "_basis_batch_convolved",
-            (self.N_rot, self.K_batch_max, self.N_seg),
+            (self.N_Omega, self.K_batch_max, self.N_seg),
             np.float32,
             "C",
         )
@@ -299,7 +345,7 @@ class PFO_OPENCL_BATCHED:
 
         self._basis_batch_convolved_T = _alloc(
             "_basis_batch_convolvedT",
-            (self.N_rot, self.N_seg, self.K_batch_max),
+            (self.N_Omega, self.N_seg, self.K_batch_max),
             np.float32,
             "C",
         )
@@ -434,8 +480,8 @@ class PFO_OPENCL_BATCHED:
 
 
         # ---- dimensions ----
-        R = self.N_rot
-        C = self.N_chi
+        R = self.N_Omega
+        C = self.N_eta
         T = self.N_theta   # masked theta count
         K_largest = np.max(np.array(self.K_list))
 
@@ -533,11 +579,12 @@ class PFO_OPENCL_BATCHED:
         basis_convolved: clarray.Array,
         i_mat: int,
     ):
+        """Apply Gaussian peak convolution to expand PF(eta,peak) into PF(eta,2theta)."""
         queue = self.queue
 
         # ---------------- shapes ----------------
-        R  = int(self.N_rot)
-        C  = int(self.N_chi)
+        R  = int(self.N_Omega)
+        C  = int(self.N_eta)
         Kmax = int(self.K_batch_max)
         P  = int(self.N_peaks_list[i_mat])
         T = int(self.N_theta)
@@ -586,6 +633,7 @@ class PFO_OPENCL_BATCHED:
 
 
     def set_peak_width(self, peak_width):
+        """Update Gaussian peak width (degrees) used in convolution."""
         self.peak_width = peak_width
 
 
@@ -597,12 +645,12 @@ class PFO_OPENCL_BATCHED:
         Returns
         -------
         yin_gpu : clarray
-            Shape (N_rot, Nx, N_seg), C order
+            Shape (N_Omega, Nx, N_seg), C order
         """
 
         data = clarray.zeros(
             self.queue,
-            (self.N_rot, self.Nx, self.N_chi * self.N_theta),
+            (self.N_Omega, self.Nx, self.N_eta * self.N_theta),
             dtype=np.float32,
             order="C",
         )
@@ -621,7 +669,7 @@ class PFO_OPENCL_BATCHED:
         coeffs_gpu_full : clarray
             Shape (Nx, Nx, K_sum), Fortran order
         out_y : clarray
-            Shape (N_rot, Nx, N_seg), C order
+            Shape (N_Omega, Nx, N_seg), C order
             Accumulated into (will be zeroed here)
         """
 
@@ -631,16 +679,16 @@ class PFO_OPENCL_BATCHED:
         assert coeffs.flags.f_contiguous
         assert coeffs.shape == (self.Nx, self.Ny, self.K_sum)
         assert data.flags.c_contiguous
-        assert data.shape == (self.N_rot, self.Nx, self.N_seg)
+        assert data.shape == (self.N_Omega, self.Nx, self.N_seg)
         
         data.fill(0)
-        R = int(self.N_rot)
-        C = int(self.N_chi)
+        R = int(self.N_Omega)
+        C = int(self.N_eta)
         T = int(self.N_theta)
         Kmax = self.K_batch_max
         Nx = self.Nx
         Ny = self.Ny
-        N_rot = self.N_rot
+        N_Omega = self.N_Omega
 
         for i_mat in range(self.N_mat):
             P = int(self.N_peaks_list[i_mat])
@@ -684,7 +732,7 @@ class PFO_OPENCL_BATCHED:
                     sino=self.coeffs_sino_F,
                 )
 
-                total = N_rot * Nx * Kmax
+                total = N_Omega * Nx * Kmax
                 self.k.transpose_d_omega_k_f_to_c(
                     self.queue,
                     (total,),
@@ -692,7 +740,7 @@ class PFO_OPENCL_BATCHED:
                     self.coeffs_sino_F.data,
                     self.coeffs_sino_C.data,
                     np.int32(Nx),
-                    np.int32(N_rot),
+                    np.int32(N_Omega),
                     np.int32(Kmax),
                     np.int32(total),
                 )
@@ -737,6 +785,7 @@ class PFO_OPENCL_BATCHED:
                     np.int32(C),
                     np.int32(P),
                     np.int32(G),
+                    np.int32(self.N_Omega_subdivisions),
                 )
 
                 self._scale_pf_by_intensity_inplace(self._basis_batch_list[i_mat], intensity_gpu)
@@ -758,7 +807,7 @@ class PFO_OPENCL_BATCHED:
         Parameters
         ----------
         y_gpu : clarray
-            Shape (N_rot, Nx, N_seg), C-order
+            Shape (N_Omega, Nx, N_seg), C-order
 
         Returns
         -------
@@ -785,7 +834,7 @@ class PFO_OPENCL_BATCHED:
         Parameters
         ----------
         y_gpu : clarray
-            Shape (N_rot, Nx, N_seg), C-order
+            Shape (N_Omega, Nx, N_seg), C-order
         out_x : clarray
             Shape (Nx, Nx, K_sum), Fortran-order
             Will be overwritten
@@ -795,11 +844,11 @@ class PFO_OPENCL_BATCHED:
         assert coeffs.flags.f_contiguous
         assert coeffs.shape == (self.Nx, self.Ny, self.K_sum)
         assert data.flags.c_contiguous
-        assert data.shape == (self.N_rot, self.Nx, self.N_seg)
+        assert data.shape == (self.N_Omega, self.Nx, self.N_seg)
 
         coeffs.fill(0)
-        R = int(self.N_rot)
-        C = int(self.N_chi)
+        R = int(self.N_Omega)
+        C = int(self.N_eta)
         T = int(self.N_theta)
         Kmax = self.K_batch_max
         Nx = self.Nx
@@ -867,6 +916,7 @@ class PFO_OPENCL_BATCHED:
                     np.int32(C),
                     np.int32(P),
                     np.int32(G),
+                    np.int32(self.N_Omega_subdivisions),
                 )
 
                 self._scale_pf_by_intensity_inplace(self._basis_batch_list[i_mat], intensity_gpu)
@@ -994,10 +1044,7 @@ class PFO_OPENCL_BATCHED:
 
 
     def _scale_pf_by_intensity_inplace(self, PF_GPU: clarray.Array, INTENSITY_GPU: clarray.Array) -> None:
-        """
-        PF_GPU:        (R, Kb, C, P) C-order
-        INTENSITY_GPU: (P,) float32 on GPU
-        """
+        """Element-wise multiply PF_GPU (R, Kb, C, P) by intensity per peak P."""
         R = int(PF_GPU.shape[0])
         Kb = int(PF_GPU.shape[1])
         C = int(PF_GPU.shape[2])
@@ -1024,11 +1071,7 @@ class PFO_OPENCL_BATCHED:
 
 
 def batched_gemm_clblast(queue, A3, B3, C3, R, M, K, N):
-    """
-    A3: (R, M, K) clarray
-    B3: (R, K, N) clarray
-    C3: (R, M, N) clarray
-    """
+    """Batched GEMM via CLBlast: C += A @ B, per-batch (beta=1 accumulate)."""
 
     # reshape views (NO COPY)
     A = A3.reshape((R*M, K))
@@ -1060,11 +1103,7 @@ def batched_gemm_clblast(queue, A3, B3, C3, R, M, K, N):
 
 
 def batched_gemm_adj_clblast(queue, Y3, BT3, X3, R, Mx, Nsub, K, alpha):
-    """
-    Y3:  (R, Mx,   Nsub)  clarray
-    BT3: (R, Nsub, K)     clarray  (explicitly transposed B)
-    X3:  (R, Mx,   K)     clarray (output)
-    """
+    """Batched adjoint GEMM: X = alpha * Y @ BT, per-batch (beta=0 overwrite)."""
 
     # 2D views (NO COPY)
     A = Y3.reshape((R * Mx, Nsub))   # (R*Mx, Nsub)
@@ -1105,6 +1144,7 @@ def estimate_L_power(
     eps: float = 1e-30,
     verbose: int = 1,
 ) -> float:
+    """Estimate the Lipschitz constant L = ||A^T A|| via power iteration."""
     if niter < 1:
         raise ValueError("niter must be >= 1")
 
@@ -1114,7 +1154,7 @@ def estimate_L_power(
     # x in domain, Fortran
     x = clarray.empty(q, (op.Nx, op.Ny, op.K_sum), np.float32, order="F")
     # y in range, C
-    Ax = clarray.empty(q, (op.N_rot, op.Nx, op.N_seg), np.float32, order="C")
+    Ax = clarray.empty(q, (op.N_Omega, op.Nx, op.N_seg), np.float32, order="C")
     # z = A^*Ax in domain
     z = clarray.empty(q, x.shape, np.float32, order="F")
 

@@ -20,6 +20,7 @@ def reciprocal_lattice(A):
 
 
 def cubic(a=1):
+    """Cubic lattice (a = b = c, α = β = γ = 90°)."""
     A = np.array([[a, 0, 0],
                   [0, a, 0],
                   [0, 0, a]]).T
@@ -27,6 +28,7 @@ def cubic(a=1):
 
 
 def orthorhombic(a=1, b=2, c=3):
+    """Orthorhombic lattice (a ≠ b ≠ c, α = β = γ = 90°)."""
     A = np.array([[a, 0, 0],
                   [0, b, 0],
                   [0, 0, c]]).T
@@ -34,6 +36,7 @@ def orthorhombic(a=1, b=2, c=3):
 
 
 def tetragonal(a=1, c=1.5):
+    """Tetragonal lattice (a = b ≠ c, α = β = γ = 90°)."""
     A = np.array([[a, 0, 0],
                   [0, a, 0],
                   [0, 0, c]]).T
@@ -41,6 +44,7 @@ def tetragonal(a=1, c=1.5):
 
 
 def hexagonal(a=1, c=1.633):
+    """Hexagonal lattice (a = b, γ = 120°)."""
     A = np.array([[a, 0, 0],
                   [-0.5 * a, np.sqrt(3) / 2 * a, 0],
                   [0, 0, c]]).T

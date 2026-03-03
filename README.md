@@ -5,13 +5,19 @@ Create and activate a fresh conda environment, install the required dependencies
 ```bash
 conda create --name textom python=3.11
 conda activate textom
+```
 
+
+
+```bash
 conda install numpy
 conda install --channel conda-forge pymatgen
 pip install --upgrade ase
-pip install gratopy
+```
 
-# Optional (depending on your setup):
+Install 
+
+pip install gratopy
 conda install conda-forge::clblast
 conda install pyopencl
 pip install --user pyclblast

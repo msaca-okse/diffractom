@@ -25,6 +25,7 @@ def build_pfo_program(ctx: cl.Context, *, ts: int = 16) -> cl.Program:
 # ----------------------------
 @dataclass(frozen=True)
 class Kernels:
+    """Typed bundle of all OpenCL kernels used by the PFO operator."""
     # ---- core math ----
     batched_gemm_kernel: cl.Kernel
     expand_kernel: cl.Kernel

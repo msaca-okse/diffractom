@@ -5,6 +5,7 @@ import numpy as np
 
 @dataclass
 class OrientationNode:
+    """Single node in the orientation tree, holding a rotation and metadata."""
     R: Rotation                # scipy Rotation object
     level: int                 # index into sigma_levels
     sigma: float
@@ -16,16 +17,21 @@ class OrientationNode:
 
 
 class OrientationTree:
+    """Hierarchical orientation grid with multi-resolution refinement."""
+
     def __init__(self, sigma_levels):
+        """Create tree with the given sigma levels (one per refinement depth)."""
         self.nodes: list[OrientationNode] = []
         self.levels: dict[int, list[int]] = {i: [] for i in range(len(sigma_levels))}
         self.sigma_levels = list(sigma_levels)
 
     def leaf_nodes(self):
+        """Indices of active nodes with no children."""
         return [i for i, n in enumerate(self.nodes)
                 if n.active and len(n.children) == 0]
 
     def nodes_at_level(self, level):
+        """Indices of active nodes at a given level."""
         return [i for i in self.levels[level] if self.nodes[i].active]
 
     # ------------------------------------------------------------
@@ -121,6 +127,7 @@ class OrientationTree:
         return new_indices
     
     def active_nodes(self):
+        """Indices of all active nodes."""
         return [
             i for i, n in enumerate(self.nodes)
             if n.active
@@ -128,6 +135,7 @@ class OrientationTree:
 
 
     def active_leaf_nodes(self):
+        """Indices of active leaf nodes (no children)."""
         return [
             i for i, n in enumerate(self.nodes)
             if n.active and len(n.children) == 0
@@ -160,6 +168,7 @@ class OrientationTree:
         return out
     
     def print_summary(self):
+        """Pretty-print level-wise active/total node counts."""
         print("OrientationTree summary:")
         for lvl in sorted(self.levels):
             active, total = self.summary()[lvl]
@@ -167,6 +176,7 @@ class OrientationTree:
 
 
     def inspect_node(self, idx):
+        """Return a dict with full info about node *idx*."""
         n = self.nodes[idx]
         return {
             "index": idx,
@@ -181,17 +191,20 @@ class OrientationTree:
         }
 
     def rotations_at_level(self, level, active_only=True):
+        """List of Rotation objects for nodes at *level*."""
         indices = self.levels.get(level, [])
         if active_only:
             indices = [i for i in indices if self.nodes[i].active]
         return [self.nodes[i].R for i in indices]
 
     def active_rotations(self, level, active_only=True):
+        """Rotations for all active leaf nodes."""
         indices = self.active_leaf_nodes()
         return [self.nodes[i].R for i in indices]
 
 
     def scores_at_level(self, level, active_only=True):
+        """Score array for nodes at *level*."""
         indices = self.levels.get(level, [])
         if active_only:
             indices = [i for i in indices if self.nodes[i].active]
@@ -244,5 +257,6 @@ class OrientationTree:
 
 
 def invert_grid(grid):
+    """Return flattened inverse rotation matrices (K, 9) for a list of Rotations."""
     grid_inv_cpu = np.stack([rot.inv().as_matrix().reshape(-1) for rot in grid],axis=0).astype(np.float32)
     return grid_inv_cpu
