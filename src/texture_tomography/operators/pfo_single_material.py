@@ -78,6 +78,7 @@ class PFO_SINGLE:
         self.Nx = self.cfg['Nx']
         self.Ny = self.cfg['Ny']
         self.N_Omega = self.cfg['N_Omega']
+        self.cor_offset = self.cfg['cor_offset']
         self.N_Omega_subdivisions = self.cfg.get('N_Omega_subdivisions', 1)
         self.angle_range = np.array(self.cfg['angle_range'])/180*np.pi
         delta = (self.angle_range[1] - self.angle_range[0]) / self.N_Omega
@@ -112,7 +113,7 @@ class PFO_SINGLE:
             n_detectors=self.Nx,
             image_width=self.Nx,
             detector_width=self.Nx,
-            detector_shift=2,
+            detector_shift=self.cor_offset,
         )
         assert self.queue.context.int_ptr == self.ctx.int_ptr
 
