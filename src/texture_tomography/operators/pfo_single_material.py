@@ -164,7 +164,7 @@ class PFO_SINGLE:
                 # Generate a linearly spaced set of angles covering the detector segment
                 start = 0.5 * (before + now)
                 end = 0.5 * (now + after)
-                inc = (end - start) / integration_samples
+                inc = (end - start) / integration_samples*2
                 angles = np.linspace(start + inc / 2, end - inc / 2, integration_samples)
 
                 # Make the zero-rotation-frame vectors corresponding to the given angles

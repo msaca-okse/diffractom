@@ -1,7 +1,10 @@
 from dataclasses import dataclass
 from typing import Optional, List
 from scipy.spatial.transform import Rotation
+from scipy.spatial import KDTree
 import numpy as np
+
+from texture_tomography.crystallography import point_groups
 
 @dataclass
 class OrientationNode:
@@ -252,8 +255,185 @@ class OrientationTree:
 
         return tree
 
+    @classmethod
+    def from_random_fundamental_zone(
+        cls,
+        n_orientations: int,
+        symmetry: str,
+        sigma: float,
+    ):
+        """
+        Initialize an OrientationTree with randomly sampled orientations
+        mapped into the fundamental zone of the given crystal symmetry.
 
+        This creates a single-level tree (no children).
 
+        Parameters
+        ----------
+        n_orientations : int
+            Number of random orientations to generate.
+        symmetry : str
+            Crystal symmetry name.  One of ``"triclinic"``, ``"monoclinic"``,
+            ``"orthorhombic"``, ``"tetragonal"``, ``"trigonal"``,
+            ``"hexagonal"``, ``"cubic"``.
+        sigma : float
+            Sigma value assigned to all orientations (level 0).
+
+        Returns
+        -------
+        tree : OrientationTree
+        """
+        point_group_map = {
+            "triclinic": point_groups.trivial,
+            "monoclinic": point_groups.cyclic_2,
+            "orthorhombic": point_groups.orthorhombic,
+            "tetragonal": point_groups.tetragonal,
+            "trigonal": point_groups.trigonal,
+            "hexagonal": point_groups.hexagonal,
+            "cubic": point_groups.cubic,
+        }
+
+        if symmetry not in point_group_map:
+            raise ValueError(
+                f"Unknown symmetry '{symmetry}'. "
+                f"Must be one of {list(point_group_map.keys())}"
+            )
+
+        pg_elements = point_group_map[symmetry]
+
+        # Point-group symmetry matrices: (G, 3, 3)
+        pg_mats = np.stack([g.as_matrix() for g in pg_elements], axis=0)
+
+        # Random orientations: (N, 3, 3)
+        R_random = Rotation.random(n_orientations).as_matrix()
+
+        # For each orientation, apply every point-group element and keep
+        # the product closest to the identity (i.e. largest trace).
+        #   products[n, g] = R_random[n] @ pg_mats[g]   -> shape (N, G, 3, 3)
+        products = np.einsum('nij,gjk->ngik', R_random, pg_mats)
+
+        # Trace of each product: (N, G)
+        traces = np.einsum('ngii->ng', products)
+
+        # Index of the best symmetry element per orientation
+        best_g = np.argmax(traces, axis=1)  # (N,)
+
+        # Gather the best-projected matrices: (N, 3, 3)
+        R_fz = products[np.arange(n_orientations), best_g]
+
+        # Build scipy Rotation objects from the (N, 3, 3) stack
+        rotations = Rotation.from_matrix(R_fz)
+
+        tree = cls(sigma_levels=[sigma])
+
+        for i, R in enumerate(rotations):
+            node = OrientationNode(
+                R=R,
+                level=0,
+                sigma=sigma,
+                parent=None,
+                children=[],
+                active=True,
+            )
+            idx = len(tree.nodes)
+            tree.nodes.append(node)
+            tree.levels[0].append(idx)
+
+        return tree
+
+    def prune_close_orientations(
+        self,
+        theta_deg: float,
+        target: Optional[int] = None,
+    ):
+        """
+        Remove nodes whose orientations are too close to an already-kept
+        node.  Uses a greedy strategy with a KDTree on unit quaternions for
+        fast neighbour look-ups.
+
+        Pruned nodes are deleted from the tree and all indices (node list,
+        level lists, parent/children references) are rebuilt so that the
+        tree is compact afterwards.
+
+        Parameters
+        ----------
+        theta_deg : float
+            Minimum angular separation (in degrees) between kept
+            orientations.  Pairs closer than this are pruned.
+        target : int, optional
+            If given, stop once this many nodes have been kept.
+
+        Returns
+        -------
+        n_kept : int
+            Number of nodes remaining after pruning.
+        """
+        if len(self.nodes) == 0:
+            return 0
+
+        # --- build quaternion array for all nodes ---
+        R_all = Rotation.concatenate([n.R for n in self.nodes])
+        q = R_all.as_quat()                          # (N, 4)  [x,y,z,w]
+        q /= np.linalg.norm(q, axis=1, keepdims=True)
+
+        # Antipodal equivalence: q and -q represent the same rotation,
+        # so we include both copies and query against a single copy.
+        q_full = np.vstack([q, -q])                   # (2N, 4)
+
+        # Quaternion Euclidean distance for misorientation angle θ:
+        #   d = 2 sin(θ / 4)
+        radius = 2.0 * np.sin(np.deg2rad(theta_deg) / 4.0)
+
+        kd = KDTree(q_full)
+
+        N = len(q)
+        used = np.zeros(2 * N, dtype=bool)
+        keep_mask = np.zeros(N, dtype=bool)
+
+        kept_count = 0
+        for i in range(N):
+            if used[i]:
+                continue
+
+            keep_mask[i] = True
+            kept_count += 1
+
+            # Mark all neighbours (including antipodal copies) as used
+            nbrs = kd.query_ball_point(q[i], r=radius)
+            used[nbrs] = True
+
+            if target is not None and kept_count >= target:
+                break
+
+        # --- rebuild the tree keeping only the surviving nodes ---
+        old_nodes = [self.nodes[i] for i in range(N) if keep_mask[i]]
+
+        # Build old-index -> new-index map
+        old_to_new = {}
+        new_idx = 0
+        for i in range(N):
+            if keep_mask[i]:
+                old_to_new[i] = new_idx
+                new_idx += 1
+
+        # Rewrite parent / children references
+        for node in old_nodes:
+            node.parent = old_to_new.get(node.parent) if node.parent is not None else None
+            node.children = [
+                old_to_new[c] for c in node.children if c in old_to_new
+            ]
+
+        self.nodes = old_nodes
+
+        # Rebuild level index
+        for lvl in self.levels:
+            self.levels[lvl] = []
+        for i, node in enumerate(self.nodes):
+            lvl = node.level
+            if lvl in self.levels:
+                self.levels[lvl].append(i)
+
+        return len(self.nodes)
 
 
 def invert_grid(grid):
