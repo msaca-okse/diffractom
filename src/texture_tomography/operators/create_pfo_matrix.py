@@ -1,6 +1,6 @@
 PF_KERNEL_SRC = r"""
 __kernel void pfmatrix_eval(
-    __global const float *coords,      // (R, S, C, P, 3) flattened
+    __global const float *coords,      // (R, S_omega, C, S_eta, P, 3) flattened
     __global const float *grid_inv,    // (K, 9) flattened row-major (3x3)
     __global const float *sym_ops,     // (G, 9) flattened row-major (3x3)
     __global const float *hvecs,       // (P, 3) normalized h-vectors
@@ -15,7 +15,8 @@ __kernel void pfmatrix_eval(
     const int C,
     const int P,
     const int G,
-    const int S                        // number of omega subdivisions
+    const int S,                       // number of omega subdivisions
+    const int S_eta                    // number of eta subdivisions
 ){
     int gid = get_global_id(0);
     int total = R * K * C * P;
@@ -42,41 +43,44 @@ __kernel void pfmatrix_eval(
 
     // loop over omega subdivisions
     for (int s = 0; s < S; ++s) {
-        // --- load coordinate v = coords[r,s,c,p,:] ---
-        int coord_base = (((r * S + s) * C + c) * P + p) * 3;
-        float vx = coords[coord_base + 0];
-        float vy = coords[coord_base + 1];
-        float vz = coords[coord_base + 2];
+        // loop over eta subdivisions
+        for (int se = 0; se < S_eta; ++se) {
+            // --- load coordinate v = coords[r,s,c,se,p,:] ---
+            int coord_base = ((((r * S + s) * C + c) * S_eta + se) * P + p) * 3;
+            float vx = coords[coord_base + 0];
+            float vy = coords[coord_base + 1];
+            float vz = coords[coord_base + 2];
 
-        // --- apply inverse grid rotation q = grid_inv[k] * v ---
-        float qx = grid_inv[Rb + 0]*vx + grid_inv[Rb + 1]*vy + grid_inv[Rb + 2]*vz;
-        float qy = grid_inv[Rb + 3]*vx + grid_inv[Rb + 4]*vy + grid_inv[Rb + 5]*vz;
-        float qz = grid_inv[Rb + 6]*vx + grid_inv[Rb + 7]*vy + grid_inv[Rb + 8]*vz;
+            // --- apply inverse grid rotation q = grid_inv[k] * v ---
+            float qx = grid_inv[Rb + 0]*vx + grid_inv[Rb + 1]*vy + grid_inv[Rb + 2]*vz;
+            float qy = grid_inv[Rb + 3]*vx + grid_inv[Rb + 4]*vy + grid_inv[Rb + 5]*vz;
+            float qz = grid_inv[Rb + 6]*vx + grid_inv[Rb + 7]*vy + grid_inv[Rb + 8]*vz;
 
-        float w = 0.0f;
+            float w = 0.0f;
 
-        // loop over symmetry operations
-        for (int g = 0; g < G; ++g) {
-            int Sb = g * 9;
+            // loop over symmetry operations
+            for (int g = 0; g < G; ++g) {
+                int Sb = g * 9;
 
-            // h_rot = sym_ops[g] * h0
-            float hx = sym_ops[Sb + 0]*hx0 + sym_ops[Sb + 1]*hy0 + sym_ops[Sb + 2]*hz0;
-            float hy = sym_ops[Sb + 3]*hx0 + sym_ops[Sb + 4]*hy0 + sym_ops[Sb + 5]*hz0;
-            float hz = sym_ops[Sb + 6]*hx0 + sym_ops[Sb + 7]*hy0 + sym_ops[Sb + 8]*hz0;
+                // h_rot = sym_ops[g] * h0
+                float hx = sym_ops[Sb + 0]*hx0 + sym_ops[Sb + 1]*hy0 + sym_ops[Sb + 2]*hz0;
+                float hy = sym_ops[Sb + 3]*hx0 + sym_ops[Sb + 4]*hy0 + sym_ops[Sb + 5]*hz0;
+                float hz = sym_ops[Sb + 6]*hx0 + sym_ops[Sb + 7]*hy0 + sym_ops[Sb + 8]*hz0;
 
-            float dot = hx*qx + hy*qy + hz*qz;
+                float dot = hx*qx + hy*qy + hz*qz;
 
-            float arg1 = -(1.0f - dot) * inv_sig2;
-            if (arg1 > -6.0f) w += exp(arg1);
+                float arg1 = -(1.0f - dot) * inv_sig2;
+                if (arg1 > -6.0f) w += exp(arg1);
 
-            float arg2 = -(1.0f + dot) * inv_sig2;
-            if (arg2 > -6.0f) w += exp(arg2);
+                float arg2 = -(1.0f + dot) * inv_sig2;
+                if (arg2 > -6.0f) w += exp(arg2);
+            }
+
+            w_total += w;
         }
-
-        w_total += w;
     }
 
-    out[gid] = (w_total / (float)S) * norm_factor[k];
+    out[gid] = (w_total / (float)(S * S_eta)) * norm_factor[k];
 }
 """
 
@@ -430,7 +434,8 @@ def pfmatrix_eval_gpu(
     R: int, K: int, C: int, P: int, G: int,
     S: int,                     # number of omega subdivisions
     sigma,                      # array-like, shape (K,)
-    out_gpu: clarray.Array = None
+    out_gpu: clarray.Array = None,
+    S_eta: int = 1,             # number of eta subdivisions
 ):
     """Evaluate the dense PF matrix on GPU.
 
@@ -477,6 +482,7 @@ def pfmatrix_eval_gpu(
         np.int32(P),
         np.int32(G),
         np.int32(S),
+        np.int32(S_eta),
     )
 
     return out_gpu

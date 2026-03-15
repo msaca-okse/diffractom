@@ -341,6 +341,125 @@ class OrientationTree:
 
         return tree
 
+    def plot_stereographic(
+        self,
+        level: int = 0,
+        direction: np.ndarray = None,
+        symmetry: str = None,
+        ax=None,
+        **scatter_kw,
+    ):
+        """Plot a stereographic projection of orientations at a given level.
+
+        For each active rotation *R* the crystal direction
+        ``d = R^T @ direction`` (inverse pole figure convention) is computed,
+        folded to the upper hemisphere, and projected stereographically onto
+        the equatorial plane.
+
+        When *symmetry* is given, every orientation is expanded by all
+        point-group operations so that the projection shows the full
+        coverage of the grid (not just the fundamental-zone representatives).
+
+        Parameters
+        ----------
+        level : int
+            Tree level to visualise (default 0).
+        direction : (3,) array-like, optional
+            Sample direction to project.  Default ``[0, 0, 1]`` (Z).
+        symmetry : str, optional
+            Crystal symmetry name (e.g. ``"cubic"``, ``"hexagonal"``).
+            When provided, each orientation is expanded by the
+            corresponding point-group operations before projection.
+        ax : matplotlib Axes, optional
+            If *None* a new figure is created.
+        **scatter_kw
+            Extra keyword arguments forwarded to ``ax.scatter``.
+
+        Returns
+        -------
+        ax : matplotlib Axes
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Circle as _Circle
+
+        if direction is None:
+            direction = np.array([0.0, 0.0, 1.0])
+        direction = np.asarray(direction, dtype=float)
+        direction = direction / np.linalg.norm(direction)
+
+        # Gather rotations
+        rotations = self.rotations_at_level(level, active_only=True)
+        if not rotations:
+            raise ValueError(f"No active rotations at level {level}")
+
+        R_concat = Rotation.concatenate(rotations)
+        mats = R_concat.as_matrix()                          # (K, 3, 3)
+
+        # Optionally expand by symmetry operations → (K*G, 3, 3)
+        if symmetry is not None:
+            sym_map = {
+                "triclinic": point_groups.trivial,
+                "monoclinic": point_groups.cyclic_2,
+                "orthorhombic": point_groups.orthorhombic,
+                "tetragonal": point_groups.tetragonal,
+                "trigonal": point_groups.trigonal,
+                "hexagonal": point_groups.hexagonal,
+                "cubic": point_groups.cubic,
+            }
+            if symmetry not in sym_map:
+                raise ValueError(
+                    f"Unknown symmetry '{symmetry}'. "
+                    f"Must be one of {list(sym_map.keys())}"
+                )
+            pg_ops = np.stack(
+                [g.as_matrix() for g in sym_map[symmetry]], axis=0
+            )  # (G, 3, 3)
+            # Expand: equiv[k, g] = pg_ops[g] @ mats[k]
+            expanded = np.einsum('gij,kjl->kgil', pg_ops, mats)  # (K, G, 3, 3)
+            mats = expanded.reshape(-1, 3, 3)                    # (K*G, 3, 3)
+
+        # Crystal directions: d_i = R_i^T @ direction  (IPF convention)
+        dirs = mats.transpose(0, 2, 1) @ direction           # (N, 3)
+
+        # Fold to upper hemisphere
+        dirs[dirs[:, 2] < 0] *= -1
+
+        # Stereographic projection  (project from south pole)
+        denom = 1.0 + dirs[:, 2]
+        denom = np.where(denom < 1e-12, 1e-12, denom)
+        X = dirs[:, 0] / denom
+        Y = dirs[:, 1] / denom
+
+        # --- Plot ---
+        created = ax is None
+        if created:
+            fig, ax = plt.subplots(figsize=(6, 6))
+
+        scatter_defaults = dict(s=4, alpha=0.6, edgecolors="none")
+        scatter_defaults.update(scatter_kw)
+        ax.scatter(X, Y, **scatter_defaults)
+
+        # Unit circle boundary
+        ax.add_patch(_Circle((0, 0), 1.0, fill=False, color="k", lw=0.8))
+
+        ax.set_xlim(-1.2, 1.2)
+        ax.set_ylim(-1.2, 1.2)
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+        if created:
+            n = len(rotations)
+            dir_lbl = {(1,0,0): "X", (0,1,0): "Y", (0,0,1): "Z"}.get(
+                tuple(int(x) for x in direction), str(direction))
+            ax.set_title(
+                f"Stereographic — IPF {dir_lbl}  "
+                f"(n={n}{f', sym={symmetry}' if symmetry else ''})"
+            )
+            plt.tight_layout()
+            plt.show()
+
+        return ax
+
     def prune_close_orientations(
         self,
         theta_deg: float,

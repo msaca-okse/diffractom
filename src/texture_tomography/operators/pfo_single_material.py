@@ -87,6 +87,17 @@ class PFO_SINGLE:
         self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega, endpoint=False) + delta / 2
         # Fine angles centered in sub-intervals (for PF coordinate generation)
         self.angles_subdivided = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega * self.N_Omega_subdivisions, endpoint=False) + sub_delta / 2
+
+        # --- eta subdivisions ---
+        self.N_eta_subdivisions = self.cfg.get('N_eta_subdivisions', 1)
+        self.eta_angle_range = np.array(self.cfg.get('eta_angle_range', [0, 360])) / 180 * np.pi
+        eta_delta = (self.eta_angle_range[1] - self.eta_angle_range[0]) / self.N_eta
+        eta_sub_delta = eta_delta / self.N_eta_subdivisions
+        # Coarse eta bin centres
+        self.eta_angles = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta, endpoint=False) + eta_delta / 2
+        # Fine eta sub-bin centres
+        self.eta_angles_subdivided = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta * self.N_eta_subdivisions, endpoint=False) + eta_sub_delta / 2
+
         self.pf_batch_max_gb = float(max_gb)
 
 
@@ -122,75 +133,52 @@ class PFO_SINGLE:
         self.allocate_coefficient_buffer()
 
 
-    def detector_coordinates(self, integration_samples=1, full_circle_covered=True):
-        """ Calculates and returns the probed polar and azimuthal coordinates on the unit sphere at
-        each angle of projection and for each detector segment in the system's geometry.
+    def detector_coordinates(self):
+        """Compute probed unit-sphere coordinates for all (omega, eta, peak) combinations.
+
+        Coords shape: (N_Omega, N_Omega_subdivisions, N_eta, N_eta_subdivisions, N_peaks, 3)
         """
         wavelength_angstrom = 12.398 / self.cfg["wavelength"]
         self.two_theta_peaks = 2.0 * np.arcsin(
             np.linalg.norm(self.h_cpu, axis=1) / (4.0 * np.pi) * wavelength_angstrom
         ).astype(np.float32)
         print(self.two_theta_peaks)
+
+        S_eta = self.N_eta_subdivisions
+
+        # Eta sub-bin centres: (N_eta, S_eta)
+        eta_angles_2d = self.eta_angles_subdivided.reshape(self.N_eta, S_eta)
+
+        det_dir_origin = np.array(self.cfg["detector_direction_origin"])
+        det_dir_pos90 = np.array(self.cfg["detector_direction_positive_90"])
+        p_direction_0 = np.array(self.cfg['p_direction_0'])
+        k0 = np.asarray(self.cfg["k_direction_0"])
+
+        N_fine_omega = self.N_Omega * self.N_Omega_subdivisions
+        Rmats = R.from_rotvec(self.angles_subdivided[:, None] * k0).as_matrix()
+
         coords_list = []
         for tt in self.two_theta_peaks:
+            twothetahalf = tt / 2.0
 
-            probed_directions_zero_rot = np.zeros((self.N_eta, integration_samples, 3))
-            # Impose symmetry if needed.
-            if not full_circle_covered:
-                shift = np.pi
-            else:
-                shift = 0
-            det_bin_middles_extended = np.linspace(0, 2*np.pi, self.N_eta, endpoint=False)
-            det_bin_middles_extended = np.insert(det_bin_middles_extended, 0, det_bin_middles_extended[-1] + shift)
-            det_bin_middles_extended = np.append(det_bin_middles_extended, det_bin_middles_extended[1] + shift)
+            # Zero-rotation-frame directions: (N_eta, S_eta, 3)
+            dirs_zero = (
+                np.cos(eta_angles_2d)[..., np.newaxis] * det_dir_origin[np.newaxis, np.newaxis, :]
+                + np.sin(eta_angles_2d)[..., np.newaxis] * det_dir_pos90[np.newaxis, np.newaxis, :]
+            )
 
-            for ii in range(self.N_eta):
+            # Apply 2theta tilt
+            dirs_zero = dirs_zero * np.cos(twothetahalf) - np.sin(twothetahalf) * p_direction_0
 
-                # Check if the interval from the previous to the next bin goes over the -pi +pi discontinuity
-                before = det_bin_middles_extended[ii]
-                now = det_bin_middles_extended[ii + 1]
-                after = det_bin_middles_extended[ii + 2]
+            # Rotate by all omega angles: (N_fine_omega, N_eta, S_eta, 3)
+            probed = np.einsum('oij,esi->oesj', Rmats, dirs_zero)
 
-                if abs(before - now + 2 * np.pi) < abs(before - now):
-                    before = before + 2 * np.pi
-                elif abs(before - now - 2 * np.pi) < abs(before - now):
-                    before = before - 2 * np.pi
-
-                if abs(now - after + 2 * np.pi) < abs(now - after):
-                    after = after - 2 * np.pi
-                elif abs(now - after - 2 * np.pi) < abs(now - after):
-                    after = after + 2 * np.pi
-
-                # Generate a linearly spaced set of angles covering the detector segment
-                start = 0.5 * (before + now)
-                end = 0.5 * (now + after)
-                inc = (end - start) / integration_samples*2
-                angles = np.linspace(start + inc / 2, end - inc / 2, integration_samples)
-
-                # Make the zero-rotation-frame vectors corresponding to the given angles
-                probed_directions_zero_rot[ii, :, :] = np.cos(angles[:, np.newaxis]) * \
-                    np.array(self.cfg["detector_direction_origin"])[np.newaxis,:]
-
-                probed_directions_zero_rot[ii, :, :] += np.sin(angles[:, np.newaxis]) * \
-                    np.array(self.cfg["detector_direction_positive_90"])[np.newaxis,:]
-
-            twothetahalf = tt/2
-
-            probed_directions_zero_rot = +probed_directions_zero_rot * np.cos(twothetahalf)\
-                - np.sin(twothetahalf) * np.array(self.cfg['p_direction_0'])
-            N_fine = self.N_Omega * self.N_Omega_subdivisions
-            probed_direction_vectors = np.zeros((N_fine, self.N_eta, integration_samples, 3), dtype=np.float64)
-            k0 = np.asarray(self.cfg["k_direction_0"])
-            Rmats = R.from_rotvec(self.angles_subdivided[:, None] * k0).as_matrix()
-            probed_direction_vectors[...] = \
-                np.einsum('kij,mli->kmlj', Rmats, probed_directions_zero_rot)
-
-            coords = probed_direction_vectors[:,:,0,:]
-            coords = coords.reshape((self.N_Omega, self.N_Omega_subdivisions, self.N_eta, 3))
+            # Reshape: (N_Omega, N_Omega_sub, N_eta, S_eta, 3)
+            coords = probed.reshape(self.N_Omega, self.N_Omega_subdivisions, self.N_eta, S_eta, 3)
             coords_list.append(coords)
 
-        coords_cpu = np.stack(coords_list, axis=-1)
-        coords_cpu = coords_cpu.transpose((0, 1, 2, 4, 3))
+        # Stack over peaks → (N_Omega, N_Omega_sub, N_eta, S_eta, N_peaks, 3)
+        coords_cpu = np.stack(coords_list, axis=-2)
         self.coords_cpu = np.asarray(coords_cpu, dtype=np.float32, order="C")
         self.coords_gpu = clarray.to_device(self.queue, self.coords_cpu)
 
@@ -579,6 +567,7 @@ class PFO_SINGLE:
                 np.int32(P),
                 np.int32(G),
                 np.int32(self.N_Omega_subdivisions),
+                np.int32(self.N_eta_subdivisions),
             )
             if not self.normalized:
                 self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, intensity_gpu)
@@ -701,6 +690,7 @@ class PFO_SINGLE:
                 np.int32(P),
                 np.int32(G),
                 np.int32(self.N_Omega_subdivisions),
+                np.int32(self.N_eta_subdivisions),
             )
             if not self.normalized:
                 self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, intensity_gpu)

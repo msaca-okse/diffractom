@@ -89,6 +89,15 @@ class PFO_OPENCL_BATCHED:
         self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega, endpoint=False) + delta / 2
         # Fine angles centered in sub-intervals (for PF coordinate generation)
         self.angles_subdivided = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega * self.N_Omega_subdivisions, endpoint=False) + sub_delta / 2
+
+        # --- eta subdivisions ---
+        self.N_eta_subdivisions = self.cfg.get('N_eta_subdivisions', 1)
+        self.eta_angle_range = np.array(self.cfg.get('eta_angle_range', [0, 360])) / 180 * np.pi
+        eta_delta = (self.eta_angle_range[1] - self.eta_angle_range[0]) / self.N_eta
+        eta_sub_delta = eta_delta / self.N_eta_subdivisions
+        self.eta_angles = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta, endpoint=False) + eta_delta / 2
+        self.eta_angles_subdivided = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta * self.N_eta_subdivisions, endpoint=False) + eta_sub_delta / 2
+
         self.N_mat = len(self.materials)
         self.pf_batch_max_gb = float(max_gb)
 
@@ -127,54 +136,31 @@ class PFO_OPENCL_BATCHED:
         self.allocate_coefficient_buffer()
 
 
-    def detector_coordinates(self, integration_samples=1, full_circle_covered=True):
-        """ Calculates and returns the probed polar and azimuthal coordinates on the unit sphere at
-        each angle of projection and for each detector segment in the system's geometry.
-        Per-material coordinate arrays are stored in self.pf_coords_gpu_list.
+    def detector_coordinates(self):
+        """Compute per-material probed unit-sphere coordinates.
+
+        Coords shape per material: (N_Omega, N_Omega_sub, N_eta, N_eta_sub, N_peaks, 3)
         """
         wavelength_angstrom = 12.398 / self.cfg["wavelength"]
-        S = self.N_Omega_subdivisions
-        N_fine = self.N_Omega * S
+        S_omega = self.N_Omega_subdivisions
+        S_eta = self.N_eta_subdivisions
+        N_fine_omega = self.N_Omega * S_omega
 
-        # Precompute azimuthal detector directions (shared across all materials/peaks)
-        probed_directions_zero_rot = np.zeros((self.N_eta, integration_samples, 3))
-        if not full_circle_covered:
-            shift = np.pi
-        else:
-            shift = 0
-        det_bin_middles_extended = np.linspace(0, 2*np.pi, self.N_eta, endpoint=False)
-        det_bin_middles_extended = np.insert(det_bin_middles_extended, 0, det_bin_middles_extended[-1] + shift)
-        det_bin_middles_extended = np.append(det_bin_middles_extended, det_bin_middles_extended[1] + shift)
+        # Eta sub-bin centres: (N_eta, S_eta)
+        eta_angles_2d = self.eta_angles_subdivided.reshape(self.N_eta, S_eta)
 
-        for ii in range(self.N_eta):
-            before = det_bin_middles_extended[ii]
-            now = det_bin_middles_extended[ii + 1]
-            after = det_bin_middles_extended[ii + 2]
-
-            if abs(before - now + 2 * np.pi) < abs(before - now):
-                before = before + 2 * np.pi
-            elif abs(before - now - 2 * np.pi) < abs(before - now):
-                before = before - 2 * np.pi
-
-            if abs(now - after + 2 * np.pi) < abs(now - after):
-                after = after - 2 * np.pi
-            elif abs(now - after - 2 * np.pi) < abs(now - after):
-                after = after + 2 * np.pi
-
-            start = 0.5 * (before + now)
-            end = 0.5 * (now + after)
-            inc = (end - start) / integration_samples
-            angles = np.linspace(start + inc / 2, end - inc / 2, integration_samples)
-
-            probed_directions_zero_rot[ii, :, :] = np.cos(angles[:, np.newaxis]) * \
-                np.array(self.cfg["detector_direction_origin"])[np.newaxis,:]
-
-            probed_directions_zero_rot[ii, :, :] += np.sin(angles[:, np.newaxis]) * \
-                np.array(self.cfg["detector_direction_positive_90"])[np.newaxis,:]
-
-        # Precompute rotation matrices for subdivided angles
+        det_dir_origin = np.array(self.cfg["detector_direction_origin"])
+        det_dir_pos90 = np.array(self.cfg["detector_direction_positive_90"])
+        p_direction_0 = np.array(self.cfg['p_direction_0'])
         k0 = np.asarray(self.cfg["k_direction_0"])
+
         Rmats = R.from_rotvec(self.angles_subdivided[:, None] * k0).as_matrix()
+
+        # Zero-rotation-frame azimuthal directions: (N_eta, S_eta, 3)
+        dirs_azi = (
+            np.cos(eta_angles_2d)[..., np.newaxis] * det_dir_origin[np.newaxis, np.newaxis, :]
+            + np.sin(eta_angles_2d)[..., np.newaxis] * det_dir_pos90[np.newaxis, np.newaxis, :]
+        )
 
         # Build per-material coordinate arrays
         self.pf_coords_gpu_list = []
@@ -188,21 +174,18 @@ class PFO_OPENCL_BATCHED:
 
             coords_list = []
             for tt in two_theta_peaks:
-                twothetahalf = tt / 2
-                dirs = +probed_directions_zero_rot * np.cos(twothetahalf) \
-                    - np.sin(twothetahalf) * np.array(self.cfg['p_direction_0'])
+                twothetahalf = tt / 2.0
+                dirs_zero = dirs_azi * np.cos(twothetahalf) - np.sin(twothetahalf) * p_direction_0
 
-                probed_direction_vectors = np.zeros((N_fine, self.N_eta, integration_samples, 3), dtype=np.float64)
-                probed_direction_vectors[...] = \
-                    np.einsum('kij,mli->kmlj', Rmats, dirs)
+                # Rotate by all omega angles: (N_fine_omega, N_eta, S_eta, 3)
+                probed = np.einsum('oij,esi->oesj', Rmats, dirs_zero)
 
-                coords = probed_direction_vectors[:,:,0,:]
-                coords = coords.reshape((self.N_Omega, S, self.N_eta, 3))
+                # Reshape: (N_Omega, S_omega, N_eta, S_eta, 3)
+                coords = probed.reshape(self.N_Omega, S_omega, self.N_eta, S_eta, 3)
                 coords_list.append(coords)
 
-            # coords_list: list of (N_Omega, S, N_eta, 3), length = N_peaks for this material
-            coords_cpu = np.stack(coords_list, axis=-1)         # (N_Omega, S, N_eta, 3, N_peaks)
-            coords_cpu = coords_cpu.transpose((0, 1, 2, 4, 3)) # (N_Omega, S, N_eta, N_peaks, 3)
+            # Stack over peaks -> (N_Omega, S_omega, N_eta, S_eta, N_peaks, 3)
+            coords_cpu = np.stack(coords_list, axis=-2)
             coords_cpu = np.asarray(coords_cpu, dtype=np.float32, order="C")
             self.pf_coords_cpu_list.append(coords_cpu)
             self.pf_coords_gpu_list.append(clarray.to_device(self.queue, coords_cpu))
@@ -787,6 +770,7 @@ class PFO_OPENCL_BATCHED:
                     np.int32(P),
                     np.int32(G),
                     np.int32(self.N_Omega_subdivisions),
+                    np.int32(self.N_eta_subdivisions),
                 )
 
                 self._scale_pf_by_intensity_inplace(self._basis_batch_list[i_mat], intensity_gpu)
@@ -918,6 +902,7 @@ class PFO_OPENCL_BATCHED:
                     np.int32(P),
                     np.int32(G),
                     np.int32(self.N_Omega_subdivisions),
+                    np.int32(self.N_eta_subdivisions),
                 )
 
                 self._scale_pf_by_intensity_inplace(self._basis_batch_list[i_mat], intensity_gpu)
