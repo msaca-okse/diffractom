@@ -3,7 +3,7 @@
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yourname/diffractom.git
+git clone https://github.com/msaca-okse/diffractom.git
 cd diffractom
 ```
 
