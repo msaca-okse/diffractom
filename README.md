@@ -1,32 +1,72 @@
 ## Installation
 
-Create and activate a fresh conda environment, install the required dependencies, build the package, and install it:
+### 1. Clone the repository
 
 ```bash
-conda create --name diffractom python=3.11
+git clone https://github.com/yourname/diffractom.git
+cd diffractom
+```
+
+### 2. Create and activate environment
+
+We recommend using Conda to manage dependencies:
+
+```bash
+conda env create -f environment.yml
 conda activate diffractom
 ```
 
+### 3. Install the package
 
+Install the library in editable mode:
 
 ```bash
-conda install numpy
-conda install --channel conda-forge pymatgen
-pip install --upgrade ase
+pip install -e .
 ```
 
-Install 
+---
 
-pip install gratopy
-conda install conda-forge::clblast
-conda install pyopencl
-pip install --user pyclblast
+## Requirements
 
-python -m pip install --upgrade pip build
-python -m build
-python -m pip install dist/diffractom-0.1.0-py3-none-any.whl
+The environment installs all required dependencies, including:
 
-# Optional extras:
-conda install notebook
+- numpy  
+- pyopencl (OpenCL interface)  
+- clblast / pyclblast (GPU linear algebra)  
+- pymatgen  
+- ase  
+- gratopy  
+
+---
+
+## GPU / OpenCL requirement
+
+⚠️ **A working OpenCL installation is required.**
+
+This includes:
+- GPU drivers (NVIDIA / AMD / Intel)  
+- OpenCL runtime available on your system  
+
+On HPC systems, this typically means running on a GPU node and loading the appropriate modules.
+
+---
+
+## Optional dependencies
+
+The following are not required for core functionality, but may be useful for analysis and visualization:
+
+```bash
+conda install -c conda-forge orix notebook
 pip install h5py hdf5plugin
-conda install -c conda-forge orix
+```
+
+---
+
+## Notes
+
+- Mixing `conda` and `pip` is intentional due to GPU/OpenCL dependencies.  
+- If you encounter issues with OpenCL or CLBlast, ensure your system configuration is correct.  
+
+
+## License
+Apache License 2.0

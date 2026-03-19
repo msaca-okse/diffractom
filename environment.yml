@@ -1,0 +1,16 @@
+name: diffractom
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - numpy
+  - pyopencl
+  - clblast
+  - pymatgen
+  - pip
+  - pip:
+      - gratopy
+      - ase
+      - pyclblast
