@@ -10,12 +10,12 @@ from pyclblast import gemmStridedBatched
 
 from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
-from .pfo_kernels import build_all_opencl
+from .pf_kernels import build_all_opencl
 
 
 
 
-class PFO_OPENCL_BATCHED:
+class MultiPhaseForwardOperator:
     """Multi-material pole-figure + tomographic forward/adjoint operator on GPU.
 
     Handles multiple crystallographic materials, each with its own orientation
@@ -42,7 +42,7 @@ class PFO_OPENCL_BATCHED:
             Experiment configuration.
         materials : list[Material]
             Crystallographic materials with reflections and symmetry.
-        grids : list[OrientationTree]
+        grids : list[Grid]
             Per-material orientation discretisation trees.
         two_thetas : array-like
             Detector 2-theta bin centres (degrees).
@@ -235,7 +235,7 @@ class PFO_OPENCL_BATCHED:
     def transfer_grid_parameters_to_gpu(self):
         """
         Transfer active orientation grid parameters (rotations + sigmas)
-        from OrientationTree objects to GPU.
+        from Grid objects to GPU.
         """
 
         self.grid_inv_gpu_list = []

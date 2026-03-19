@@ -7,7 +7,7 @@ import numpy as np
 from diffractom.crystallography import point_groups
 
 @dataclass
-class OrientationNode:
+class GridNode:
     """Single node in the orientation tree, holding a rotation and metadata."""
     R: Rotation                # scipy Rotation object
     level: int                 # index into sigma_levels
@@ -19,12 +19,12 @@ class OrientationNode:
     score: float = 0.0
 
 
-class OrientationTree:
+class Grid:
     """Hierarchical orientation grid with multi-resolution refinement."""
 
     def __init__(self, sigma_levels):
         """Create tree with the given sigma levels (one per refinement depth)."""
-        self.nodes: list[OrientationNode] = []
+        self.nodes: list[GridNode] = []
         self.levels: dict[int, list[int]] = {i: [] for i in range(len(sigma_levels))}
         self.sigma_levels = list(sigma_levels)
 
@@ -113,7 +113,7 @@ class OrientationTree:
             for omega in offsets:
                 R_child = parent.R * Rotation.from_rotvec(omega)
 
-                child = OrientationNode(
+                child = GridNode(
                     R=R_child,
                     level=next_level,
                     sigma=sigma_new,
@@ -172,7 +172,7 @@ class OrientationTree:
     
     def print_summary(self):
         """Pretty-print level-wise active/total node counts."""
-        print("OrientationTree summary:")
+        print("Grid summary:")
         for lvl in sorted(self.levels):
             active, total = self.summary()[lvl]
             print(f"  level {lvl}: {active} active / {total} total")
@@ -220,7 +220,7 @@ class OrientationTree:
         sigma: float,
     ):
         """
-        Initialize an OrientationTree from a given set of orientation matrices.
+        Initialize an Grid from a given set of orientation matrices.
 
         Parameters
         ----------
@@ -231,7 +231,7 @@ class OrientationTree:
 
         Returns
         -------
-        tree : OrientationTree
+        tree : Grid
         """
         if R_mats.ndim != 3 or R_mats.shape[1:] != (3, 3):
             raise ValueError("R_mats must have shape (N, 3, 3)")
@@ -241,7 +241,7 @@ class OrientationTree:
         tree = cls(sigma_levels=[sigma])
 
         for R in rotations:
-            node = OrientationNode(
+            node = GridNode(
                 R=R,
                 level=0,
                 sigma=sigma,
@@ -263,7 +263,7 @@ class OrientationTree:
         sigma: float,
     ):
         """
-        Initialize an OrientationTree with randomly sampled orientations
+        Initialize an Grid with randomly sampled orientations
         mapped into the fundamental zone of the given crystal symmetry.
 
         This creates a single-level tree (no children).
@@ -281,7 +281,7 @@ class OrientationTree:
 
         Returns
         -------
-        tree : OrientationTree
+        tree : Grid
         """
         point_group_map = {
             "triclinic": point_groups.trivial,
@@ -327,7 +327,7 @@ class OrientationTree:
         tree = cls(sigma_levels=[sigma])
 
         for i, R in enumerate(rotations):
-            node = OrientationNode(
+            node = GridNode(
                 R=R,
                 level=0,
                 sigma=sigma,
@@ -554,8 +554,3 @@ class OrientationTree:
 
         return len(self.nodes)
 
-
-def invert_grid(grid):
-    """Return flattened inverse rotation matrices (K, 9) for a list of Rotations."""
-    grid_inv_cpu = np.stack([rot.inv().as_matrix().reshape(-1) for rot in grid],axis=0).astype(np.float32)
-    return grid_inv_cpu

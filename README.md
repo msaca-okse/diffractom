@@ -68,5 +68,32 @@ pip install h5py hdf5plugin
 - If you encounter issues with OpenCL or CLBlast, ensure your system configuration is correct.  
 
 
+## Basic usage
+
+A minimal reconstruction consists of:
+
+1. Define experimental parameters in .yaml config file
+2. Setup a material from .cif
+2. Building an orientation grid  
+3. Constructing the forward operator  
+4. Solving the inverse problem  
+
+```python
+import diffractom as dt
+
+# Material
+material = dt.Material.from_lattice_parameters(...)
+
+# Orientation grid
+grid = dt.build_grid("uniform_fz", sigma_rad)
+
+# Forward operator
+op = dt.PFO_SINGLE(cfg, material, grid)
+
+# Solve (FISTA)
+solver = dt.FISTAHuberOpenCL(op, lam=..., huber_delta=...)
+solver.run(x, data, niter=50)
+
+
 ## License
 Apache License 2.0

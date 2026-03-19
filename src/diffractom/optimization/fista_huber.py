@@ -116,7 +116,7 @@ def build_fista_program(ctx: cl.Context) -> cl.Program:
 
 # -------------------- FISTA implementation --------------------
 
-class FISTAHuberOpenCL:
+class FISTAHuber:
     """
     Solve: min_x 0.5||A x - b||^2 + g(x)
     with FISTA on GPU.
@@ -130,7 +130,7 @@ class FISTAHuberOpenCL:
 
         Parameters
         ----------
-        operator : PFO_SINGLE or PFO_OPENCL_BATCHED
+        operator : SinglePhaseForwardOperator or MultiPhaseForwardOperator
         prox_kind : str
             One of 'nonneg', 'l1', 'nonneg_l1', 'nonneg_tv'.
         lam : float

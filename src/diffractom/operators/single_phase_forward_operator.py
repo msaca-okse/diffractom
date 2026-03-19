@@ -7,14 +7,14 @@ import pyopencl as cl
 import pyopencl.array as clarray
 import gratopy
 from pyclblast import gemmStridedBatched
-from ..utils.multiresolution_refiner import OrientationTree
+from ..utils.grid import Grid
 from ..crystallography.material import Material
 from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
-from .pfo_kernels import build_all_opencl
+from .pf_kernels import build_all_opencl
 
 
-class PFO_SINGLE:
+class SinglePhaseForwardOperator:
     """Single-material pole-figure forward operator on GPU.
 
     Computes  data = PF @ Radon(coeffs)  and its adjoint, where PF is the
@@ -26,7 +26,7 @@ class PFO_SINGLE:
         self,
         cfg: Mapping[str, Any],
         material: Material,
-        grid: OrientationTree,
+        grid: Grid,
         max_gb: float,
         verbose: bool = False,
         normalized: bool = False,
@@ -43,7 +43,7 @@ class PFO_SINGLE:
             wavelength, detector_direction_origin, etc.).
         material : Material
             Crystallographic material with reflections and symmetry.
-        grid : OrientationTree
+        grid : Grid
             Orientation discretisation tree.
         max_gb : float
             GPU memory budget (GB) for K-batching.
@@ -202,7 +202,7 @@ class PFO_SINGLE:
     def transfer_grid_parameters_to_gpu(self):
         """
         Transfer active orientation grid parameters (rotations + sigmas)
-        from OrientationTree objects to GPU.
+        from Grid objects to GPU.
         """
 
             # --- extract active leaf nodes ---
