@@ -3,8 +3,8 @@
 Create and activate a fresh conda environment, install the required dependencies, build the package, and install it:
 
 ```bash
-conda create --name textom python=3.11
-conda activate textom
+conda create --name diffractom python=3.11
+conda activate diffractom
 ```
 
 
@@ -24,7 +24,7 @@ pip install --user pyclblast
 
 python -m pip install --upgrade pip build
 python -m build
-python -m pip install dist/texture_tomography-0.1.0-py3-none-any.whl
+python -m pip install dist/diffractom-0.1.0-py3-none-any.whl
 
 # Optional extras:
 conda install notebook

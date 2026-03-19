@@ -39,7 +39,7 @@ class PFO_SINGLE:
         Parameters
         ----------
         cfg : dict
-            Experiment configuration (keys: Nx, Ny, N_Omega, N_eta, angle_range,
+            Experiment configuration (keys: Nx, Ny, My, N_Omega, N_eta, angle_range,
             wavelength, detector_direction_origin, etc.).
         material : Material
             Crystallographic material with reflections and symmetry.
@@ -77,6 +77,7 @@ class PFO_SINGLE:
         self.N_seg = self.N_peaks * self.N_eta
         self.Nx = self.cfg['Nx']
         self.Ny = self.cfg['Ny']
+        self.My = self.cfg['My']
         self.N_Omega = self.cfg['N_Omega']
         self.cor_offset = self.cfg['cor_offset']
         self.N_Omega_subdivisions = self.cfg.get('N_Omega_subdivisions', 1)
@@ -120,10 +121,9 @@ class PFO_SINGLE:
             gratopy.PARALLEL,
             (self.Nx, self.Ny, self.K_batch_max),
             self.angles,
-            #self.N_Omega,
-            n_detectors=self.Nx,
+            n_detectors=self.My,
             image_width=self.Nx,
-            detector_width=self.Nx,
+            detector_width=self.My,
             detector_shift=self.cor_offset,
         )
         assert self.queue.context.int_ptr == self.ctx.int_ptr
@@ -244,7 +244,7 @@ class PFO_SINGLE:
 
         self.coeffs_sino_C = _alloc(
             "coeffs_sino_C",
-            (self.N_Omega, self.Nx, self.K_batch_max),
+            (self.N_Omega, self.My, self.K_batch_max),
             np.float32,
             "C",
         )
@@ -435,12 +435,12 @@ class PFO_SINGLE:
         Returns
         -------
         yin_gpu : clarray
-            Shape (N_Omega, Nx, N_seg), C order
+            Shape (N_Omega, My, N_seg), C order
         """
 
         data = clarray.zeros(
             self.queue,
-            (self.N_Omega, self.Nx, self.N_seg),
+            (self.N_Omega, self.My, self.N_seg),
             dtype=np.float32,
             order="C",
         )
@@ -456,7 +456,7 @@ class PFO_SINGLE:
         Parameters
         ----------
         coeffs : clarray, (Nx, Ny, K), F-order
-        data : clarray, (N_Omega, Nx, N_seg), C-order — accumulated into.
+        data : clarray, (N_Omega, My, N_seg), C-order — accumulated into.
         """
         data.fill(0.0)
 
@@ -467,6 +467,7 @@ class PFO_SINGLE:
         Kmax = self.K_batch_max
         Nx = self.Nx
         Ny = self.Ny
+        My = self.My
         N_Omega = self.N_Omega
         coords_gpu   = self.coords_gpu
         sym_ops_gpu  = self.sym_ops_gpu
@@ -511,14 +512,14 @@ class PFO_SINGLE:
             # 3) Transpose sino F → C (only Kb)
             # -------------------------------------------------
 
-            total = N_Omega * Nx * Kmax
+            total = N_Omega * My * Kmax
             self.k.transpose_d_omega_k_f_to_c(
                 self.queue,
                 (total,),
                 None,
                 self.coeffs_sino_F.data,
                 self.coeffs_sino_C.data,
-                np.int32(Nx),
+                np.int32(My),
                 np.int32(N_Omega),
                 np.int32(Kmax),
                 np.int32(total),
@@ -573,7 +574,7 @@ class PFO_SINGLE:
                 self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, intensity_gpu)
 
             # OBS: batched_gemm_clblast overwrites _data_batch, but we need to accumulate. Hence this trick
-            batched_gemm_clblast(self.queue, self.coeffs_sino_C, self._basis_batch_kmax.reshape((R, Kmax, C*P)), data, R=R, M=Nx, K=Kmax, N=P*C)
+            batched_gemm_clblast(self.queue, self.coeffs_sino_C, self._basis_batch_kmax.reshape((R, Kmax, C*P)), data, R=R, M=My, K=Kmax, N=P*C)
 
 
 
@@ -584,12 +585,12 @@ class PFO_SINGLE:
         Parameters
         ----------
         y_gpu : clarray
-            Shape (N_Omega, Nx, N_seg), C-order
+            Shape (N_Omega, My, N_seg), C-order
 
         Returns
         -------
         x_gpu : clarray
-            Shape (Nx, Nx, K_sum), Fortran-order
+            Shape (Nx, Ny, K_sum), Fortran-order
         """
 
         coeffs = clarray.zeros(
@@ -611,14 +612,14 @@ class PFO_SINGLE:
         Parameters
         ----------
         data : clarray
-            Shape (N_Omega, Nx, N_seg), C-order
+            Shape (N_Omega, My, N_seg), C-order
         coeffs : clarray
-            Shape (Nx, Nx, K_sum), Fortran-order
+            Shape (Nx, Ny, K_sum), Fortran-order
             Will be overwritten
         """
 
         # ---------------- checks ----------------
-        assert data.shape == (self.N_Omega, self.Nx, self.N_seg)
+        assert data.shape == (self.N_Omega, self.My, self.N_seg)
         assert data.flags.c_contiguous
 
         assert coeffs.shape == (self.Nx, self.Ny, self.K)
@@ -634,6 +635,7 @@ class PFO_SINGLE:
         G = int(len(self.sym_ops_cpu))
         Nx = self.Nx
         Ny = self.Ny
+        My = self.My
         coords_gpu   = self.coords_gpu
         sym_ops_gpu  = self.sym_ops_gpu
         h_gpu_normed        = self.h_gpu_normed
@@ -710,11 +712,11 @@ class PFO_SINGLE:
             )
 
             # batched gemm overwrites self.coeffs_sino_C
-            batched_gemm_adj_clblast(self.queue, data, self._basis_batch_transpose_kmax, self.coeffs_sino_C, R, Nx, P*C, Kmax, R/np.pi)
+            batched_gemm_adj_clblast(self.queue, data, self._basis_batch_transpose_kmax, self.coeffs_sino_C, R, My, P*C, Kmax, R/np.pi)
             # Now transpose, backproject and depose the coefficients in the "coeffs" array
 
             # Transpose
-            total = R*Nx*Kmax
+            total = R*My*Kmax
             self.k.transpose_omega_d_k_c_to_d_omega_k_f(
                 self.queue,
                 (total,),
@@ -722,7 +724,7 @@ class PFO_SINGLE:
                 self.coeffs_sino_C.data,
                 self.coeffs_sino_F.data,
                 np.int32(R),
-                np.int32(Nx),
+                np.int32(My),
                 np.int32(Kmax),
                 np.int32(total),
             )
@@ -867,7 +869,7 @@ def estimate_L_power(
     # x in domain, Fortran
     x = clarray.empty(q, (op.Nx, op.Ny, op.K), np.float32, order="F")
     # y in range, C
-    Ax = clarray.empty(q, (op.N_Omega, op.Nx, op.N_seg), np.float32, order="C")
+    Ax = clarray.empty(q, (op.N_Omega, op.My, op.N_seg), np.float32, order="C")
     # z = A^*Ax in domain
     z = clarray.empty(q, x.shape, np.float32, order="F")
 

@@ -1,4 +1,4 @@
-# texture_tomography — Documentation
+# diffractom — Documentation
 
 GPU-accelerated texture tomography reconstruction library.  
 Reconstructs spatially-resolved orientation distribution functions (ODFs) from
@@ -10,7 +10,7 @@ parallel-beam projection on OpenCL.
 ## Package layout
 
 ```
-texture_tomography/
+diffractom/
 ├── operators/          # Forward / adjoint operators (GPU)
 ├── crystallography/    # Material, lattice, point-group helpers
 ├── utils/              # Orientation grid tree, GPU memory logger

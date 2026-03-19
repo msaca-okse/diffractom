@@ -4,7 +4,7 @@ from scipy.spatial.transform import Rotation
 from scipy.spatial import KDTree
 import numpy as np
 
-from texture_tomography.crystallography import point_groups
+from diffractom.crystallography import point_groups
 
 @dataclass
 class OrientationNode:
