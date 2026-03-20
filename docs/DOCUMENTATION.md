@@ -28,8 +28,8 @@ diffractom/
 | `pfo_single_material.py` | `PFO_SINGLE` — single-material pole-figure ⊗ Radon operator. |
 | `pfo_and_projection_batched_opencl.py` | `PFO_OPENCL_BATCHED` — multi-material operator with Gaussian 2θ convolution. |
 | `create_pfo_matrix.py` | OpenCL kernel source strings and GPU wrapper functions for PF-matrix evaluation (dense & sparse). |
-| `pfo_kernels.py` | Builds the main `.cl` program, typed `Kernels` dataclass, `build_all_opencl()` convenience. |
-| `pfo_kernels.cl` | Raw OpenCL kernels: GEMM, transposes, slicing, scattering, Gaussian peak expansion. |
+| `pf_kernels.py` | Builds the main `.cl` program, typed `Kernels` dataclass, `build_all_opencl()` convenience. |
+| `pf_kernels.cl` | Raw OpenCL kernels: GEMM, transposes, slicing, scattering, Gaussian peak expansion. |
 
 #### Key classes
 

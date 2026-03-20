@@ -1,0 +1,20 @@
+# config.yaml
+N_theta: 5  # Number of hkl rings
+N_Omega: 180    # Number of rotation steps
+N_Omega_subdivisions: 1  # integration samples per omega step in pole figure transform
+angle_range: [0, 180] # rotation angle range in degrees. 180 rotations steps in the range [0,180] uses the points [0.5, 1.5,...,179.5] 
+#in case of 1 integration sample
+Nx: 99  # Number of pixels in the x dimension (pixel size=translation size)
+Ny: 99   # Number of pixels in the y dimension (pixel size=translation size)
+My: 103   # Number of translation steps
+k_direction_0: [0,0,1]    # Rotation axis
+p_direction_0: [1,0,0]    # beam direction
+j_direction_0: [0,-1,0]   # Horizontal detector axis
+detector_direction_origin: [0, -1, 0]  # Eta=0 axis
+detector_direction_positive_90: [0, 0, -1]   
+cor_offset: 0  # center of rotation offset
+N_eta: 180   # number of azimuthal steps
+N_eta_subdivisions: 1  # integration samples per eta step in the pole figure transform
+eta_angle_range: [0, 360] # Start and end angle in azimuthal integration. Midpoints are used in case of 1 integration sample
+
+wavelength: 50

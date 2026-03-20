@@ -222,8 +222,8 @@ class Material:
             "cubic",
         ],
         wavelength_kev: float,
-        min_two_theta: float,
-        max_two_theta: float,
+        min_two_theta: float = 0.0,
+        max_two_theta: float = 0.0,
         global_intensity_norm: float | None = None,
         # ---- selection options ----
         hkl_list: Sequence[tuple[int, int, int]] | None = None,

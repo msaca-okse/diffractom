@@ -57,7 +57,7 @@ The following are not required for core functionality, but may be useful for ana
 
 ```bash
 conda install -c conda-forge orix notebook
-pip install h5py hdf5plugin
+pip install h5py hdf5plugin matplotlib
 ```
 
 ---

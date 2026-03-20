@@ -142,7 +142,6 @@ class SinglePhaseForwardOperator:
         self.two_theta_peaks = 2.0 * np.arcsin(
             np.linalg.norm(self.h_cpu, axis=1) / (4.0 * np.pi) * wavelength_angstrom
         ).astype(np.float32)
-        print(self.two_theta_peaks)
 
         S_eta = self.N_eta_subdivisions
 

@@ -13,9 +13,9 @@ from .create_pfo_matrix import build_pf_program
 # ----------------------------
 def build_pfo_program(ctx: cl.Context, *, ts: int = 16) -> cl.Program:
     """
-    Build the main PFO OpenCL program from pfo_kernels.cl.
+    Build the main PFO OpenCL program from pf_kernels.cl.
     """
-    cl_path = Path(__file__).with_name("pfo_kernels.cl")
+    cl_path = Path(__file__).with_name("pf_kernels.cl")
     src = cl_path.read_text()
     return cl.Program(ctx, src).build(options=[f"-DTS={ts}"])
 
@@ -81,7 +81,7 @@ _KERNEL_MAP: Final[tuple[tuple[str, str], ...]] = (
 )
 
 
-def bind_pfo_kernels(prg: cl.Program) -> Kernels:
+def bind_pf_kernels(prg: cl.Program) -> Kernels:
     """
     Bind kernels into a typed bundle.
     Fails fast if a kernel symbol is missing from the compiled program.
@@ -113,6 +113,6 @@ def build_all_opencl(ctx: cl.Context, *, ts: int = 16) -> tuple[cl.Program, Kern
       - returns both
     """
     prg = build_pfo_program(ctx, ts=ts)
-    kernels = bind_pfo_kernels(prg)
+    kernels = bind_pf_kernels(prg)
     pf_prg = build_pf_program(ctx)
     return prg, kernels, pf_prg
