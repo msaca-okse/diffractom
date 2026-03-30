@@ -2,5 +2,6 @@
 
 from .single_phase_forward_operator import SinglePhaseForwardOperator
 from .multi_phase_forward_operator import MultiPhaseForwardOperator
+from .bulk_texture_forward_operator import BulkTextureForwardOperator
 
-__all__ = ["SinglePhaseForwardOperator", "MultiPhaseForwardOperator"]
+__all__ = ["SinglePhaseForwardOperator", "MultiPhaseForwardOperator", "BulkTextureForwardOperator"]
