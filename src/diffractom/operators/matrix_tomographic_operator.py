@@ -27,6 +27,7 @@ class MatrixTomographicOperator:
         K: int,
         N_seg: int,
         cor_offset: float = 0.0,
+        image_width_factor: float = 1.0,
         verbose: bool = False,
         ctx: cl.Context | None = None,
         queue: cl.CommandQueue | None = None,
@@ -71,6 +72,7 @@ class MatrixTomographicOperator:
         self.N_seg = N_seg
         self.cor_offset = cor_offset
         self.verbose = verbose
+        self.image_width_factor = image_width_factor
 
         # --- context / queue ---
         if ctx is not None and queue is not None:
@@ -95,7 +97,7 @@ class MatrixTomographicOperator:
             (self.Nx, self.Ny, self.K),
             self.angles,
             n_detectors=self.My,
-            image_width=self.Nx,
+            image_width=self.Nx*self.image_width_factor,
             detector_width=self.My,
             detector_shift=self.cor_offset,
         )
