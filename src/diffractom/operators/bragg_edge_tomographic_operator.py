@@ -72,8 +72,9 @@ import pyopencl.array as clarray
 from scipy.spatial.transform import Rotation
 
 from .matrix_tomographic_operator import MatrixTomographicOperator
-from ..crystallography.neutron_material import NeutronMaterial
+from ..crystallography.material import Material
 from ..utils.grid import Grid
+from ..utils.instrument import raden_pulse_tail
 
 
 # ---------------------------------------------------------------------------
@@ -90,148 +91,72 @@ def _build_bragg_program(ctx: cl.Context) -> cl.Program:
 # ---------------------------------------------------------------------------
 # Pure-Python reference implementation (CPU)
 # Faithful replication of the MATLAB functions:
-#   factor.m            → _structure_factor_sq
-#   genera_indices_2022 → compute_bragg_A1
-#   tau.m               → _tau
 #   genera_matriz_bola_2022 + xs_singlecrystal_2022 → build_bragg_matrix_cpu
 # ---------------------------------------------------------------------------
 
-def _tau(x: np.ndarray) -> np.ndarray:
-    """Empirical pulse-tail parameter τ(λ) — direct translation of tau.m.
-
-    tau.m::
-        p1=1.39341; p2=0.18492; p3=18.94806; p4=-10.82914; p5=16.6964;
-        tau=erf(((x-p1)/p2)).*(p3+p4*x)+p5.*x;
-    """
-    from scipy.special import erf as sp_erf
-    p1, p2 = 1.39341, 0.18492
-    p3, p4, p5 = 18.94806, -10.82914, 16.6964
-    return sp_erf((x - p1) / p2) * (p3 + p4 * x) + p5 * x
-
-
-def compute_bragg_A1(
-    a: float,
-    atoms: np.ndarray,
-    threshold: float = 0.001,
-) -> np.ndarray:
-    """Build the HKL reflection table — replica of genera_indices_2022(a, B).
-
-    Enumerates all (h, k, l) with h, k, l ∈ [-10, 10], computes |F|² using
-    the same formula as ``factor.m``, and returns reflections with |F|² above
-    ``threshold``, sorted by |F|² descending.
-
-    Parameters
-    ----------
-    a : float
-        Cubic lattice parameter in Å.
-    atoms : np.ndarray, shape (N_atoms, 5)
-        Each row: [x, y, z, b_coh_fm, u2_A2] — fractional coordinates,
-        coherent scattering length in fm, and mean-square displacement in Å².
-        Matches the column layout of ``atomos_316L_alloy.txt`` (without the
-        leading atom-index column).
-    threshold : float
-        Minimum |F|² in barns to include a reflection.  The MATLAB code uses
-        ``find(AA(:,4) > 0.001)``.
-
-    Returns
-    -------
-    A1 : np.ndarray, shape (N_hkl, 4)
-        Columns: [h, k, l, F2_barns], sorted by F2 descending.
-    """
-    # ----- enumerate all (h,k,l) in [-10,10]^3 excluding (0,0,0) -----
-    h_range = np.arange(-10, 11, dtype=np.float64)
-    hh, kk, ll = np.meshgrid(h_range, h_range, h_range, indexing="ij")
-    h = hh.ravel();  k = kk.ravel();  l = ll.ravel()
-    nonzero = (h != 0) | (k != 0) | (l != 0)
-    h, k, l = h[nonzero], k[nonzero], l[nonzero]
-
-    # ----- structure factor |F|² — replica of factor.m -----
-    # factor.m uses b in fm;  SF = (xre² + xim²) * 0.01 converts fm² → barns
-    d   = a / np.sqrt(h**2 + k**2 + l**2)   # d-spacing in Å
-    q   = 2.0 * np.pi / d                     # q in Å⁻¹
-    q2  = q**2
-
-    u2_ref = atoms[0, 4]   # u² of first atom (same as B(1,6) in factor.m)
-    xre = np.zeros(len(h), dtype=np.float64)
-    xim = np.zeros(len(h), dtype=np.float64)
-
-    for i in range(len(atoms)):
-        xi, yi, zi, bi, u2_i = atoms[i, 0], atoms[i, 1], atoms[i, 2], atoms[i, 3], atoms[i, 4]
-        qd = 2.0 * np.pi * (h * xi + k * yi + l * zi)
-        # factor.m: exp(-q2*(B(1,6)*0.5)) * (B(i,5) * exp(-q2*(B(i,6)-B(1,6))*0.5) * cos/sin(qd))
-        dw = np.exp(-q2 * u2_ref * 0.5) * np.exp(-q2 * (u2_i - u2_ref) * 0.5)
-        xre += dw * bi * np.cos(qd)
-        xim += dw * bi * np.sin(qd)
-
-    SF = (xre**2 + xim**2) * 0.01   # convert fm² → barns
-
-    # ----- filter and sort (replicates the logic of genera_indices_2022) -----
-    mask = SF > threshold
-    h, k, l, SF = h[mask], k[mask], l[mask], SF[mask]
-    order = np.argsort(-SF)
-
-    return np.column_stack([h[order], k[order], l[order], SF[order]])
-
 
 def build_bragg_matrix_cpu(
-    A1: np.ndarray,
-    a: float,
+    bragg_table: dict,
     rotations: Rotation,
     beam_angles_deg,
     lam: np.ndarray,
     sig: float,
     e0: float,
+    pulse_tail_fn=raden_pulse_tail,
 ) -> np.ndarray:
     """CPU implementation faithful to xs_text_full_cubic + xs_singlecrystal_2022.
 
     Replicates the MATLAB computation that produces ``matrix_15_*deg.txt``.
+    Works for any crystal system — no cubic assumption is made.
 
     Parameters
     ----------
-    A1 : np.ndarray, shape (N_hkl, 4)
-        HKL table from :func:`compute_bragg_A1`: columns [h, k, l, F2_barns].
-    a : float
-        Cubic lattice parameter in Å.  (``a = 3.596`` for 316L.)
+    bragg_table : dict
+        Output of :meth:`~diffractom.crystallography.material.Material.neutron_bragg_table`.
+        Required keys: ``g_vecs`` (N_hkl, 3), ``d`` (N_hkl,), ``F2`` (N_hkl,),
+        ``V`` (unit-cell volume in Å³).  The g-vectors are reciprocal lattice
+        vectors **without** the 2π factor (Å⁻¹).
     rotations : scipy.spatial.transform.Rotation, length N_orient
-        Crystal orientations corresponding to ``S3G_B`` in MATLAB.
-        These are the **forward** orientations (NOT pre-inverted); the function
-        applies the inverse internally, matching ``rot = rotation.byEuler(inv(S3G_B)...)``
-        in ``xs_text_full_cubic.m``.
+        Crystal orientations.  The function applies the inverse internally,
+        matching ``rot = rotation.byEuler(inv(S3G_B)...)`` in MATLAB.
     beam_angles_deg : sequence of float
-        Tomographic beam angles in degrees.  The beam direction for angle φ
-        is ``R_z(φ) @ [0,1,0]`` (MATLAB: ``rotate(vector3d(0,1,0), axis2quat(ẑ,φ))``).
+        Tomographic beam angles in degrees.  Beam direction for angle φ:
+        ``R_z(φ) @ [0,1,0]``.
     lam : np.ndarray, shape (N_lam,)
         Wavelength grid in Å.
     sig : float
-        Orientation spread in **radians**.  Corresponds to ``G_big`` in MATLAB.
+        Orientation spread in **radians** (``G_big`` in MATLAB).
     e0 : float
-        Instrument resolution parameter (dimensionless, ~1e-4).
-        (MATLAB: ``e0 = 0.0001``.)
+        Instrument resolution parameter (``e0 = 0.0001`` in MATLAB).
+    pulse_tail_fn : callable, optional
+        Function ``f(lam) -> tau`` that returns the instrument pulse-tail
+        parameter τ(λ).  ``α = τ / 10000`` is the exponential decay length
+        in the peak-shape formula.  Defaults to
+        :func:`~diffractom.utils.instrument.raden_pulse_tail` (RADEN/J-PARC).
+        Pass a different callable to use a different beamline model.
 
     Returns
     -------
     B : np.ndarray, shape (N_Omega, N_orient, N_lam)
-        ``B[i_ang, i_n, :]`` is the single-crystal cross-section spectrum
-        for beam angle ``beam_angles_deg[i_ang]`` and orientation
-        ``rotations[i_n]``.
     """
     from scipy.special import erfc as sp_erfc
 
-    lam       = np.asarray(lam, dtype=np.float64)
-    lam_min   = lam.min()
-    lam_max   = lam.max()
-    N_lam     = len(lam)
-    N_orient  = len(rotations)
-    N_Omega   = len(beam_angles_deg)
+    lam      = np.asarray(lam, dtype=np.float64)
+    lam_min  = lam.min()
+    lam_max  = lam.max()
+    N_lam    = len(lam)
+    N_orient = len(rotations)
+    N_Omega  = len(beam_angles_deg)
 
-    V_cm3 = (a * 1e-8) ** 3          # unit cell volume in cm³  (matches genera_matriz_bola_2022)
+    g_vecs = np.asarray(bragg_table['g_vecs'], dtype=np.float64)   # (N_hkl, 3) Å⁻¹
+    d_hkl  = np.asarray(bragg_table['d'],      dtype=np.float64)   # (N_hkl,)   Å
+    F2     = np.asarray(bragg_table['F2'],      dtype=np.float64)   # (N_hkl,)   barns
+    V_cm3  = float(bragg_table['V']) * 1e-24                        # Å³ → cm³
 
-    h,  k,  l_  = A1[:, 0], A1[:, 1], A1[:, 2]
-    F2          = A1[:, 3]            # |F|² in barns
-    hkl_sq      = h**2 + k**2 + l_**2
+    # |g|² for each reflection — used for the general Bragg wavelength formula
+    g_sq = np.einsum('ij,ij->i', g_vecs, g_vecs)                   # (N_hkl,) Å⁻²
 
-    # Pre-compute inverse rotation matrices (= R^T for SO(3))
-    R_inv_all = rotations.inv().as_matrix()   # (N_orient, 3, 3)
+    R_inv_all = rotations.inv().as_matrix()                          # (N_orient, 3, 3)
 
     B = np.zeros((N_Omega, N_orient, N_lam), dtype=np.float64)
 
@@ -242,72 +167,67 @@ def build_bragg_matrix_cpu(
         vv = np.array([-np.sin(ang_rad), np.cos(ang_rad), 0.0])
 
         for i_n in range(N_orient):
-            # Beam direction in crystal frame of orientation i_n
-            # MATLAB: HH = rot .* HAZ_muestra(m)  where rot = rotation.byEuler(inv(S3G_B)...)
-            n_crystal = R_inv_all[i_n] @ vv          # (3,)
-            a1c, a2c, a3c = n_crystal
+            # Beam direction in crystal frame (= rot.*HAZ_muestra in MATLAB)
+            n_crystal = R_inv_all[i_n] @ vv                         # (3,)
 
-            # ---------- genera_matriz_bola_2022 ----------
-            # lam0 = 2*a * (h*a1 + k*a2 + l*a3) / (h²+k²+l²)
-            lam0 = 2.0 * a * (h * a1c + k * a2c + l_ * a3c) / hkl_sq
+            # General Bragg wavelength: λ₀ = 2(n̂·g)/|g|²
+            # Derivation: Bragg condition λ₀ = 2d·sin(θB), with
+            #   sin(θB) = (n̂·g)/|g|  → λ₀ = 2(n̂·g)/|g|²
+            # Reduces to the MATLAB cubic formula when g = [h,k,l]/a.
+            lam0 = 2.0 * (g_vecs @ n_crystal) / g_sq               # (N_hkl,)
 
-            # Keep reflections whose Bragg wavelength falls in [lam_min, lam_max]
             mask = (lam0 >= lam_min) & (lam0 <= lam_max)
             if not np.any(mask):
                 continue
 
-            lam0_m  = lam0[mask]
-            F2_m    = F2[mask]
-            hkl_sq_m = hkl_sq[mask]
+            lam0_m = lam0[mask]
+            d_m    = d_hkl[mask]
+            F2_m   = F2[mask]
 
-            d_hkl = a / np.sqrt(hkl_sq_m)              # d-spacing in Å
-            ratio = np.clip(lam0_m / (2.0 * d_hkl), -1.0, 1.0)
-            theta_B = np.arcsin(ratio)                  # Bragg angle
-            alpha0  = np.arccos(ratio)                  # = acos(lam0/(2d)) as in MATLAB
-
-            # Guard sin²(theta_B) = 0 (grazing)
+            ratio   = np.clip(lam0_m / (2.0 * d_m), -1.0, 1.0)
+            theta_B = np.arcsin(ratio)           # Bragg angle
+            alpha0  = np.arccos(ratio)           # complement: angle between beam and planes
             sin2_tB = np.maximum(np.sin(theta_B)**2, 1e-30)
 
-            # amplitude: 1E8*(lam0*1E-8)^4 * F2*1E-24 / (V^2 * 2 * sin²(thetaB))
+            # amplitude: 1E8*(lam0*1E-8)^4 * F2*1E-24 / (V^2 * 2 * sin²(θB))
             amplitude = (
                 1e8 * (lam0_m * 1e-8)**4 * F2_m * 1e-24
                 / (V_cm3**2 * 2.0 * sin2_tB)
             )
 
-            # ---------- xs_singlecrystal_2022 ----------
-            # sigma_g = lam0 * sqrt(tan²(alpha0)*sig² + e0²)    [col 11 in MATLAB]
-            # alfa    = tau(lam0) / 10000                         [col 12 in MATLAB]
+            # Peak shape from xs_singlecrystal_2022.m:
+            #   σ_g = λ₀ · √(tan²(α₀)·sig² + e₀²)   [MATLAB col 11]
+            #   α   = τ(λ₀) / 10000                   [MATLAB col 12]
             sigma_g = lam0_m * np.sqrt(np.tan(alpha0)**2 * sig**2 + e0**2)
-            alfa    = _tau(lam0_m) / 10000.0
+            alfa    = pulse_tail_fn(lam0_m) / 10000.0
 
-            # Two groups (same split as xs_singlecrystal_2022.m):
-            #   kk  : sigma_g <  0.2 * alfa  → erfc × exponential form
-            #   kk1 : sigma_g >= 0.2 * alfa  → Gaussian approximation
-            kk  = sigma_g <  0.2 * alfa
-            kk1 = ~kk
+            kk  = sigma_g <  0.2 * alfa    # erfc × exponential form
+            kk1 = ~kk                      # Gaussian approximation
 
-            # Broadcast over wavelengths: shape (M_refl, N_lam)
             if np.any(kk):
-                dlam = lam[np.newaxis, :] - lam0_m[kk, np.newaxis]   # (M, N_lam)
-                s  = sigma_g[kk, np.newaxis]
-                al = alfa[kk, np.newaxis]
-                u  = -dlam / (np.sqrt(2.0) * s) + s / al
-                # exponent = (s/(sqrt(2)*al))^2 - dlam/al
-                exp_arg = (s / (np.sqrt(2.0) * al))**2 - dlam / al
-                # Guard overflow: when exp_arg > 709 numpy overflows float64
-                exp_arg = np.clip(exp_arg, -800.0, 709.0)
-                y5 = (amplitude[kk, np.newaxis]
-                      * sp_erfc(u)
-                      * (1.0 / (2.0 * al))
-                      * np.exp(exp_arg))
+                dlam    = lam[np.newaxis, :] - lam0_m[kk, np.newaxis]
+                s       = sigma_g[kk, np.newaxis]
+                al      = alfa[kk, np.newaxis]
+                u       = -dlam / (np.sqrt(2.0) * s) + s / al
+                exp_arg = np.clip(
+                    (s / (np.sqrt(2.0) * al))**2 - dlam / al, -800.0, 709.0
+                )
+                y5 = (
+                    amplitude[kk, np.newaxis]
+                    * sp_erfc(u)
+                    * (1.0 / (2.0 * al))
+                    * np.exp(exp_arg)
+                )
                 B[i_ang, i_n] += np.sum(y5, axis=0)
 
             if np.any(kk1):
-                dlam = lam[np.newaxis, :] - lam0_m[kk1, np.newaxis]  # (M, N_lam)
+                dlam = lam[np.newaxis, :] - lam0_m[kk1, np.newaxis]
                 s    = sigma_g[kk1, np.newaxis]
-                y6   = (amplitude[kk1, np.newaxis]
-                        * (1.0 / (np.sqrt(2.0 * np.pi) * s))
-                        * np.exp(-dlam**2 / (2.0 * s**2)))
+                y6   = (
+                    amplitude[kk1, np.newaxis]
+                    * (1.0 / (np.sqrt(2.0 * np.pi) * s))
+                    * np.exp(-dlam**2 / (2.0 * s**2))
+                )
                 B[i_ang, i_n] += np.sum(y6, axis=0)
 
     return B
@@ -318,13 +238,13 @@ def build_bragg_matrix_cpu(
 # ---------------------------------------------------------------------------
 
 def build_bragg_matrix_gpu(
-    A1: np.ndarray,
-    a: float,
+    bragg_table: dict,
     rotations: Rotation,
     beam_angles_deg: np.ndarray,
     lam: np.ndarray,
     sig: float,
     e0: float,
+    pulse_tail_fn=raden_pulse_tail,
     ctx: cl.Context | None = None,
     queue: cl.CommandQueue | None = None,
 ) -> np.ndarray:
@@ -337,10 +257,8 @@ def build_bragg_matrix_gpu(
 
     Parameters
     ----------
-    A1 : np.ndarray, shape (N_hkl, 4)
-        HKL table from :func:`compute_bragg_A1`: columns [h, k, l, F2_barns].
-    a : float
-        Cubic lattice parameter in Å.
+    bragg_table : dict
+        Output of :meth:`~diffractom.crystallography.material.Material.neutron_bragg_table`.
     rotations : scipy Rotation, shape (N_orient,)
     beam_angles_deg : np.ndarray, shape (N_Omega,)
         Tomographic angles in degrees.
@@ -350,6 +268,9 @@ def build_bragg_matrix_gpu(
         Orientation spread in radians (G_big).
     e0 : float
         Instrument resolution parameter.
+    pulse_tail_fn : callable, optional
+        Instrument pulse-tail function — see :func:`build_bragg_matrix_cpu`.
+        Defaults to :func:`~diffractom.utils.instrument.raden_pulse_tail`.
     ctx, queue : optional
         Existing OpenCL context/command-queue.
 
@@ -447,8 +368,12 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
 
     Parameters
     ----------
-    material : NeutronMaterial
-        Crystal with neutron scattering parameters.
+    material : Material
+        A :class:`~diffractom.crystallography.material.Material` with neutron
+        sites set via :meth:`~diffractom.crystallography.material.Material.set_neutron_sites`
+        or built with :meth:`~diffractom.crystallography.material.Material.from_neutron_sites`.
+        The class handles reflection enumeration and structure-factor computation;
+        no material-specific logic remains in the operator itself.
     grid : Grid
         Orientation grid whose active leaf nodes define the K basis functions.
         Sigma (angular half-width) is read from the nodes; pass ``sigma_grid``
@@ -466,6 +391,10 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         (default), the value is taken from ``grid.nodes[leaf_0].sigma``.
     e0 : float
         Instrument exponential resolution parameter (dimensionless, ~1e-4).
+    pulse_tail_fn : callable, optional
+        Instrument pulse-tail function ``f(lam) -> tau``.  Defaults to
+        :func:`~diffractom.utils.instrument.raden_pulse_tail` (RADEN/J-PARC).
+        Pass a different callable for a different beamline.
     powder_xs : np.ndarray or None, shape (N_lam,)
         Powder-averaged cross-section spectrum.  Required if
         ``include_powder=True``.
@@ -497,12 +426,13 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
 
     def __init__(
         self,
-        material: NeutronMaterial,
+        material: Material,
         grid: Grid,
         beam_angles: np.ndarray,
         lam: np.ndarray,
         sigma_grid: float | None = None,
         e0: float = 1e-4,
+        pulse_tail_fn=raden_pulse_tail,
         powder_xs: np.ndarray | None = None,
         include_powder: bool = False,
         h_max: int = 10,
@@ -543,31 +473,38 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         if queue is None:
             queue = cl.CommandQueue(ctx)
 
-        # --- compute HKL reflection table (genera_indices_2022 equivalent) ---
-        A1 = compute_bragg_A1(material.a, material.atoms, threshold=threshold)
+        # --- build neutron Bragg table from material ---
+        # Material handles reflection enumeration, d-spacings, and |F|²;
+        # the operator is not aware of lattice parameters or atom positions.
+        bragg_table = material.neutron_bragg_table(
+            lam_min   = float(lam.min()),
+            lam_max   = float(lam.max()),
+            h_max     = h_max,
+            threshold = threshold,
+        )
 
         # --- build B ---
         if use_gpu:
             B = build_bragg_matrix_gpu(
-                A1             = A1,
-                a              = material.a,
+                bragg_table    = bragg_table,
                 rotations      = rotations,
                 beam_angles_deg= beam_angles,
                 lam            = lam,
                 sig            = sigma_grid,
                 e0             = e0,
+                pulse_tail_fn  = pulse_tail_fn,
                 ctx            = ctx,
                 queue          = queue,
             )
         else:
             B = build_bragg_matrix_cpu(
-                A1             = A1,
-                a              = material.a,
+                bragg_table    = bragg_table,
                 rotations      = rotations,
                 beam_angles_deg= beam_angles,
                 lam            = lam,
                 sig            = sigma_grid,
                 e0             = e0,
+                pulse_tail_fn  = pulse_tail_fn,
             ).astype(np.float32)
 
         if include_powder:
@@ -589,6 +526,7 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         self.lam = lam
         self.sigma_grid = sigma_grid
         self.e0 = e0
+        self.pulse_tail_fn = pulse_tail_fn
         self.include_powder = include_powder
 
         # --- delegate to parent ---

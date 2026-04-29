@@ -317,6 +317,11 @@ class Material:
         # grouping equivalent reflections — necessary for non-cubic systems.
         self._hkl_grouping_ops: list[np.ndarray] | None = None
 
+        # Neutron scattering site parameters (set via set_neutron_sites)
+        # Shape (M, 5): [x, y, z, b_coh_fm, u2_A2] — fractional coords,
+        # coherent scattering length in fm, mean-square displacement in Å².
+        self._neutron_sites: np.ndarray | None = None
+
         # Reflection table (structured numpy array)
         self.reflections: np.ndarray | None = None
 
@@ -379,6 +384,36 @@ class Material:
             self._occupancies = cif['occupancies']
         if cif.get('sym_ops'):
             self._hkl_grouping_ops = _sym_ops_to_hkl_ops(cif['sym_ops'])
+
+    def set_neutron_sites(self, sites) -> None:
+        """Set neutron scattering sites directly, without requiring element names.
+
+        This is the neutron analogue of specifying an atomic basis: instead of
+        element symbols and X-ray form factors, you supply the coherent
+        scattering length ``b_coh`` and the Debye-Waller parameter ``u²`` for
+        each site.  Matches the column layout of MATLAB ``atomos_*.txt`` files
+        (without the leading atom-index column).
+
+        Can be called on any ``Material`` instance, including ones built from a
+        CIF, to layer neutron parameters on top of an existing structure.
+
+        Parameters
+        ----------
+        sites : array_like, shape (N_atoms, 5)
+            Each row: ``[x, y, z, b_coh, u²]``
+
+            * ``x, y, z``  – fractional coordinates in the unit cell
+            * ``b_coh``    – coherent scattering length in **fm**
+            * ``u²``       – isotropic mean-square displacement in **Å²**
+              (Debye-Waller factor = exp(-|G|² u²/2))
+        """
+        arr = np.asarray(sites, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[1] != 5:
+            raise ValueError(
+                "sites must have shape (N_atoms, 5): [x, y, z, b_coh_fm, u2_A2], "
+                f"got {arr.shape}"
+            )
+        self._neutron_sites = arr
 
     # ------------------------------------------------------------------
     # Factory: from CIF
@@ -551,6 +586,245 @@ class Material:
             global_intensity_norm=global_intensity_norm,
         )
         return mat
+
+    # ------------------------------------------------------------------
+    # Factory: from neutron site parameters (no CIF required)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_neutron_sites(
+        cls,
+        sites,
+        *,
+        a: float,
+        b: float | None = None,
+        c: float | None = None,
+        alpha: float = 90.0,
+        beta:  float = 90.0,
+        gamma: float = 90.0,
+        space_group_number: int | None = None,
+        name: str = 'material',
+    ) -> 'Material':
+        """Build a Material from manually specified neutron scattering sites.
+
+        No CIF file or element names are needed.  Intended for alloys or
+        composite materials where an effective pseudo-atom description is used
+        (e.g. 316L steel described as four identical FCC sites with a single
+        averaged ``b_coh`` and ``u²``).
+
+        The resulting object has its lattice set and neutron sites ready for
+        use with :meth:`compute_neutron_sf_sq`.  No X-ray reflection table is
+        computed.
+
+        Parameters
+        ----------
+        sites : array_like, shape (N_atoms, 5)
+            Each row: ``[x, y, z, b_coh_fm, u2_A2]``.  See
+            :meth:`set_neutron_sites` for full documentation.
+        a : float
+            Lattice parameter *a* in Å.
+        b, c : float, optional
+            Lattice parameters *b* and *c* in Å.  Default to *a*.
+        alpha, beta, gamma : float
+            Cell angles in degrees.  Default 90°.
+        space_group_number : int, optional
+            Space group number (1–230).  Used to derive the crystal system
+            (and hence the correct point-group for multiplicity counting if
+            :meth:`compute_reflections` is called later).
+        name : str
+            Human-readable label.
+
+        Examples
+        --------
+        316L stainless steel (FCC, effective pseudo-atom)::
+
+            import numpy as np
+            from diffractom.crystallography.material import Material
+
+            mat = Material.from_neutron_sites(
+                sites=[
+                    [0.0, 0.0, 0.0, 9.2, 0.0083],
+                    [0.5, 0.5, 0.0, 9.2, 0.0083],
+                    [0.0, 0.5, 0.5, 9.2, 0.0083],
+                    [0.5, 0.0, 0.5, 9.2, 0.0083],
+                ],
+                a=3.596,
+                space_group_number=225,   # Fm-3m
+                name='316L',
+            )
+            hkl = np.array([[1,1,1],[2,0,0],[2,2,0]])
+            sf2 = mat.compute_neutron_sf_sq(hkl)   # barns
+        """
+        mat = cls(name=name)
+        b_val = b if b is not None else a
+        c_val = c if c is not None else a
+        if space_group_number is not None:
+            mat.set_space_group(number=space_group_number)
+        mat.set_lattice(a, b_val, c_val, alpha, beta, gamma)
+        mat.set_neutron_sites(sites)
+        return mat
+
+    # ------------------------------------------------------------------
+    # Neutron structure factors
+    # ------------------------------------------------------------------
+
+    def compute_neutron_sf_sq(self, hkl_arr) -> np.ndarray:
+        """Compute the neutron |F_hkl|² for each reflection, in barns.
+
+        Works for any crystal system — the scattering vector magnitude is
+        obtained from the full reciprocal-lattice matrix ``B`` (which includes
+        the 2π factor), so no cubic assumption is made.
+
+        Parameters
+        ----------
+        hkl_arr : array_like, shape (N, 3)
+            Miller indices (integers or floats).
+
+        Returns
+        -------
+        np.ndarray, shape (N,)
+            |F_hkl|² in **barns**.
+
+        Notes
+        -----
+        The formula is the standard kinematic neutron structure factor::
+
+            F_hkl = Σ_j  b_j · exp(-|G|² u²_j / 2) · exp(2πi G·r_j)
+
+        where G = B @ [h,k,l] (Å⁻¹, with 2π), b_j in fm, u²_j in Å².
+        The factor 0.01 converts |F|² from fm² to barns (1 barn = 100 fm²).
+
+        Raises
+        ------
+        RuntimeError
+            If neutron sites or lattice are not set.
+        """
+        if self._neutron_sites is None:
+            raise RuntimeError(
+                "Neutron sites not set. Call set_neutron_sites() or use "
+                "Material.from_neutron_sites()."
+            )
+        B   = self._compute_reciprocal_lattice_matrix()   # (3, 3), includes 2π
+        hkl = np.asarray(hkl_arr, dtype=np.float64)       # (N, 3)
+
+        # Scattering vectors and their squared magnitudes
+        G  = B @ hkl.T                                      # (3, N)
+        q2 = np.einsum('ij,ij->j', G, G)                   # (N,)  |G|²  Å⁻²
+
+        sites = self._neutron_sites                          # (M, 5)
+        xyz   = sites[:, :3]                                 # (M, 3) fractional
+        b_coh = sites[:,  3]                                 # (M,)   fm
+        u2    = sites[:,  4]                                 # (M,)   Å²
+
+        # Phases: 2π·(h·x_j + k·y_j + l·z_j),  shape (N, M)
+        phases = 2.0 * np.pi * (hkl @ xyz.T)
+
+        # Debye-Waller per (reflection, atom):  shape (N, M)
+        dw = np.exp(-np.outer(q2, u2) / 2.0)
+
+        # Vectorised structure-factor sum
+        w    = b_coh * dw                                    # (N, M)
+        F_re = (w * np.cos(phases)).sum(axis=1)              # (N,)
+        F_im = (w * np.sin(phases)).sum(axis=1)              # (N,)
+
+        # |F|² in fm² → barns  (* 0.01)
+        return (F_re**2 + F_im**2) * 0.01
+
+    def neutron_bragg_table(
+        self,
+        lam_min: float,
+        lam_max: float,
+        h_max: int = 10,
+        threshold: float = 1e-3,
+    ) -> dict:
+        """Enumerate neutron Bragg reflections active in a wavelength window.
+
+        For each (h, k, l) with indices in [-h_max, h_max]³, computes the
+        reciprocal lattice vector ``g`` (without the 2π factor), the d-spacing,
+        and the neutron |F|² from :meth:`compute_neutron_sf_sq`.  Only
+        reflections satisfying ``|F|² > threshold`` *and* ``2d >= lam_min``
+        (i.e. the reflection can in principle contribute for some beam direction
+        and orientation) are retained.
+
+        The returned dict is the canonical input for
+        :func:`~diffractom.operators.bragg_edge_tomographic_operator.build_bragg_matrix_cpu`.
+        The per-orientation λ₀ filtering (``lam_min ≤ λ₀ ≤ lam_max``) is
+        performed inside ``build_bragg_matrix_cpu`` because it depends on the
+        beam direction and crystal orientation.
+
+        Parameters
+        ----------
+        lam_min, lam_max : float
+            Wavelength range in Å (inclusive).
+        h_max : int
+            Maximum absolute Miller index to enumerate.  Matches the
+            ``hh1 = [-10:10]`` range in MATLAB's ``genera_indices_2022.m``.
+        threshold : float
+            Minimum |F|² in barns to retain a reflection.
+
+        Returns
+        -------
+        dict with keys:
+
+        ``g_vecs`` : np.ndarray, shape (N_hkl, 3)
+            Reciprocal lattice vectors **without** the 2π factor, in Å⁻¹.
+            ``g = A⁻ᵀ @ [h, k, l]``.  General — works for any crystal system.
+        ``d`` : np.ndarray, shape (N_hkl,)
+            d-spacings in Å: ``d = 1 / |g|``.
+        ``F2`` : np.ndarray, shape (N_hkl,)
+            Neutron |F_hkl|² in barns.
+        ``V`` : float
+            Unit-cell volume in Å³ (needed for the amplitude prefactor in the
+            cross-section formula).
+
+        Raises
+        ------
+        RuntimeError
+            If neutron sites or lattice are not set.
+        """
+        if self._neutron_sites is None:
+            raise RuntimeError(
+                "Neutron sites not set. Call set_neutron_sites() or use "
+                "Material.from_neutron_sites()."
+            )
+        B       = self._compute_reciprocal_lattice_matrix()   # (3,3), with 2π
+        B_no2pi = B / (2.0 * np.pi)                           # (3,3), without 2π
+
+        # --- enumerate all (h,k,l) in [-h_max, h_max]³ ---
+        r  = np.arange(-h_max, h_max + 1, dtype=np.float64)
+        hh, kk, ll = np.meshgrid(r, r, r, indexing='ij')
+        hkl = np.column_stack([hh.ravel(), kk.ravel(), ll.ravel()])
+        hkl = hkl[np.any(hkl != 0, axis=1)]                  # remove (0,0,0)
+
+        # --- reciprocal vectors and d-spacings (general, not cubic-specific) ---
+        G    = B_no2pi @ hkl.T                                # (3, N)
+        g_sq = np.einsum('ij,ij->j', G, G)                   # (N,)  |g|²
+        d    = 1.0 / np.sqrt(g_sq)                            # (N,)  Å
+
+        # --- pre-filter: reflection can only contribute if 2d >= lam_min ---
+        mask_d = (2.0 * d) >= lam_min
+        hkl    = hkl[mask_d]
+        G      = G[:, mask_d]
+        g_sq   = g_sq[mask_d]
+        d      = d[mask_d]
+
+        # --- neutron structure factors ---
+        F2 = self.compute_neutron_sf_sq(hkl)                  # (N,) barns
+
+        # --- filter by |F|² threshold ---
+        mask_F  = F2 > threshold
+        g_vecs  = G[:, mask_F].T                              # (N_hkl, 3)
+        d_filt  = d[mask_F]                                   # (N_hkl,)
+        F2_filt = F2[mask_F]                                  # (N_hkl,)
+
+        V = abs(float(np.linalg.det(self._A)))                # unit-cell volume Å³
+
+        return {
+            'g_vecs': g_vecs,    # (N_hkl, 3)  Å⁻¹, without 2π
+            'd':      d_filt,    # (N_hkl,)    Å
+            'F2':     F2_filt,   # (N_hkl,)    barns
+            'V':      V,         # scalar       Å³
+        }
 
     # ------------------------------------------------------------------
     # Core: reflection computation
