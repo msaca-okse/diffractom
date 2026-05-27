@@ -6,7 +6,6 @@ channels:
 dependencies:
   - python=3.11
   - numpy
-  - pyopencl
   - clblast
   - pymatgen
   - pip
@@ -14,3 +13,4 @@ dependencies:
       - gratopy
       - ase
       - pyclblast
+      - pyopencl
