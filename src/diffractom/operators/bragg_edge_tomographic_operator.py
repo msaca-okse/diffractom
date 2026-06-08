@@ -138,6 +138,10 @@ def build_bragg_matrix_cpu(
     Returns
     -------
     B : np.ndarray, shape (N_Omega, N_orient, N_lam)
+        Macroscopic elastic coherent attenuation coefficient μ_R(λ, τ) in cm⁻¹,
+        equivalent to n·σ.  The number density n = 1/V_cell is not hardcoded —
+        it is derived from the unit-cell volume in *bragg_table* (which in turn
+        comes from :meth:`Material.neutron_bragg_table`).
     """
     from scipy.special import erfc as sp_erfc
 
@@ -189,7 +193,11 @@ def build_bragg_matrix_cpu(
             alpha0  = np.arccos(ratio)           # complement: angle between beam and planes
             sin2_tB = np.maximum(np.sin(theta_B)**2, 1e-30)
 
-            # amplitude: 1E8*(lam0*1E-8)^4 * F2*1E-24 / (V^2 * 2 * sin²(θB))
+            # Macroscopic attenuation amplitude μ_hkl (cm⁻¹):
+            #   μ_hkl = n · λ₀⁴ · |F|² / (V · 2 · sin²θB)
+            # where n = 1/V, so the denominator has V² overall.
+            # V comes from bragg_table['V'] (set by Material), so the lattice
+            # parameter is never hardcoded here.
             amplitude = (
                 1e8 * (lam0_m * 1e-8)**4 * F2_m * 1e-24
                 / (V_cm3**2 * 2.0 * sin2_tB)
@@ -277,6 +285,8 @@ def build_bragg_matrix_gpu(
     Returns
     -------
     B : np.ndarray, shape (N_Omega, N_orient, N_lam), dtype float32
+        Macroscopic attenuation coefficient μ_R (cm⁻¹).  See
+        :func:`build_bragg_matrix_cpu` for details.
     """
     raise NotImplementedError(
         "build_bragg_matrix_gpu needs to be updated to match xs_singlecrystal_2022.m. "
@@ -422,6 +432,13 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
     -----
     ``N_seg`` in the parent class corresponds to ``N_lam`` here.
     ``K`` equals ``N_orient`` (+ 1 if ``include_powder=True``).
+
+    **Units**: the B matrix stores the macroscopic elastic-coherent attenuation
+    coefficient μ_R(λ, τ) in cm⁻¹.  The number density n = 1/V_cell is implicit
+    in the formula (V² in the denominator) but is never hardcoded: V comes from
+    :meth:`Material.neutron_bragg_table` which reads it from the lattice
+    parameters set on the :class:`Material` object.  To recover the microscopic
+    cross-section σ = μ/n, divide by ``n = 1 / (bragg_table['V'] * 1e-24)``.
     """
 
     def __init__(
