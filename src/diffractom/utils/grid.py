@@ -213,6 +213,27 @@ class Grid:
             indices = [i for i in indices if self.nodes[i].active]
         return np.array([self.nodes[i].score for i in indices])
 
+
+    def set_sigma_for_level(
+        self,
+        level: int,
+        sigma: float,
+    ):
+        """
+        Update the sigma value for every node in a given level.
+
+        This updates both the nodes already present at that level and the
+        corresponding entry in ``sigma_levels`` so future child generation
+        uses the new value as well.
+        """
+        if level not in self.levels:
+            raise ValueError(f"Level {level} is not present in this grid")
+
+        self.sigma_levels[level] = sigma
+        for idx in self.levels[level]:
+            self.nodes[idx].sigma = sigma
+
+
     @classmethod
     def from_rotation_matrices(
         cls,

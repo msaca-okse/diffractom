@@ -470,7 +470,7 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
 
         beam_angles = np.asarray(beam_angles, dtype=np.float64)
         lam = np.asarray(lam, dtype=np.float64)
-
+        
         N_orient = len(rotations)
         N_Omega = len(beam_angles)
         N_lam = len(lam)
@@ -500,6 +500,7 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
             threshold = threshold,
         )
 
+
         # --- build B ---
         if use_gpu:
             B = build_bragg_matrix_gpu(
@@ -514,6 +515,7 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
                 queue          = queue,
             )
         else:
+
             B = build_bragg_matrix_cpu(
                 bragg_table    = bragg_table,
                 rotations      = rotations,
@@ -545,10 +547,13 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         self.e0 = e0
         self.pulse_tail_fn = pulse_tail_fn
         self.include_powder = include_powder
+        self.angles = beam_angles
 
         # --- delegate to parent ---
+        print('N_Omega',N_Omega)
         super().__init__(
             B=B,
+            angles = self.angles,
             N_Omega=N_Omega,
             K=K,
             N_seg=N_lam,
