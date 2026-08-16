@@ -103,6 +103,7 @@ def build_bragg_matrix_cpu(
     sig: float,
     e0: float,
     pulse_tail_fn=raden_pulse_tail,
+    edge_blur_scale: float = 1.0,
 ) -> np.ndarray:
     """CPU implementation faithful to xs_text_full_cubic + xs_singlecrystal_2022.
 
@@ -134,6 +135,10 @@ def build_bragg_matrix_cpu(
         in the peak-shape formula.  Defaults to
         :func:`~diffractom.utils.instrument.raden_pulse_tail` (RADEN/J-PARC).
         Pass a different callable to use a different beamline model.
+    edge_blur_scale : float, optional
+        Scalar multiplier applied to the symmetric edge broadening term.
+        Use values below 1.0 for sharper edges and above 1.0 for broader
+        edges.  Must be positive.
 
     Returns
     -------
@@ -156,6 +161,10 @@ def build_bragg_matrix_cpu(
     d_hkl  = np.asarray(bragg_table['d'],      dtype=np.float64)   # (N_hkl,)   Å
     F2     = np.asarray(bragg_table['F2'],      dtype=np.float64)   # (N_hkl,)   barns
     V_cm3  = float(bragg_table['V']) * 1e-24                        # Å³ → cm³
+
+    edge_blur_scale = float(edge_blur_scale)
+    if edge_blur_scale <= 0.0:
+        raise ValueError("edge_blur_scale must be positive")
 
     # |g|² for each reflection — used for the general Bragg wavelength formula
     g_sq = np.einsum('ij,ij->i', g_vecs, g_vecs)                   # (N_hkl,) Å⁻²
@@ -196,8 +205,6 @@ def build_bragg_matrix_cpu(
             # Macroscopic attenuation amplitude μ_hkl (cm⁻¹):
             #   μ_hkl = n · λ₀⁴ · |F|² / (V · 2 · sin²θB)
             # where n = 1/V, so the denominator has V² overall.
-            # V comes from bragg_table['V'] (set by Material), so the lattice
-            # parameter is never hardcoded here.
             amplitude = (
                 1e8 * (lam0_m * 1e-8)**4 * F2_m * 1e-24
                 / (V_cm3**2 * 2.0 * sin2_tB)
@@ -206,7 +213,11 @@ def build_bragg_matrix_cpu(
             # Peak shape from xs_singlecrystal_2022.m:
             #   σ_g = λ₀ · √(tan²(α₀)·sig² + e₀²)   [MATLAB col 11]
             #   α   = τ(λ₀) / 10000                   [MATLAB col 12]
-            sigma_g = lam0_m * np.sqrt(np.tan(alpha0)**2 * sig**2 + e0**2)
+
+            sigma_g = (
+                lam0_m * np.sqrt(np.tan(alpha0)**2 * sig**2 + e0**2)
+                * edge_blur_scale
+            )
             alfa    = pulse_tail_fn(lam0_m) / 10000.0
 
             kk  = sigma_g <  0.2 * alfa    # erfc × exponential form
@@ -405,6 +416,10 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         Instrument pulse-tail function ``f(lam) -> tau``.  Defaults to
         :func:`~diffractom.utils.instrument.raden_pulse_tail` (RADEN/J-PARC).
         Pass a different callable for a different beamline.
+    edge_blur_scale : float, optional
+        Scalar multiplier applied to the symmetric edge broadening term.
+        Use values below 1.0 for sharper edges and above 1.0 for broader
+        edges.  Must be positive.
     powder_xs : np.ndarray or None, shape (N_lam,)
         Powder-averaged cross-section spectrum.  Required if
         ``include_powder=True``.
@@ -450,6 +465,7 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         sigma_grid: float | None = None,
         e0: float = 1e-4,
         pulse_tail_fn=raden_pulse_tail,
+        edge_blur_scale: float = 1.0,
         powder_xs: np.ndarray | None = None,
         include_powder: bool = False,
         h_max: int = 10,
@@ -511,6 +527,7 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
                 sig            = sigma_grid,
                 e0             = e0,
                 pulse_tail_fn  = pulse_tail_fn,
+                edge_blur_scale= edge_blur_scale,
                 ctx            = ctx,
                 queue          = queue,
             )
@@ -524,6 +541,7 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
                 sig            = sigma_grid,
                 e0             = e0,
                 pulse_tail_fn  = pulse_tail_fn,
+                edge_blur_scale= edge_blur_scale,
             ).astype(np.float32)
 
         if include_powder:
@@ -546,6 +564,7 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         self.sigma_grid = sigma_grid
         self.e0 = e0
         self.pulse_tail_fn = pulse_tail_fn
+        self.edge_blur_scale = edge_blur_scale
         self.include_powder = include_powder
         self.angles = beam_angles
 
