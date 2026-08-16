@@ -149,16 +149,14 @@ class FISTAHuber:
         self.queue = operator.queue
         self.huber_delta = float(huber_delta)
 
+        # NOTE: x/y/x_old/grad (the "coeffs" arrays) are now CPU-resident
+        # F-order numpy arrays, consistent with SinglePhaseForwardOperator_cpu.
+        # Only the data-space vector ops (residual, huber clip) still run on
+        # the GPU, since Ax/r/out_gpu stay GPU-resident.
         self.fista_prg = build_fista_program(self.ctx)
-        self.k_copy_buf       = cl.Kernel(self.fista_prg, "copy_buf")
         self.k_residual_axpb  = cl.Kernel(self.fista_prg, "residual_axpb")
-        self.k_grad_step      = cl.Kernel(self.fista_prg, "grad_step")
-        self.k_extrapolate    = cl.Kernel(self.fista_prg, "extrapolate")
         self.k_huber_clip_inplace = cl.Kernel(self.fista_prg, "huber_clip_inplace")
         self.k_huber_loss = cl.Kernel(self.fista_prg, "huber_loss")
-
-        self.prox_kernels = ProxKernels(self.ctx)
-        self.tv_kernels = TVProxKernels(self.ctx)
 
         self.prox_kind = prox_kind
         self.lam = float(lam)
@@ -172,12 +170,6 @@ class FISTAHuber:
 
         self.tv_niter = int(tv_niter)
 
-        # prox dispatch
-        self._prox_nonneg     = prox_nonneg
-        self._prox_l1         = prox_l1
-        self._prox_nonneg_l1  = prox_nonneg_l1
-        self._prox_nonneg_tv  = prox_tv_nonneg_inplace
-
 
 
         if tau is None:
@@ -190,45 +182,26 @@ class FISTAHuber:
 
 
 
-    def _apply_prox(self, x_gpu):
-            """Dispatch to the chosen proximal operator in place."""
+    def _apply_prox(self, x):
+            """Dispatch to the chosen proximal operator in place (CPU array).
+
+            NOTE: only 'nonneg' is implemented for the CPU-coeffs variant.
+            """
             if self.prox_kind == "nonneg":
-                self._prox_nonneg(self.queue, self.prox_kernels, x_gpu)
-
-            elif self.prox_kind == "l1":
-                self._prox_l1(self.queue, self.prox_kernels, x_gpu, self.lam, self.tau)
-
-            elif self.prox_kind == "nonneg_l1":
-                self._prox_nonneg_l1(self.queue, self.prox_kernels, x_gpu, self.lam, self.tau)
-
-            elif self.prox_kind == "nonneg_tv":
-                b = self._tv_buffers
-                x_gpu, tv_res = self._prox_nonneg_tv(
-                    queue=self.queue,
-                    kernels=self.tv_kernels,
-                    x_gpu=x_gpu,
-                    y_gpu=b["y"],
-                    ux=b["gx"],
-                    uy=b["gy"],
-                    px=b["px"],
-                    py=b["py"],
-                    div=b["div"],
-                    weight=self.lam,
-                    tau=self.tau,
-                    n_iter=self.tv_niter,
-                    return_stats=True
-                )
-                self._last_tv_residual = tv_res
+                np.maximum(x, 0.0, out=x)
 
             else:
-                raise ValueError(f"Unknown prox_kind: {self.prox_kind}")
+                raise NotImplementedError(
+                    f"FISTAHuber (cpu) only supports prox_kind='nonneg' (got {self.prox_kind!r}); "
+                    "l1/tv variants are not implemented for CPU-resident coeffs."
+                )
 
-            return x_gpu
+            return x
 
 
     def run(
         self,
-        x0_gpu: clarray.Array,
+        x0: np.ndarray,
         out_gpu: clarray.Array,
         niter: int,
         weights: clarray.Array | None = None,
@@ -236,27 +209,30 @@ class FISTAHuber:
         diagnostics_interval: int = 1,
     ):
         """
-        x0_gpu:   clarray (Nx, Ny, K) float32, order='F'
+        x0:       numpy.ndarray (Nx, Ny, K) float32, order='F', on CPU (host).
         out_gpu:  clarray (O, D, Nseg) float32, order='C'
         weights:  OPTIONAL clarray (O, D, Nseg) float32, order='C'
                 If provided, residuals are multiplied elementwise by weights.
                 weights==0 masks out (ignores) corrupted data points.
-        returns x_gpu solution (same layout as x0_gpu)
+        returns x solution: numpy.ndarray (same layout as x0), on CPU (host)
         """
         q = self.queue
 
         # ---- basic checks ----
-        if not isinstance(x0_gpu, clarray.Array) or not isinstance(out_gpu, clarray.Array):
-            raise TypeError("x0_gpu and out_gpu must be pyopencl.array.Array")
+        if not isinstance(x0, np.ndarray):
+            raise TypeError("x0 must be a numpy.ndarray (CPU-resident coeffs)")
+        if not isinstance(out_gpu, clarray.Array):
+            raise TypeError("out_gpu must be pyopencl.array.Array")
 
-        if x0_gpu.queue is None or out_gpu.queue is None:
-            raise ValueError("Arrays must have a queue attached (created via clarray on a queue)")
+        if out_gpu.queue is None:
+            raise ValueError("out_gpu must have a queue attached (created via clarray on a queue)")
 
-        if x0_gpu.dtype != np.float32 or out_gpu.dtype != np.float32:
+        if x0.dtype != np.float32 or out_gpu.dtype != np.float32:
             raise TypeError("This FISTA assumes float32 arrays")
 
-        if x0_gpu.queue.context.int_ptr != self.ctx.int_ptr:
-            raise ValueError("x0_gpu context != operator context")
+        if not x0.flags.f_contiguous:
+            raise ValueError("x0 must be Fortran-order (order='F')")
+
         if out_gpu.queue.context.int_ptr != self.ctx.int_ptr:
             raise ValueError("out_gpu context != operator context")
 
@@ -275,26 +251,22 @@ class FISTAHuber:
                 raise ValueError(f"weights.shape {weights.shape} must match out_gpu.shape {out_gpu.shape}")
 
         # ---- persistent buffers ----
-        x = x0_gpu
-        y = clarray.empty(q, x.shape, dtype=np.float32, order="F")
-        x_old = clarray.empty(q, x.shape, dtype=np.float32, order="F")
-        grad = clarray.empty(q, x.shape, dtype=np.float32, order="F")
+        # x/y/x_old/grad are CPU-resident F-order numpy arrays (the "coeffs"),
+        # consistent with SinglePhaseForwardOperator_cpu.direct_cl/adjoint_cl.
+        x = x0
+        y = np.empty(x.shape, dtype=np.float32, order="F")
+        x_old = np.empty(x.shape, dtype=np.float32, order="F")
+        grad = np.empty(x.shape, dtype=np.float32, order="F")
 
-        # TV buffers: allocate once per run, reuse each iter
         if self.prox_kind == "nonneg_tv":
-            self._tv_buffers = {
-                "y":  clarray.empty(q, x.shape, np.float32, order="F"),
-                "gx": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "gy": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "px": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "py": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "div": clarray.zeros(q, x.shape, np.float32, order="F"),
-            }
+            raise NotImplementedError(
+                "prox_kind='nonneg_tv' is not implemented for CPU-resident coeffs."
+            )
 
-        # copy x0 -> y,x_old
+        # copy x0 -> y, x_old
         total_x = np.int32(x.size)
-        self.k_copy_buf(q, (int(total_x),), None, x.data, y.data, total_x)
-        self.k_copy_buf(q, (int(total_x),), None, x.data, x_old.data, total_x)
+        np.copyto(y, x)
+        np.copyto(x_old, x)
 
         Ax = None
         r = None
@@ -343,15 +315,10 @@ class FISTAHuber:
 
             # ---- grad = A*(r) ----
             # NOTE: with weights, this is A*( clip( w*(Ax-b) ) )
-            self.op.adjoint_cl(r, grad)  # (Nx,Ny,K) Fortran
+            self.op.adjoint_cl(r, grad)  # (Nx,Ny,K) Fortran, CPU-resident
 
             # ---- v = y - tau*grad ----
-            self.k_grad_step(
-                q, (int(total_x),), None,
-                y.data, grad.data, x.data,   # update into x (your kernels treat 3rd arg as output)
-                np.float32(self.tau),
-                total_x
-            )
+            np.subtract(y, self.tau * grad, out=x)
 
             # ---- prox: apply in-place on v (x), then extrapolation uses y ----
             self._apply_prox(x)  # MUST modify x in-place and return x (or ignore return)
@@ -360,15 +327,11 @@ class FISTAHuber:
             t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
             beta = (t - 1.0) / t_new
 
-            self.k_extrapolate(
-                q, (int(total_x),), None,
-                x.data, x_old.data, y.data,
-                np.float32(beta),
-                total_x
-            )
+            # ---- y = x + beta * (x - x_old) ----
+            np.add(x, beta * (x - x_old), out=y)
 
             # ---- x_old <- x ----
-            self.k_copy_buf(q, (int(total_x),), None, x.data, x_old.data, total_x)
+            np.copyto(x_old, x)
 
             t = t_new
 
@@ -402,8 +365,8 @@ class FISTAHuber:
                 gval = self.lam * float(clarray.sum(b["div"]).get())
 
             obj = fval + gval
-            xnorm = float(np.sqrt(clarray.vdot(x, x).get()))
-            gnorm = float(np.sqrt(clarray.vdot(grad, grad).get()))
+            xnorm = float(np.linalg.norm(x))
+            gnorm = float(np.linalg.norm(grad))
 
             tv_res = None
             if self.prox_kind == "nonneg_tv":
@@ -450,21 +413,13 @@ class FISTAHuber:
         }
 
         # ---------------- GPU cleanup ----------------
+        # x/y/x_old/grad are plain CPU numpy arrays now, nothing to release.
         q.finish()
-
-        for arr in (y, x_old, grad):
-            if arr is not None:
-                arr.base_data.release()
 
         if Ax is not None:
             Ax.base_data.release()
         if r is not None:
             r.base_data.release()
-
-        if self.prox_kind == "nonneg_tv":
-            for arr in self._tv_buffers.values():
-                arr.base_data.release()
-            del self._tv_buffers
 
         del y, x_old, grad, Ax, r
         import gc
