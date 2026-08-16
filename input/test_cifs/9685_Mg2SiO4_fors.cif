@@ -1,0 +1,77 @@
+
+#(C) 2024 by FIZ Karlsruhe - Leibniz Institute for Information Infrastructure.  All rights reserved.
+data_9685-ICSD
+_database_code_ICSD 9685
+_audit_creation_date 1980-01-01
+_audit_update_record 2024-08-01
+_chemical_name_common 'Magnesium silicate'
+_chemical_formula_structural 'Mg2 Si O4'
+_chemical_formula_sum 'Mg2 O4 Si1'
+_chemical_name_structure_type Mg2SiO4
+_chemical_name_mineral Forsterite
+_exptl_crystal_density_diffrn 3.22
+_diffrn_ambient_temperature 293.
+_citation_title
+
+;
+The Crystal Structures of Forsterite and Hortonolite at several Temperatures
+up to 900C
+;
+loop_
+_citation_id
+_citation_journal_full
+_citation_year
+_citation_journal_volume
+_citation_page_first
+_citation_page_last
+_citation_journal_id_ASTM
+primary 'American Mineralogist' 1973 58 588 593 AMMIAY
+loop_
+_citation_author_citation_id
+_citation_author_name
+primary 'Smyth, J.R.'
+primary 'Hazen, R.M.'
+_cell_length_a 4.756(1)
+_cell_length_b 10.207(1)
+_cell_length_c 5.980(1)
+_cell_angle_alpha 90.
+_cell_angle_beta 90.
+_cell_angle_gamma 90.
+_cell_volume 290.3
+_cell_formula_units_Z 4
+_space_group_name_H-M_alt 'P b n m'
+_space_group_IT_number 62
+loop_
+_space_group_symop_id
+_space_group_symop_operation_xyz
+1 '-x+1/2, y+1/2, z'
+2 'x, y, -z+1/2'
+3 'x+1/2, -y+1/2, z+1/2'
+4 '-x, -y, -z'
+5 'x+1/2, -y+1/2, -z'
+6 '-x, -y, z+1/2'
+7 '-x+1/2, y+1/2, -z+1/2'
+8 'x, y, z'
+loop_
+_atom_type_symbol
+_atom_type_oxidation_number
+Mg2+ 2
+Si4+ 4
+O2- -2
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_symmetry_multiplicity
+_atom_site_Wyckoff_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_B_iso_or_equiv
+_atom_site_occupancy
+Mg1 Mg2+ 4 a 0 0 0 0.26(1) 1.
+Mg2 Mg2+ 4 c 0.9915(2) 0.2774(1) 0.25 0.22(1) 1.
+Si1 Si4+ 4 c 0.4262(1) 0.0940(1) 0.25 0.08(1) 1.
+O1 O2- 4 c 0.7657(3) 0.0913(2) 0.25 0.27(2) 1.
+O2 O2- 4 c 0.2215(4) 0.4474(2) 0.25 0.24(2) 1.
+O3 O2- 8 d 0.2777(2) 0.1628(1) 0.0331(2) 0.27(2) 1.
+#End of TTdata_9685-ICSD

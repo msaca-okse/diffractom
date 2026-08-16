@@ -1,0 +1,26 @@
+Problem with xray diffraction textom pipeline:
+Currently, the memory bottleneck is in storing all of the coefficients.
+Most of them are zero, or rather will be zero in the final reconstruction.
+I suspect we can speed this up considerably by storing this array in sparse format.
+
+The first thing I want to try is to make a block-sparse in the x,y dimensions of this array. The blcks should be 4 by 4.
+Then in batches, the sparse array is converted to a dense array and tomographic projection can be done.
+This should take care of this memory bottleneck and move it elsewhere.
+
+Now there is still some redundancy in this. It may be faster to compute the tomographic projection directly on the sparse
+array without the need for conversion to dense first. In addition, it may even make sense to store the sinogram coefficients in sparse format aswell,
+although this will likely be less sparse, as point in image space become curves in sinogram space.
+
+And then there is the question of the pole figure calculation. The construction and application of the pole figure matrix
+is actually the heaviest computation being made. This is wha takes the most time. This matrix is constructed in every application
+of the forward and adjoint maps. (It could be interesting to time how long the application of the matrix takes versus the construction of it.).
+
+But here's the thing: With small fwhm on the basis functions, the gives mostly zeros. Now constructing this in sparse
+format would save a lot of time on the computation side. But with some smart geomoetry, we may even be able to save time
+on the construction side, if we know in advance what miller indices to skip. 
+
+
+
+
+
+If the data itself has sharp Bragg peaks, it may make more sense to store that in sparse format aswell.

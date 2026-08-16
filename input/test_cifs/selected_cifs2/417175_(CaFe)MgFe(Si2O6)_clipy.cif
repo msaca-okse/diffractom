@@ -1,0 +1,110 @@
+
+##########################################################################
+#               Crystallographic Information Format file
+#               Produced by PyCifRW module
+#
+#  This is a CIF file.  CIF has been adopted by the International
+#  Union of Crystallography as the standard for data archiving and
+#  transmission.
+#
+#  For information on this file format, follow the CIF links at
+#  http://www.iucr.org
+##########################################################################
+
+data_417175-ICSD
+
+_database_code_ICSD                     417175
+_audit_creation_date                    2008-08-01
+_audit_update_record                    2013-02-01
+_chemical_name_common 
+                                        'Calcium iron magnesium catena-disilicate (0.87/0.14/0.79/1)'
+_chemical_formula_structural            '(Ca0.87 Fe0.13) Mg0.79 Fe0.007 (Si2 O6)'
+_chemical_formula_sum                   'Ca0.87 Fe0.137 Mg0.79 O6 Si2'
+_chemical_name_structure_type           Pyroxene#Diopside#CaMg(SiO3)2
+_chemical_name_mineral                  Augite
+_exptl_crystal_density_diffrn           3.23
+_diffrn_ambient_temperature             293.
+_citation_title                         
+;
+Crystal chemistry of clinopyroxenes from oligo-miocene volcanics of Montresta
+(Sardinia, Italy)
+;
+loop_
+  _citation_id
+  _citation_journal_full
+  _citation_year
+  _citation_journal_volume
+  _citation_page_first
+  _citation_page_last
+  _citation_journal_id_ASTM
+         primary   'Mineralogy and Petrology'    2007      90        157       166      MIPEE9
+loop_
+  _citation_author_citation_id
+  _citation_author_name
+         primary   'Lenaz, D.'         
+         primary   'Princivalle, F.' 
+_cell_length_a                          9.7472(9)
+_cell_length_b                          8.9088(7)
+_cell_length_c                          5.2670(10)
+_cell_angle_alpha                       90.
+_cell_angle_beta                        106.165(14)
+_cell_angle_gamma                       90.
+_cell_volume                            439.28
+_cell_formula_units_Z                   4
+_space_group_name_H-M_alt               'C 1 2/c 1'
+_space_group_IT_number                  15
+loop_
+  _space_group_symop_id
+  _space_group_symop_operation_xyz
+         1         'x, -y, z+1/2'      
+         2         '-x, -y, -z'        
+         3         '-x, y, -z+1/2'     
+         4         'x, y, z'           
+         5         'x+1/2, -y+1/2, z+1/2'        
+         6         '-x+1/2, -y+1/2, -z'          
+         7         '-x+1/2, y+1/2, -z+1/2'       
+         8         'x+1/2, y+1/2, z' 
+loop_
+  _atom_type_symbol
+  _atom_type_oxidation_number
+         Si4+      4         
+         O2-       -2        
+         Mg2+      2         
+         Ca2+      2         
+         Fe3+      3 
+loop_
+  _atom_site_label
+  _atom_site_type_symbol
+  _atom_site_symmetry_multiplicity
+  _atom_site_Wyckoff_symbol
+  _atom_site_fract_x
+  _atom_site_fract_y
+  _atom_site_fract_z
+  _atom_site_U_iso_or_equiv
+  _atom_site_occupancy
+         Si1       Si        8         f         0.28795(17)         0.09270(17)        0.2316(3)          0.0032(5)          1        
+         O1        O         8         f         0.1155(5)           0.0875(5)           0.1416(8)          0.0045(9)          1        
+         O2        O         8         f         0.3629(5)           0.2508(5)           0.3230(9)          0.0065(9)          1        
+         O3        O         8         f         0.3514(4)           0.0193(5)           -0.0038(8)         0.0058(9)          1        
+         Mg1       Mg        4         e         0.        0.9067(3)           0.25     0.0029(9)          0.79(2)  
+         Ca1       Ca        4         e         0.        0.2983(2)           0.25     0.0098(6)          0.867(12)          
+         Fe1       Fe        4         e         0.        0.2983(2)           0.25     0.0098(6)          0.133(12)          
+         Fe2       Fe        4         e         0.        0.1897    0.25      0.0098(6)          0.007(4)
+loop_
+  _atom_site_aniso_label
+  _atom_site_aniso_type_symbol
+  _atom_site_aniso_U_11
+  _atom_site_aniso_U_22
+  _atom_site_aniso_U_33
+  _atom_site_aniso_U_12
+  _atom_site_aniso_U_13
+  _atom_site_aniso_U_23
+         Si1       Si4+      0.0040(8)           0.0050(8)           0.0010(8)           -0.0002(5)         -0.0006(5)         -0.0006(5)         
+         O1        O2-       0.0042(18)          0.0090(19)          0.0010(18)         0.0003(13)         0.0002(14)         -0.0008(14)        
+         O2        O2-       0.0110(19)          0.009(2)  0.0010(17)          -0.0031(15)        0.0030(15)         -0.0018(15)        
+         O3        O2-       0.0053(18)          0.011(2)  0.0010(18)          -0.0005(14)        -0.0012(14)        -0.0023(15)        
+         Mg1       Mg2+      0.0030(13)          0.0045(13)          0.0010(13)         0.       -0.0016(9)         0.       
+         Ca1       Ca2+      0.0094(9)           0.0176(10)          0.0010(8)           0.       -0.0026(6)         0.       
+         Fe1       Fe3+      0.0094(9)           0.0176(10)          0.0010(8)           0.       -0.0026(6)         0.       
+         Fe2       Fe3+      0.0094(9)           0.0176(10)          0.0010(8)           0.       -0.0026(6)         0.
+_symmetry_space_group_name_H-M          'C 1 2/c 1'

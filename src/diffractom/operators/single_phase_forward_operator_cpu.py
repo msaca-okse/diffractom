@@ -1,0 +1,921 @@
+from __future__ import annotations
+import numpy as np
+import time
+import gc
+from typing import Any, Mapping
+import pyopencl as cl
+import pyopencl.array as clarray
+import gratopy
+from pyclblast import gemmStridedBatched
+from ..utils.grid import Grid
+from ..crystallography.material import Material
+from scipy.spatial.transform import Rotation as R
+from .create_pfo_matrix import build_pf_program
+from .pf_kernels import build_all_opencl
+
+
+class SinglePhaseForwardOperator_cpu:
+    """Single-material pole-figure forward operator on GPU/CPU.
+
+    Computes  data = PF @ Radon(coeffs)  and its adjoint, where PF is the
+    pole-figure transform and Radon is the parallel-beam projection.
+    All heavy computation runs on OpenCL.
+    """
+
+    def __init__(
+        self,
+        cfg: Mapping[str, Any],
+        material: Material,
+        grid: Grid,
+        max_gb: float,
+        verbose: bool = False,
+        normalized: bool = False,
+        ctx: cl.Context | None = None,
+        queue: cl.CommandQueue | None = None,
+        **kwargs,
+    ):
+        """Initialise the single-material forward operator.
+
+        Parameters
+        ----------
+        cfg : dict
+            Experiment configuration (keys: Nx, Ny, My, N_Omega, N_eta, angle_range,
+            wavelength, detector_direction_origin, etc.).
+        material : Material
+            Crystallographic material with reflections and symmetry.
+        grid : Grid
+            Orientation discretisation tree.
+        max_gb : float
+            GPU memory budget (GB) for K-batching.
+        verbose : bool
+            Print buffer allocation summary.
+        normalized : bool
+            If True, skip intensity scaling of the PF matrix.
+        ctx, queue : optional
+            Existing OpenCL context/queue; created automatically if None.
+        **kwargs
+            Override any cfg key (e.g. ``N_Omega=50``).
+        """
+
+        # --- context / queue ---
+        if ctx is not None and queue is not None:
+            self.ctx = ctx
+            self.queue = queue
+        else:
+            self.ctx = cl.create_some_context(interactive=False)
+            self.queue = cl.CommandQueue(self.ctx)
+
+        
+        # Keyword arguments override cfg values (e.g. N_Omega=50 overrides cfg['N_Omega'])
+        self.cfg = {**cfg, **kwargs}
+        self.normalized = normalized
+        self.material = material
+        self.grid = grid
+        self.verbose = verbose
+        self.N_eta = self.cfg['N_eta']
+        self.N_peaks = len(self.material.reflections)
+        self.N_seg = self.N_peaks * self.N_eta
+        self.Nx = self.cfg['Nx']
+        self.Ny = self.cfg['Ny']
+        self.My = self.cfg['My']
+        self.N_Omega = self.cfg['N_Omega']
+        self.cor_offset = self.cfg['cor_offset']
+        self.N_Omega_subdivisions = self.cfg.get('N_Omega_subdivisions', 1)
+        self.angle_range = np.array(self.cfg['angle_range'])/180*np.pi
+        delta = (self.angle_range[1] - self.angle_range[0]) / self.N_Omega
+        sub_delta = delta / self.N_Omega_subdivisions
+        # Coarse angles centered in their intervals (for gratopy projection)
+        self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega, endpoint=False) + delta / 2
+        # Fine angles centered in sub-intervals (for PF coordinate generation)
+        self.angles_subdivided = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega * self.N_Omega_subdivisions, endpoint=False) + sub_delta / 2
+
+        # --- eta subdivisions ---
+        self.N_eta_subdivisions = self.cfg.get('N_eta_subdivisions', 1)
+        self.eta_angle_range = np.array(self.cfg.get('eta_angle_range', [0, 360])) / 180 * np.pi
+        eta_delta = (self.eta_angle_range[1] - self.eta_angle_range[0]) / self.N_eta
+        eta_sub_delta = eta_delta / self.N_eta_subdivisions
+        # Coarse eta bin centres
+        self.eta_angles = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta, endpoint=False) + eta_delta / 2
+        # Fine eta sub-bin centres
+        self.eta_angles_subdivided = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta * self.N_eta_subdivisions, endpoint=False) + eta_sub_delta / 2
+
+        self.pf_batch_max_gb = float(max_gb)
+
+
+        # --- build kernels ---
+        self.prg, self.k, self.pf_prg = build_all_opencl(self.ctx, ts=16)
+        self.pf_prg = build_pf_program(self.ctx)
+        self.pfmatrix_eval_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval")
+
+
+        self.transfer_material_parameters_to_gpu()
+        self.detector_coordinates()
+        self.transfer_grid_parameters_to_gpu()
+        self.get_pf_batches_for_material()  # list of dicts
+
+
+
+        #        --- 2) Create ProjectionSettings using THIS queue ---
+        self.PS = gratopy.ProjectionSettings(
+            self.queue,
+            gratopy.PARALLEL,
+            (self.Nx, self.Ny, self.K_batch_max),
+            self.angles,
+            n_detectors=self.My,
+            image_width=self.Nx,
+            detector_width=self.My,
+            detector_shift=self.cor_offset,
+        )
+        assert self.queue.context.int_ptr == self.ctx.int_ptr
+
+
+        # Allocate buffers
+        self.allocate_coefficient_buffer()
+
+
+    def detector_coordinates(self):
+        """Compute probed unit-sphere coordinates for all (omega, eta, peak) combinations.
+
+        Coords shape: (N_Omega, N_Omega_subdivisions, N_eta, N_eta_subdivisions, N_peaks, 3)
+        """
+        wavelength_angstrom = 12.398 / self.cfg["wavelength"]
+        self.two_theta_peaks = 2.0 * np.arcsin(
+            np.linalg.norm(self.h_cpu, axis=1) / (4.0 * np.pi) * wavelength_angstrom
+        ).astype(np.float32)
+
+        S_eta = self.N_eta_subdivisions
+
+        # Eta sub-bin centres: (N_eta, S_eta)
+        eta_angles_2d = self.eta_angles_subdivided.reshape(self.N_eta, S_eta)
+
+        det_dir_origin = np.array(self.cfg["detector_direction_origin"])
+        det_dir_pos90 = np.array(self.cfg["detector_direction_positive_90"])
+        p_direction_0 = np.array(self.cfg['p_direction_0'])
+        k0 = np.asarray(self.cfg["k_direction_0"])
+
+        N_fine_omega = self.N_Omega * self.N_Omega_subdivisions
+        Rmats = R.from_rotvec(self.angles_subdivided[:, None] * k0).as_matrix()
+
+        coords_list = []
+        for tt in self.two_theta_peaks:
+            twothetahalf = tt / 2.0
+
+            # Zero-rotation-frame directions: (N_eta, S_eta, 3)
+            dirs_zero = (
+                np.cos(eta_angles_2d)[..., np.newaxis] * det_dir_origin[np.newaxis, np.newaxis, :]
+                + np.sin(eta_angles_2d)[..., np.newaxis] * det_dir_pos90[np.newaxis, np.newaxis, :]
+            )
+
+            # Apply 2theta tilt
+            dirs_zero = dirs_zero * np.cos(twothetahalf) - np.sin(twothetahalf) * p_direction_0
+
+            # Rotate by all omega angles: (N_fine_omega, N_eta, S_eta, 3)
+            probed = np.einsum('oij,esi->oesj', Rmats, dirs_zero)
+
+            # Reshape: (N_Omega, N_Omega_sub, N_eta, S_eta, 3)
+            coords = probed.reshape(self.N_Omega, self.N_Omega_subdivisions, self.N_eta, S_eta, 3)
+            coords_list.append(coords)
+
+        # Stack over peaks → (N_Omega, N_Omega_sub, N_eta, S_eta, N_peaks, 3)
+        coords_cpu = np.stack(coords_list, axis=-2)
+        self.coords_cpu = np.asarray(coords_cpu, dtype=np.float32, order="C")
+        self.coords_gpu = clarray.to_device(self.queue, self.coords_cpu)
+
+
+
+
+    def transfer_material_parameters_to_gpu(self):
+        """Upload reciprocal-lattice vectors, intensities and symmetry ops to GPU."""
+        self.h_cpu_normed = np.asarray(self.material.h_vecs_normed, dtype=np.float32, order="C")
+        self.h_cpu = np.asarray(self.material.h_vecs, dtype=np.float32, order="C")
+        self.h_gpu_normed = clarray.to_device(self.queue, self.h_cpu_normed)
+
+        self.intens_cpu = np.asarray(self.material.intensities(), dtype=np.float32, order="C")
+        self.intens_gpu = clarray.to_device(self.queue, self.intens_cpu)
+
+        self.sym_ops_cpu = np.asarray(self.material.point_group_matrices, dtype=np.float32, order="C")
+        self.sym_ops_gpu = clarray.to_device(self.queue, self.sym_ops_cpu)
+
+
+
+    def transfer_grid_parameters_to_gpu(self):
+        """
+        Transfer active orientation grid parameters (rotations + sigmas)
+        from Grid objects to GPU.
+        """
+
+            # --- extract active leaf nodes ---
+        active_indices = self.grid.active_leaf_nodes()
+        nodes = [self.grid.nodes[i] for i in active_indices]
+        self.K = len(nodes)
+
+            # --- inverse rotations ---
+        self.grid_inv_cpu = np.stack(
+            [n.R.inv().as_matrix().reshape(-1) for n in nodes],
+            axis=0
+            ).astype(np.float32)
+
+        self.grid_inv_gpu = clarray.to_device(self.queue, self.grid_inv_cpu)
+
+            # --- sigma per node ---
+        self.sigma_cpu = np.array(
+            [node.sigma for node in nodes],
+            dtype=np.float32
+            )
+
+
+
+    def allocate_coefficient_buffer(self):
+        """Pre-allocate reusable GPU buffers for forward/adjoint computation."""
+        buffers = []
+
+        def _alloc(name, shape, dtype, order):
+            arr = clarray.empty(self.queue, shape, dtype=dtype, order=order)
+            buffers.append((name, arr))
+            return arr
+
+        self.coeffs_sino_F = _alloc(
+            "coeffs_sino_F",
+            (self.PS.n_detectors, self.PS.n_angles, self.K_batch_max),
+            np.float32,
+            "F",
+        )
+
+        self.coeffs_sino_C = _alloc(
+            "coeffs_sino_C",
+            (self.N_Omega, self.My, self.K_batch_max),
+            np.float32,
+            "C",
+        )
+
+        self._coeffs_batch_F = _alloc(
+            "_coeffs_batch_F",
+            (self.Nx, self.Ny, self.K_batch_max),
+            np.float32,
+            "F",
+        )
+
+        self._basis_batch_kmax = _alloc(
+            "_basis_batch_kmax",
+            (self.N_Omega, self.K_batch_max, self.N_eta, self.N_peaks),
+            np.float32,
+            "C",
+        )
+
+        self._basis_batch_transpose_kmax = _alloc(
+            "_basis_batch_transpose_kmax",
+            (self.N_Omega, self.N_peaks * self.N_eta, self.K_batch_max),
+            np.float32,
+            "C",
+        )
+
+        self._grid_inv_kmax = _alloc(
+            "_grid_inv_kmax",
+            (self.K_batch_max, 9),
+            np.float32,
+            "C",
+        )
+
+        self._inv_sigma2_kmax = _alloc(
+            "_inv_sigma2_kmax",
+            (self.K_batch_max,),
+            np.float32,
+            "C",
+        )
+
+        self._norm_factor_kmax = _alloc(
+            "_norm_factor_kmax",
+            (self.K_batch_max,),
+            np.float32,
+            "C",
+        )
+
+        # --------------------------------------------------
+        # Verbose memory breakdown
+        # --------------------------------------------------
+        if self.verbose:
+            print("\n=== OpenCL buffer allocation summary ===")
+
+            total_bytes = 0
+
+            for name, arr in buffers:
+                nbytes = arr.size * arr.dtype.itemsize
+                total_bytes += nbytes
+
+                shape_str = "x".join(str(s) for s in arr.shape)
+                size_mb = nbytes / 1024**2
+
+                print(f"{name:30s}: shape=({shape_str}), {size_mb:8.2f} MB")
+
+            print("---------------------------------------")
+            print(f"TOTAL GPU buffer memory: {total_bytes/1024**2:8.2f} MB")
+            print("=======================================\n")
+            self.total_bytes = total_bytes
+
+
+
+    def free_memory(self):
+        """
+        Release OpenCL buffers created by allocate_coefficient_buffer() and
+        remove the corresponding attributes from this object.
+        """
+        buffer_names = [
+            "coeffs_sino_F",
+            "coeffs_sino_C",
+            "_coeffs_batch_F",
+            "_basis_batch_kmax",
+            "_basis_batch_transpose_kmax",
+            "_grid_inv_kmax",
+            "_inv_sigma2_kmax",
+            "_norm_factor_kmax",
+        ]
+
+        # Release buffers if they exist
+        for name in buffer_names:
+            arr = getattr(self, name, None)
+            if arr is None:
+                continue
+
+            # pyopencl.array.Array holds the underlying cl.Buffer in .base_data
+            try:
+                base = getattr(arr, "base_data", None)
+                if base is not None:
+                    base.release()
+            except Exception:
+                pass
+
+            # Remove attribute so refcount drops
+            try:
+                delattr(self, name)
+            except Exception:
+                pass
+
+        # If you stored a total_bytes summary, clear it too
+        if hasattr(self, "total_bytes"):
+            try:
+                delattr(self, "total_bytes")
+            except Exception:
+                pass
+
+        # Make sure queued commands are done (finish before/after is fine)
+        try:
+            if hasattr(self, "queue") and self.queue is not None:
+                self.queue.finish()
+        except Exception:
+            pass
+
+        gc.collect()
+
+        if getattr(self, "verbose", False):
+            print("OpenCL GPU memory freed.")
+
+
+
+
+
+    def get_pf_batches_for_material(self):
+        """
+        Compute K-batching for PF-matrix generation for ONE material.
+
+        Returns
+        -------
+        batches : list of dict
+            Each dict contains:
+                - k_start
+                - k_end
+                - K_batch
+        """
+        
+        # ---- dimensions ----
+        R = self.N_Omega
+        C = self.N_eta
+        T = self.N_peaks   # masked theta count
+        K = self.K
+
+        bytes_per_float = 4
+
+        # Memory per K after convolution:
+        # (R, C, T) per K
+        bytes_per_K = R * C * T * bytes_per_float
+
+        max_bytes = self.pf_batch_max_gb * (1024 ** 3)
+
+        # At least one K per batch
+        if bytes_per_K >0.01:
+            K_batch_max = max(int(max_bytes // bytes_per_K), 1)
+             # Safety: never exceed available K
+            K_batch_max = min(K_batch_max, K)
+        else:
+            K_batch_max = 1
+
+
+
+        batches = []
+
+        k0 = 0
+        while k0 < K:
+            k1 = min(k0 + K_batch_max, K)
+            batches.append({
+                "k_start": k0,
+                "k_end": k1,
+                "K_batch": k1 - k0,
+            })
+            k0 = k1
+
+        self.batches = batches
+        self.K_batch_max = max(b["K_batch"] for b in self.batches)
+    
+
+
+    def direct(self, coeffs):
+        """
+        Allocating convenience wrapper for the OpenCL forward operator.
+
+        Returns
+        -------
+        yin_gpu : clarray
+            Shape (N_Omega, My, N_seg), C order
+        """
+
+        data = clarray.zeros(
+            self.queue,
+            (self.N_Omega, self.My, self.N_seg),
+            dtype=np.float32,
+            order="C",
+        )
+
+        self.direct_cl(coeffs, data)
+        return data
+
+
+
+    def direct_cl(self, coeffs, data):
+        """In-place forward operator: data += PF @ Radon(coeffs).
+
+        Parameters
+        ----------
+        coeffs : numpy.ndarray, (Nx, Ny, K), float32, F-order, on CPU (host).
+            Only the slice needed for the current K-batch is transferred to
+            the GPU at a time, to test the effect of not keeping the full
+            coefficient array resident on the GPU.
+        data : clarray, (N_Omega, My, N_seg), C-order — accumulated into.
+        """
+        data.fill(0.0)
+
+        assert isinstance(coeffs, np.ndarray)
+        assert coeffs.shape == (self.Nx, self.Ny, self.K)
+        assert coeffs.dtype == np.float32
+        assert coeffs.flags.f_contiguous
+
+        R  = int(self.N_Omega)
+        C = int(self.N_eta)
+        P = int(self.N_peaks)
+        G = int(len(self.sym_ops_cpu))
+        Kmax = self.K_batch_max
+        Nx = self.Nx
+        Ny = self.Ny
+        My = self.My
+        N_Omega = self.N_Omega
+        coords_gpu   = self.coords_gpu
+        sym_ops_gpu  = self.sym_ops_gpu
+        h_gpu_normed        = self.h_gpu_normed
+        intensity_gpu = self.intens_gpu
+
+        for b in self.batches:
+            k0 = b["k_start"]
+            k1 = b["k_end"]
+            Kb = b["K_batch"]
+
+            self._coeffs_batch_F.fill(0.0)
+            self.coeffs_sino_C.fill(0.0)
+            self.coeffs_sino_F.fill(0.0)
+
+
+            # -------------------------------------------------
+            # 1) Host -> device transfer of this K-batch's coeffs
+            # (F-order slicing along the last axis is contiguous, so
+            # this is a single contiguous host->device copy)
+            # -------------------------------------------------
+            cl.enqueue_copy(
+                self.queue,
+                self._coeffs_batch_F.data,
+                coeffs[:, :, k0:k1],
+                device_offset=0,
+            )
+
+            # -------------------------------------------------
+            # 2) Tomographic projection (batched in K)
+            # -------------------------------------------------
+
+            gratopy.forwardprojection(
+                self._coeffs_batch_F,
+                self.PS,
+                sino=self.coeffs_sino_F,
+            )
+
+            # -------------------------------------------------
+            # 3) Transpose sino F → C (only Kb)
+            # -------------------------------------------------
+
+            total = N_Omega * My * Kmax
+            self.k.transpose_d_omega_k_f_to_c(
+                self.queue,
+                (total,),
+                None,
+                self.coeffs_sino_F.data,
+                self.coeffs_sino_C.data,
+                np.int32(My),
+                np.int32(N_Omega),
+                np.int32(Kmax),
+                np.int32(total),
+            )
+
+            # -------------------------------------------------
+            # 4) PF + GEMM for this batch
+            # -------------------------------------------------
+
+
+            self._norm_factor_kmax.fill(0.0) # make sure that this is set to zero!
+            self._inv_sigma2_kmax.fill(0.0)
+            sigma = np.asarray(self.sigma_cpu[k0:k1], dtype=np.float32)
+            inv_sigma2_cpu = (1.0 / (sigma * sigma)).astype(np.float32)
+            norm_factor_cpu = (1.0 / (8.0 * np.pi * sigma * sigma)).astype(np.float32)
+            cl.enqueue_copy(self.queue, self._inv_sigma2_kmax.data, inv_sigma2_cpu, device_offset=0)
+            cl.enqueue_copy(self.queue, self._norm_factor_kmax.data, norm_factor_cpu, device_offset=0)
+
+            total = Kb * 9
+            self.k.SLICE_GRIDINV_K_BATCH(
+                self.queue,
+                (total,),
+                None,
+                self.grid_inv_gpu.data,      # input: (K_total, 9)
+                self._grid_inv_kmax.data,    # output: (K_batch_max, 9)
+                np.int32(self.K),            # K_IN  (total grid size)
+                np.int32(Kb),                # K_OUT (this batch size)
+                np.int32(k0),                # K_START
+            )
+
+            total = R * Kmax * C * P
+            self.pfmatrix_eval_kernel(
+                self.queue,
+                (total,),
+                None,
+                coords_gpu.data,
+                self._grid_inv_kmax.data,
+                sym_ops_gpu.data,
+                h_gpu_normed.data,
+                self._inv_sigma2_kmax.data,
+                self._norm_factor_kmax.data,
+                self._basis_batch_kmax.data,
+                np.int32(R),
+                np.int32(Kmax),
+                np.int32(C),
+                np.int32(P),
+                np.int32(G),
+                np.int32(self.N_Omega_subdivisions),
+                np.int32(self.N_eta_subdivisions),
+            )
+            if not self.normalized:
+                self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, intensity_gpu)
+
+            # OBS: batched_gemm_clblast overwrites _data_batch, but we need to accumulate. Hence this trick
+            batched_gemm_clblast(self.queue, self.coeffs_sino_C, self._basis_batch_kmax.reshape((R, Kmax, C*P)), data, R=R, M=My, K=Kmax, N=P*C)
+
+
+
+    def adjoint(self, data):
+        """
+        Allocating convenience wrapper for the OpenCL adjoint.
+
+        Parameters
+        ----------
+        y_gpu : clarray
+            Shape (N_Omega, My, N_seg), C-order
+
+        Returns
+        -------
+        coeffs : numpy.ndarray
+            Shape (Nx, Ny, K_sum), float32, Fortran-order, on CPU (host).
+        """
+
+        coeffs = np.zeros(
+            (self.Nx, self.Ny, self.K),
+            dtype=np.float32,
+            order="F",
+        )
+
+        self.adjoint_cl(data, coeffs)
+        return coeffs
+
+
+
+    def adjoint_cl(self, data, coeffs):
+        """
+        In-place OpenCL adjoint operator.
+
+        Parameters
+        ----------
+        data : clarray
+            Shape (N_Omega, My, N_seg), C-order
+        coeffs : numpy.ndarray, (Nx, Ny, K_sum), float32, Fortran-order, on CPU (host).
+            Will be overwritten. Only the slice for the current K-batch is
+            transferred from the GPU at a time, to test the effect of not
+            keeping the full coefficient array resident on the GPU.
+        """
+
+        # ---------------- checks ----------------
+        assert data.shape == (self.N_Omega, self.My, self.N_seg)
+        assert data.flags.c_contiguous
+
+        assert isinstance(coeffs, np.ndarray)
+        assert coeffs.shape == (self.Nx, self.Ny, self.K)
+        assert coeffs.dtype == np.float32
+        assert coeffs.flags.f_contiguous
+
+        # ---------------- zero output ----------------
+        coeffs.fill(0.0)
+
+        Kmax = self.K_batch_max
+        R  = self.N_Omega
+        C = int(self.N_eta)
+        P = int(self.N_peaks)
+        G = int(len(self.sym_ops_cpu))
+        Nx = self.Nx
+        Ny = self.Ny
+        My = self.My
+        coords_gpu   = self.coords_gpu
+        sym_ops_gpu  = self.sym_ops_gpu
+        h_gpu_normed        = self.h_gpu_normed
+        intensity_gpu = self.intens_gpu
+
+        for b in self.batches:
+            k0 = b["k_start"]
+            k1 = b["k_end"]
+            Kb = b["K_batch"]
+
+            self._coeffs_batch_F.fill(0.0)
+            self.coeffs_sino_C.fill(0.0)
+            self.coeffs_sino_F.fill(0.0)
+
+
+            # Create pf matrix batch
+            self._norm_factor_kmax.fill(0.0) # make sure that this is set to zero!
+            self._inv_sigma2_kmax.fill(0.0)
+            sigma = np.asarray(self.sigma_cpu[k0:k1], dtype=np.float32)
+            inv_sigma2_cpu = (1.0 / (sigma * sigma)).astype(np.float32)
+            norm_factor_cpu = (1.0 / (8.0 * np.pi * sigma * sigma)).astype(np.float32)
+            # Input the norm factors to a zero array, so the norm factor for the extra rows in the last batch are zero
+            cl.enqueue_copy(self.queue, self._inv_sigma2_kmax.data, inv_sigma2_cpu, device_offset=0)
+            cl.enqueue_copy(self.queue, self._norm_factor_kmax.data, norm_factor_cpu, device_offset=0)
+
+            total = Kb*9
+            self.k.SLICE_GRIDINV_K_BATCH(
+                self.queue,
+                (total,),
+                None,
+                self.grid_inv_gpu.data,      # input: (K_total, 9)
+                self._grid_inv_kmax.data,    # output: (K_batch_max, 9)
+                np.int32(self.K),            # K_IN  (total grid size)
+                np.int32(Kb),                # K_OUT (this batch size)
+                np.int32(k0),                # K_START
+            )
+
+
+            total = R*Kmax*C*P
+            self.pfmatrix_eval_kernel(
+                self.queue,
+                (total,),
+                None,
+                coords_gpu.data,
+                self._grid_inv_kmax.data,
+                sym_ops_gpu.data,
+                h_gpu_normed.data,
+                self._inv_sigma2_kmax.data,
+                self._norm_factor_kmax.data,
+                self._basis_batch_kmax.data,
+                np.int32(R),
+                np.int32(Kmax),
+                np.int32(C),
+                np.int32(P),
+                np.int32(G),
+                np.int32(self.N_Omega_subdivisions),
+                np.int32(self.N_eta_subdivisions),
+            )
+            if not self.normalized:
+                self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, intensity_gpu)
+
+            # Transpose the pf matrix
+            total = R*Kmax*C*P
+            self.k.btranspose_kernel(
+                self.queue,
+                (total,),
+                None,
+                self._basis_batch_kmax.data,
+                self._basis_batch_transpose_kmax.data,
+                np.int32(R),
+                np.int32(Kmax),
+                np.int32(C*P),
+                np.int32(total),
+            )
+
+            # batched gemm overwrites self.coeffs_sino_C
+            batched_gemm_adj_clblast(self.queue, data, self._basis_batch_transpose_kmax, self.coeffs_sino_C, R, My, P*C, Kmax, R/np.pi)
+            # Now transpose, backproject and depose the coefficients in the "coeffs" array
+
+            # Transpose
+            total = R*My*Kmax
+            self.k.transpose_omega_d_k_c_to_d_omega_k_f(
+                self.queue,
+                (total,),
+                None,
+                self.coeffs_sino_C.data,
+                self.coeffs_sino_F.data,
+                np.int32(R),
+                np.int32(My),
+                np.int32(Kmax),
+                np.int32(total),
+            )
+
+            # Backproject
+            gratopy.backprojection(
+                self.coeffs_sino_F,
+                self.PS,
+                img=self._coeffs_batch_F,
+            )
+
+            # -------------------------------------------------
+            # Device -> host transfer of this K-batch's result into
+            # the CPU-resident coeffs array (F-order slice along the
+            # last axis is contiguous, so this is a single contiguous
+            # device->host copy of only the first Kb "pages").
+            # -------------------------------------------------
+            cl.enqueue_copy(
+                self.queue,
+                coeffs[:, :, k0:k1],
+                self._coeffs_batch_F.data,
+            )
+
+
+
+    def _scale_pf_by_intensity_inplace(self, PF_GPU: clarray.Array, INTENSITY_GPU: clarray.Array) -> None:
+        """Element-wise multiply PF_GPU (R, Kb, C, P) by intensity per peak P."""
+        R = int(PF_GPU.shape[0])
+        Kb = int(PF_GPU.shape[1])
+        C = int(PF_GPU.shape[2])
+        P = int(PF_GPU.shape[3])
+
+        assert INTENSITY_GPU.dtype == np.float32
+        assert int(INTENSITY_GPU.size) == P
+
+        total = R * Kb * C * P
+        self.k.SCALE_PF_BY_INTENSITY_INPLACE(
+            self.queue,
+            (total,),
+            None,
+            PF_GPU.data,
+            INTENSITY_GPU.data,
+            np.int32(R),
+            np.int32(Kb),
+            np.int32(C),
+            np.int32(P),
+        )
+
+
+
+
+
+def batched_gemm_clblast(queue, A3, B3, C3, R, M, K, N):
+    """Batched GEMM via CLBlast: C += A @ B, per-batch (beta=1 accumulate)."""
+
+    # reshape views (NO COPY)
+    A = A3.reshape((R*M, K))
+    B = B3.reshape((R*K, N))
+    C = C3.reshape((R*M, N))
+
+    # leading dimensions (row-major)
+    a_ld = K
+    b_ld = N
+    c_ld = N
+
+    # strides between batches (in elements)
+    a_stride = M * K
+    b_stride = K * N
+    c_stride = M * N
+
+    gemmStridedBatched(
+        queue,
+        M, N, K,
+        R,              # batch_count
+        A, B, C,        # MUST be 2D
+        a_ld, b_ld, c_ld,
+        a_stride, b_stride, c_stride,
+        alpha=1.0,
+        beta=1.0,
+    )
+
+
+
+
+def batched_gemm_adj_clblast(queue, Y3, BT3, X3, R, Mx, Nsub, K, alpha):
+    """Batched adjoint GEMM: X = alpha * Y @ BT, per-batch (beta=0 overwrite)."""
+
+    # 2D views (NO COPY)
+    A = Y3.reshape((R * Mx, Nsub))   # (R*Mx, Nsub)
+    B = BT3.reshape((R * Nsub, K))   # (R*Nsub, K)
+    C = X3.reshape((R * Mx, K))      # (R*Mx, K)
+
+    # leading dimensions (row-major)
+    a_ld = Nsub
+    b_ld = K
+    c_ld = K
+
+    # batch strides (in elements)
+    a_stride = Mx * Nsub
+    b_stride = Nsub * K
+    c_stride = Mx * K
+
+    gemmStridedBatched(
+        queue,
+        Mx, K, Nsub,     # m, n, k
+        R,               # batch_count
+        A, B, C,
+        a_ld, b_ld, c_ld,
+        a_stride, b_stride, c_stride,
+        alpha=alpha,
+        beta=0.0,
+        a_transp=False,
+        b_transp=False,  # <<< now no ambiguity
+    )
+
+
+
+def gpu_norm(x):
+    """Compute L2 norm of a GPU array."""
+    return float(clarray.sum(x*x).get() ** 0.5)
+
+
+def estimate_L_power(
+    op,
+    niter: int = 20,
+    seed: int = 0,
+    eps: float = 1e-30,
+    verbose: int = 1,
+) -> float:
+    """Estimate the Lipschitz constant L = ||A^T A|| via power iteration."""
+    if niter < 1:
+        raise ValueError("niter must be >= 1")
+
+    q = op.queue
+    rng = np.random.default_rng(seed)
+
+    # x in domain, Fortran
+    x = clarray.empty(q, (op.Nx, op.Ny, op.K), np.float32, order="F")
+    # y in range, C
+    Ax = clarray.empty(q, (op.N_Omega, op.My, op.N_seg), np.float32, order="C")
+    # z = A^*Ax in domain
+    z = clarray.empty(q, x.shape, np.float32, order="F")
+
+    # init x random
+    x_host = rng.standard_normal(x.shape).astype(np.float32, copy=False, order="F")
+    assert x.data is not None
+    cl.enqueue_copy(q, x.data, x_host)
+    q.finish()
+
+    # normalize x
+    xnorm = float(np.sqrt(clarray.vdot(x, x).get()) + eps)
+    x *= np.float32(1.0 / xnorm)
+    q.finish()
+
+    L_est: float = 0.0
+    for it in range(niter):
+        # Ax = A x
+        op.direct_cl(x, Ax)
+        # z = A^* Ax
+        op.adjoint_cl(Ax, z)
+        q.finish()
+
+        num = float(clarray.vdot(x, z).get())
+        den = float(clarray.vdot(x, x).get()) + eps
+        L_est = num / den
+
+        znorm = float(np.sqrt(clarray.vdot(z, z).get()) + eps)
+        x[:] = z * np.float32(1.0 / znorm)
+        q.finish()
+
+        if verbose:
+            print(f"[power {it+1:02d}] L_est={L_est:.6e}  ||z||={znorm:.6e}")
+
+    # ---------- GPU cleanup ----------
+    if x.base_data is not None:
+        x.base_data.release()
+    if Ax.base_data is not None:
+        Ax.base_data.release()
+    if z.base_data is not None:
+        z.base_data.release()
+
+    del x, Ax, z, x_host
+    gc.collect()
+    q.finish()
+    # --------------------------------
+
+    return float(L_est)

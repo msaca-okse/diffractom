@@ -1,0 +1,91 @@
+
+#(C) 2024 by FIZ Karlsruhe - Leibniz Institute for Information Infrastructure.  All rights reserved.
+data_9582-ICSD
+_database_code_ICSD 9582
+_audit_creation_date 1980-01-01
+_audit_update_record 1984-05-15
+_chemical_name_common 'Zirconium silicate'
+_chemical_formula_structural 'Zr Si O4'
+_chemical_formula_sum 'O4 Si1 Zr1'
+_chemical_name_structure_type Zircon#ZrSiO4
+_chemical_name_mineral Zircon
+_exptl_crystal_density_diffrn 4.65
+_citation_title 'Refinement of the Crystal Structure of Zircon'
+loop_
+_citation_id
+_citation_journal_full
+_citation_year
+_citation_journal_volume
+_citation_page_first
+_citation_page_last
+_citation_journal_id_ASTM
+primary 'Year Book - Carnegie Institution of Washington' 1974 73 544 547 CIWYAO
+loop_
+_citation_author_citation_id
+_citation_author_name
+primary 'Finger, L.W.'
+_cell_length_a 6.612(2)
+_cell_length_b 6.612(2)
+_cell_length_c 5.994(2)
+_cell_angle_alpha 90.
+_cell_angle_beta 90.
+_cell_angle_gamma 90.
+_cell_volume 262.05
+_cell_formula_units_Z 4
+_space_group_name_H-M_alt 'I 41/a m d Z'
+_space_group_IT_number 141
+loop_
+_space_group_symop_id
+_space_group_symop_operation_xyz
+1 'y+1/4, x+3/4, -z+1/4'
+2 'y+1/4, -x+3/4, -z+1/4'
+3 'x, y+1/2, -z'
+4 'x, -y, -z'
+5 '-y+3/4, x+3/4, -z+1/4'
+6 '-y+3/4, -x+3/4, -z+1/4'
+7 '-x, y+1/2, -z'
+8 '-x, -y, -z'
+9 '-y+3/4, -x+1/4, z+3/4'
+10 '-y+3/4, x+1/4, z+3/4'
+11 '-x, -y+1/2, z'
+12 '-x, y, z'
+13 'y+1/4, -x+1/4, z+3/4'
+14 'y+1/4, x+1/4, z+3/4'
+15 'x, -y+1/2, z'
+16 'x, y, z'
+17 'y+3/4, x+1/4, -z+3/4'
+18 'y+3/4, -x+1/4, -z+3/4'
+19 'x+1/2, y, -z+1/2'
+20 'x+1/2, -y+1/2, -z+1/2'
+21 '-y+1/4, x+1/4, -z+3/4'
+22 '-y+1/4, -x+1/4, -z+3/4'
+23 '-x+1/2, y, -z+1/2'
+24 '-x+1/2, -y+1/2, -z+1/2'
+25 '-y+1/4, -x+3/4, z+1/4'
+26 '-y+1/4, x+3/4, z+1/4'
+27 '-x+1/2, -y, z+1/2'
+28 '-x+1/2, y+1/2, z+1/2'
+29 'y+3/4, -x+3/4, z+1/4'
+30 'y+3/4, x+3/4, z+1/4'
+31 'x+1/2, -y, z+1/2'
+32 'x+1/2, y+1/2, z+1/2'
+loop_
+_atom_type_symbol
+_atom_type_oxidation_number
+Zr4+ 4
+Si4+ 4
+O2- -2
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_symmetry_multiplicity
+_atom_site_Wyckoff_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_B_iso_or_equiv
+_atom_site_occupancy
+Zr1 Zr4+ 4 a 0 0.75 0.125 0.4 1.
+Si1 Si4+ 4 b 0 0.75 0.625 0.5 1.
+O1 O2- 16 h 0 0.0660(5) 0.1941(5) 0.72 1.
+#End of TTdata_9582-ICSD

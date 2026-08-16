@@ -1,0 +1,114 @@
+
+##########################################################################
+#               Crystallographic Information Format file
+#               Produced by PyCifRW module
+#
+#  This is a CIF file.  CIF has been adopted by the International
+#  Union of Crystallography as the standard for data archiving and
+#  transmission.
+#
+#  For information on this file format, follow the CIF links at
+#  http://www.iucr.org
+##########################################################################
+
+data_12957-ICSD
+
+_database_code_ICSD                     12957
+_audit_creation_date                    2020-02-01
+_chemical_name_common                   'Iron sulfide (1/2)'
+_chemical_formula_structural            'Fe S2'
+_chemical_formula_sum                   'Fe1 S2'
+_chemical_name_structure_type           FeS2
+_exptl_crystal_density_diffrn           5.01
+_diffrn_ambient_temperature             293.
+_citation_title                         
+;
+Crystal structure refinement of MnTe$_2$, MnSe$_2$, and MnS$_2$. Cation-anion
+and anionâ€“anion bonding distances in pyrite-type structures
+;
+loop_
+  _citation_id
+  _citation_journal_full
+  _citation_year
+  _citation_journal_volume
+  _citation_page_first
+  _citation_page_last
+  _citation_journal_id_ASTM
+         primary   'Zeitschrift fuer Kristallographie - Crystalline Materials'           2019     234      371      377      ZKCMAJ
+loop_
+  _citation_author_citation_id
+  _citation_author_name
+         primary   'Tokuda, Makoto'    
+         primary   'Yoshiasa, Akira'   
+         primary   'Mashimo, Tsutomu'  
+         primary   'Arima, Hiroshi'    
+         primary   'Hongu, Hidetomo'   
+         primary   'Tobase, Tsubasa'   
+         primary   'Nakatsuka, Akihiko'          
+         primary   'Sugiyama, Kazumasa' 
+_cell_length_a                          5.41900(10)
+_cell_length_b                          5.41900(10)
+_cell_length_c                          5.41900(10)
+_cell_angle_alpha                       90
+_cell_angle_beta                        90
+_cell_angle_gamma                       90
+_cell_volume                            159.13
+_cell_formula_units_Z                   4
+_space_group_name_H-M_alt               'P a -3'
+_space_group_IT_number                  205
+loop_
+  _space_group_symop_id
+  _space_group_symop_operation_xyz
+         1         '-z+1/2, x+1/2, y'  
+         2         'z+1/2, x, -y+1/2'  
+         3         'z, -x+1/2, y+1/2'  
+         4         '-z, -x, -y'        
+         5         'y, -z+1/2, x+1/2'  
+         6         '-y+1/2, z+1/2, x'  
+         7         'y+1/2, z, -x+1/2'  
+         8         '-y, -z, -x'        
+         9         'x+1/2, y, -z+1/2'  
+         10        'x, -y+1/2, z+1/2'  
+         11        '-x+1/2, y+1/2, z'  
+         12        '-x, -y, -z'        
+         13        'z+1/2, -x+1/2, -y'           
+         14        '-z+1/2, -x, y+1/2'           
+         15        '-z, x+1/2, -y+1/2'           
+         16        'z, x, y'           
+         17        '-y, z+1/2, -x+1/2'           
+         18        'y+1/2, -z+1/2, -x'           
+         19        '-y+1/2, -z, x+1/2'           
+         20        'y, z, x'           
+         21        '-x+1/2, -y, z+1/2'           
+         22        '-x, y+1/2, -z+1/2'           
+         23        'x+1/2, -y+1/2, -z'           
+         24        'x, y, z' 
+loop_
+  _atom_type_symbol
+  _atom_type_oxidation_number
+         Fe2+      2         
+         S1-       -1 
+loop_
+  _atom_site_label
+  _atom_site_type_symbol
+  _atom_site_symmetry_multiplicity
+  _atom_site_Wyckoff_symbol
+  _atom_site_fract_x
+  _atom_site_fract_y
+  _atom_site_fract_z
+  _atom_site_U_iso_or_equiv
+  _atom_site_occupancy
+         Fe1       Fe        4         b         0.5       0.5       0.5       0.00318(13)        1        
+         S1        S         8         c         0.61516(5)          0.11516(5)         0.38484(5)         0.00391(14)        1
+loop_
+  _atom_site_aniso_label
+  _atom_site_aniso_type_symbol
+  _atom_site_aniso_U_11
+  _atom_site_aniso_U_22
+  _atom_site_aniso_U_33
+  _atom_site_aniso_U_12
+  _atom_site_aniso_U_13
+  _atom_site_aniso_U_23
+         Fe1       Fe2+      0.00318(13)         0.00318(13)         0.00318(13)        0.00000(6)         0.00000(6)         0.00000(6)         
+         S1        S1-       0.00391(14)         0.00391(14)         0.00391(14)        0.00009(7)         -0.00009(7)        -0.00009(7)
+_symmetry_space_group_name_H-M          'P a -3'

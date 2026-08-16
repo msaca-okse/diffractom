@@ -1,0 +1,77 @@
+
+#(C) 2024 by FIZ Karlsruhe - Leibniz Institute for Information Infrastructure.  All rights reserved.
+data_75928-ICSD
+_database_code_ICSD 75928
+_audit_creation_date 1996-04-22
+_audit_update_record 1997-11-10
+_chemical_name_common 'Iron catena-silicate'
+_chemical_formula_structural 'Fe (Si O3)'
+_chemical_formula_sum 'Fe1 O3 Si1'
+_chemical_name_structure_type Pyroxene#Clinoenstatite#MgSiO3
+_chemical_name_mineral Clinoferrosilite
+_exptl_crystal_density_diffrn 4.
+_citation_title
+
+;
+The structure of high-pressure C2/c ferrosilite and crystal chemistry of
+high-pressure C2/c pyroxenes
+;
+loop_
+_citation_id
+_citation_journal_full
+_citation_year
+_citation_journal_volume
+_citation_page_first
+_citation_page_last
+_citation_journal_id_ASTM
+primary 'American Mineralogist' 1994 79 1032 1041 AMMIAY
+loop_
+_citation_author_citation_id
+_citation_author_name
+primary 'Hugh-Jones, D.A.'
+primary 'Woodland, A.B.'
+primary 'Angel, R.J.'
+_cell_length_a 9.7075(5)
+_cell_length_b 9.0807(4)
+_cell_length_c 5.2347(5)
+_cell_angle_alpha 90.
+_cell_angle_beta 108.46(1)
+_cell_angle_gamma 90.
+_cell_volume 437.7
+_cell_formula_units_Z 8
+_space_group_name_H-M_alt 'P 1 21/c 1'
+_space_group_IT_number 14
+loop_
+_space_group_symop_id
+_space_group_symop_operation_xyz
+1 'x, -y+1/2, z+1/2'
+2 '-x, -y, -z'
+3 '-x, y+1/2, -z+1/2'
+4 'x, y, z'
+loop_
+_atom_type_symbol
+_atom_type_oxidation_number
+Fe2+ 2
+Si4+ 4
+O2- -2
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_symmetry_multiplicity
+_atom_site_Wyckoff_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_B_iso_or_equiv
+_atom_site_occupancy
+Fe1 Fe2+ 4 e 0.2512(3) 0.6538(2) 0.2262(5) 0.92(5) 1.
+Fe2 Fe2+ 4 e 0.2256(3) 0.0145(3) 0.2239(5) 1.13(5) 1.
+Si1 Si4+ 4 e 0.0454(5) 0.3384(5) 0.2915(9) 0.64(7) 1.
+Si2 Si4+ 4 e 0.5531(5) 0.8334(5) 0.2431(9) 0.77(7) 1.
+O1 O2- 4 e 0.871(1) 0.338(1) 0.178(2) 0.62(17) 1.
+O2 O2- 4 e 0.379(1) 0.837(1) 0.137(2) 0.59(16) 1.
+O3 O2- 4 e 0.125(1) 0.496(1) 0.335(2) 0.70(17) 1.
+O4 O2- 4 e 0.633(1) 0.981(1) 0.387(3) 1.17(21) 1.
+O5 O2- 4 e 0.106(1) 0.266(1) 0.597(3) 1.45(21) 1.
+O6 O2- 4 e 0.608(1) 0.702(1) 0.470(2) 1.60(22) 1.
+#End of TTdata_75928-ICSD

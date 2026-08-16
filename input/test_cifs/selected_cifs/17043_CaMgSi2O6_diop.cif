@@ -1,0 +1,79 @@
+
+#(C) 2024 by FIZ Karlsruhe - Leibniz Institute for Information Infrastructure.  All rights reserved.
+data_17043-ICSD
+_database_code_ICSD 17043
+_audit_creation_date 1982-12-31
+_audit_update_record 2007-08-01
+_chemical_name_common 'Calcium magnesium catena-disilicate'
+_chemical_formula_structural 'Ca Mg (Si2 O6)'
+_chemical_formula_sum 'Ca1 Mg1 O6 Si2'
+_chemical_name_structure_type Pyroxene#Diopside#CaMg(SiO3)2
+_chemical_name_mineral Diopside
+_exptl_crystal_density_diffrn 3.27
+_citation_title
+
+;
+Crystal structures of Ca-rich clinopyroxenes on the Ca Mg Si2 O6 - Mg2 Si2 O6
+join
+;
+loop_
+_citation_id
+_citation_journal_full
+_citation_year
+_citation_journal_volume
+_citation_page_first
+_citation_page_last
+_citation_journal_id_ASTM
+primary 'TMPM. Tschermaks Mineralogische und Petrographische Mitteilungen' 1982
+29 223 240 TTMMDZ
+loop_
+_citation_author_citation_id
+_citation_author_name
+primary 'Bruno, E.'
+primary 'Carbonin, S.'
+primary 'Molin, G.'
+_cell_length_a 9.750(1)
+_cell_length_b 8.926(1)
+_cell_length_c 5.251(1)
+_cell_angle_alpha 90.
+_cell_angle_beta 105.90(1)
+_cell_angle_gamma 90.
+_cell_volume 439.5
+_cell_formula_units_Z 4
+_space_group_name_H-M_alt 'C 1 2/c 1'
+_space_group_IT_number 15
+loop_
+_space_group_symop_id
+_space_group_symop_operation_xyz
+1 'x, -y, z+1/2'
+2 '-x, -y, -z'
+3 '-x, y, -z+1/2'
+4 'x, y, z'
+5 'x+1/2, -y+1/2, z+1/2'
+6 '-x+1/2, -y+1/2, -z'
+7 '-x+1/2, y+1/2, -z+1/2'
+8 'x+1/2, y+1/2, z'
+loop_
+_atom_type_symbol
+_atom_type_oxidation_number
+Ca2+ 2
+Mg2+ 2
+O2- -2
+Si4+ 4
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_symmetry_multiplicity
+_atom_site_Wyckoff_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_B_iso_or_equiv
+_atom_site_occupancy
+Ca1 Ca2+ 4 e 0 0.3011(1) 0.25 0.54 1.
+Mg1 Mg2+ 4 e 0 0.9082(1) 0.25 0.32 1.
+O1 O2- 8 f 0.3507(1) 0.0179(1) -0.0043(3) 0.55 1.
+O2 O2- 8 f 0.3615(1) 0.2496(2) 0.3196(3) 0.61 1.
+O3 O2- 8 f 0.1159(1) 0.0877(1) 0.1423(2) 0.44 1.
+Si1 Si4+ 8 f 0.2866(1) 0.0933(1) 0.2302(1) 0.31 1.
+#End of TTdata_17043-ICSD
