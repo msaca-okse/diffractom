@@ -116,7 +116,7 @@ def build_fista_program(ctx: cl.Context) -> cl.Program:
 
 # -------------------- FISTA implementation --------------------
 
-class FISTAHuber:
+class FISTAHuberCPU:
     """
     Solve: min_x 0.5||A x - b||^2 + g(x)
     with FISTA on GPU.

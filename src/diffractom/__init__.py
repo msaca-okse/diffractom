@@ -8,6 +8,8 @@ from .operators.bulk_texture_forward_operator import BulkTextureForwardOperator
 from .operators.matrix_tomographic_operator import MatrixTomographicOperator
 from .optimization.fista_huber import FISTAHuber
 from .optimization.fista_l2 import FISTAL2
+from .operators.single_phase_forward_operator_cpu import SinglePhaseForwardOperatorCPU
+from .optimization.fista_huber_cpu import FISTAHuberCPU
 
 __all__ = [
     "Material",
@@ -18,4 +20,6 @@ __all__ = [
     "FISTAL2",
     "BulkTextureForwardOperator",
     "MatrixTomographicOperator",
+    "SinglePhaseForwardOperatorCPU",
+    "FISTAHuberCPU",
 ]

@@ -14,7 +14,7 @@ from .create_pfo_matrix import build_pf_program
 from .pf_kernels import build_all_opencl
 
 
-class SinglePhaseForwardOperator_cpu:
+class SinglePhaseForwardOperatorCPU:
     """Single-material pole-figure forward operator on GPU/CPU.
 
     Computes  data = PF @ Radon(coeffs)  and its adjoint, where PF is the
@@ -849,11 +849,6 @@ def batched_gemm_adj_clblast(queue, Y3, BT3, X3, R, Mx, Nsub, K, alpha):
 
 
 
-def gpu_norm(x):
-    """Compute L2 norm of a GPU array."""
-    return float(clarray.sum(x*x).get() ** 0.5)
-
-
 def estimate_L_power(
     op,
     niter: int = 20,
@@ -868,52 +863,60 @@ def estimate_L_power(
     q = op.queue
     rng = np.random.default_rng(seed)
 
-    # x in domain, Fortran
-    x = clarray.empty(q, (op.Nx, op.Ny, op.K), np.float32, order="F")
-    # y in range, C
-    Ax = clarray.empty(q, (op.N_Omega, op.My, op.N_seg), np.float32, order="C")
-    # z = A^*Ax in domain
-    z = clarray.empty(q, x.shape, np.float32, order="F")
+    # x in domain, CPU, Fortran
+    x = rng.standard_normal(
+        (op.Nx, op.Ny, op.K),
+        dtype=np.float32,
+    )
+    x = np.asfortranarray(x)
 
-    # init x random
-    x_host = rng.standard_normal(x.shape).astype(np.float32, copy=False, order="F")
-    assert x.data is not None
-    cl.enqueue_copy(q, x.data, x_host)
-    q.finish()
+    # y in range, GPU, C
+    Ax = clarray.empty(
+        q,
+        (op.N_Omega, op.My, op.N_seg),
+        np.float32,
+        order="C",
+    )
 
-    # normalize x
-    xnorm = float(np.sqrt(clarray.vdot(x, x).get()) + eps)
+    # z = A^* Ax in domain, CPU, Fortran
+    z = np.empty(x.shape, np.float32, order="F")
+
+    # Normalize x
+    xnorm = np.sqrt(np.sum(x * x)) + eps
     x *= np.float32(1.0 / xnorm)
-    q.finish()
 
     L_est: float = 0.0
+
     for it in range(niter):
+
         # Ax = A x
         op.direct_cl(x, Ax)
+
         # z = A^* Ax
         op.adjoint_cl(Ax, z)
         q.finish()
 
-        num = float(clarray.vdot(x, z).get())
-        den = float(clarray.vdot(x, x).get()) + eps
+        # Rayleigh quotient
+        num = float(np.sum(x * z))
+        den = float(np.sum(x * x)) + eps
         L_est = num / den
 
-        znorm = float(np.sqrt(clarray.vdot(z, z).get()) + eps)
+        # Normalize z and put it into x
+        znorm = float(np.sqrt(np.sum(z * z)) + eps)
         x[:] = z * np.float32(1.0 / znorm)
-        q.finish()
 
         if verbose:
-            print(f"[power {it+1:02d}] L_est={L_est:.6e}  ||z||={znorm:.6e}")
+            print(
+                f"[power {it+1:02d}] "
+                f"L_est={L_est:.6e}  "
+                f"||z||={znorm:.6e}"
+            )
 
     # ---------- GPU cleanup ----------
-    if x.base_data is not None:
-        x.base_data.release()
     if Ax.base_data is not None:
         Ax.base_data.release()
-    if z.base_data is not None:
-        z.base_data.release()
 
-    del x, Ax, z, x_host
+    del x, Ax, z
     gc.collect()
     q.finish()
     # --------------------------------
