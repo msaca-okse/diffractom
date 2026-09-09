@@ -264,20 +264,29 @@ def build_bragg_matrix_gpu(
     sig: float,
     e0: float,
     pulse_tail_fn=raden_pulse_tail,
+    edge_blur_scale: float = 1.0,
     ctx: cl.Context | None = None,
     queue: cl.CommandQueue | None = None,
+    local_size: int = 64,
 ) -> np.ndarray:
     """GPU-accelerated Bragg-edge matrix builder.
 
+    Faithful GPU replication of :func:`build_bragg_matrix_cpu` (same physics,
+    same general reciprocal-lattice-vector formulation — no cubic-crystal
+    assumption). See ``bragg_edge_kernels.cl`` for the kernel implementation
+    and its performance notes.
+
     .. note::
-        The OpenCL kernel (``bragg_edge_kernels.cl``) still uses the old
-        formula and needs to be updated to match ``xs_singlecrystal_2022.m``.
-        Use :func:`build_bragg_matrix_cpu` for validated results.
+        The kernel hard-codes the RADEN/J-PARC pulse-tail formula
+        (:func:`~diffractom.utils.instrument.raden_pulse_tail`). Passing a
+        different ``pulse_tail_fn`` raises ``ValueError`` since it would
+        silently be ignored on the GPU path.
 
     Parameters
     ----------
     bragg_table : dict
         Output of :meth:`~diffractom.crystallography.material.Material.neutron_bragg_table`.
+        Required keys: ``g_vecs`` (N_hkl, 3), ``d`` (N_hkl,), ``F2`` (N_hkl,), ``V``.
     rotations : scipy Rotation, shape (N_orient,)
     beam_angles_deg : np.ndarray, shape (N_Omega,)
         Tomographic angles in degrees.
@@ -288,10 +297,18 @@ def build_bragg_matrix_gpu(
     e0 : float
         Instrument resolution parameter.
     pulse_tail_fn : callable, optional
-        Instrument pulse-tail function — see :func:`build_bragg_matrix_cpu`.
-        Defaults to :func:`~diffractom.utils.instrument.raden_pulse_tail`.
+        Must be :func:`~diffractom.utils.instrument.raden_pulse_tail` (the
+        only model the kernel implements).
+    edge_blur_scale : float, optional
+        Scalar multiplier applied to the symmetric edge broadening term.
     ctx, queue : optional
         Existing OpenCL context/command-queue.
+    local_size : int, optional
+        Number of wavelength bins processed per work-group. All threads in a
+        work-group share the same (orientation, angle) pair and cooperatively
+        cache the per-reflection trigonometry in local memory, so this value
+        mainly trades off local-memory reuse against occupancy; 64 is a
+        reasonable default on most GPUs.
 
     Returns
     -------
@@ -299,10 +316,12 @@ def build_bragg_matrix_gpu(
         Macroscopic attenuation coefficient μ_R (cm⁻¹).  See
         :func:`build_bragg_matrix_cpu` for details.
     """
-    raise NotImplementedError(
-        "build_bragg_matrix_gpu needs to be updated to match xs_singlecrystal_2022.m. "
-        "Use build_bragg_matrix_cpu for validated results."
-    )
+    if pulse_tail_fn is not raden_pulse_tail:
+        raise ValueError(
+            "build_bragg_matrix_gpu only supports the RADEN pulse-tail "
+            "formula (raden_pulse_tail), which is hard-coded in "
+            "bragg_edge_kernels.cl. Use use_gpu=False for other instruments."
+        )
 
     if ctx is None:
         ctx = cl.create_some_context(interactive=False)
@@ -312,54 +331,83 @@ def build_bragg_matrix_gpu(
     prg = _build_bragg_program(ctx)
     kernel = cl.Kernel(prg, "bragg_edge_col")
 
-    # --- HKL table ---
-    hkl_tab = A1.astype(np.float32)
-    N_hkl = len(hkl_tab)
+    # --- reflection table: [gx, gy, gz, F2, d] ---
+    g_vecs = np.asarray(bragg_table['g_vecs'], dtype=np.float32)   # (N_hkl, 3) Å⁻¹
+    d_hkl  = np.asarray(bragg_table['d'],      dtype=np.float32)   # (N_hkl,)   Å
+    F2     = np.asarray(bragg_table['F2'],     dtype=np.float32)   # (N_hkl,)   barns
+    # NOTE: V is passed to the kernel in Å³ (NOT converted to cm³ here). The
+    # cm-scale unit-conversion factors in the amplitude formula cancel
+    # exactly (10⁸·10⁻³²·10⁻²⁴/10⁻⁴⁸ = 1), so the kernel computes the
+    # amplitude directly in Å/barn units. Converting V to cm³ here and
+    # squaring it in float32 (~1e-23 cm³ → ~1e-46) sits right at the edge of
+    # the float32 subnormal range and previously produced NaN/Inf.
+    V_A3   = float(bragg_table['V'])                                 # Å³
+
+    N_hkl = len(d_hkl)
+    hkl_tab = np.empty((N_hkl, 5), dtype=np.float32)
+    hkl_tab[:, 0:3] = g_vecs
+    hkl_tab[:, 3]   = F2
+    hkl_tab[:, 4]   = d_hkl
 
     # --- Rotation inverse matrices ---
     rot_inv_mats = rotations.inv().as_matrix().reshape(-1, 9).astype(np.float32)  # (N_orient, 9)
     N_orient = len(rotations)
 
     # --- Beam directions: rotate ŷ around ẑ by each angle ---
-    beam_dirs = np.stack([
-        np.array([
-            -np.sin(np.deg2rad(ang)),
-            np.cos(np.deg2rad(ang)),
-            0.0,
-        ], dtype=np.float32)
-        for ang in beam_angles_deg
-    ])  # (N_Omega, 3)
+    ang_rad = np.deg2rad(np.asarray(beam_angles_deg, dtype=np.float64))
+    beam_dirs = np.stack(
+        [-np.sin(ang_rad), np.cos(ang_rad), np.zeros_like(ang_rad)], axis=1
+    ).astype(np.float32)  # (N_Omega, 3)
     N_Omega = len(beam_angles_deg)
 
-    lam_f32 = lam.astype(np.float32)
-    N_lam = len(lam)
+    lam_f32 = np.asarray(lam, dtype=np.float32)
+    N_lam = len(lam_f32)
     lam_min = float(lam_f32.min())
     lam_max = float(lam_f32.max())
-    V_cm3 = float((a * 1e-8) ** 3)
+
+    if N_hkl == 0:
+        return np.zeros((N_Omega, N_orient, N_lam), dtype=np.float32)
+
+    # --- per-reflection scratch arrays live in local memory, shared by every
+    # thread in a work-group (one work-group per (orientation, angle) pair) ---
+    local_bytes = N_hkl * np.dtype(np.float32).itemsize
+    dev_local_mem = ctx.devices[0].local_mem_size
+    if 4 * local_bytes > dev_local_mem:
+        raise RuntimeError(
+            f"Reflection table too large for GPU local memory: needs "
+            f"{4 * local_bytes} bytes (4 arrays of N_hkl={N_hkl} floats) but "
+            f"device only has {dev_local_mem} bytes. Reduce h_max/threshold "
+            f"to shrink N_hkl, or use use_gpu=False."
+        )
 
     # --- upload to GPU ---
-    d_rot_inv  = clarray.to_device(queue, rot_inv_mats)
-    d_beams    = clarray.to_device(queue, beam_dirs.ravel())
-    d_hkl      = clarray.to_device(queue, hkl_tab.ravel())
-    d_lam      = clarray.to_device(queue, lam_f32)
-    d_out      = clarray.zeros(queue, (N_orient * N_Omega * N_lam,), dtype=np.float32)
+    d_rot_inv = clarray.to_device(queue, rot_inv_mats)
+    d_beams   = clarray.to_device(queue, beam_dirs)
+    d_hkl     = clarray.to_device(queue, hkl_tab)
+    d_lam     = clarray.to_device(queue, lam_f32)
+    d_out     = clarray.zeros(queue, (N_orient * N_Omega * N_lam,), dtype=np.float32)
 
-    # --- dispatch ---
-    # Global size: (N_orient * N_Omega, N_lam)
-    global_size = (N_orient * N_Omega, N_lam)
+    N_pairs = N_orient * N_Omega
+    L = max(1, min(local_size, N_lam))
+    N_lam_padded = int(np.ceil(N_lam / L)) * L
 
     kernel(
         queue,
-        global_size,
-        None,                           # local size: auto
+        (N_pairs, N_lam_padded),
+        (1, L),
         d_rot_inv.data,
         d_beams.data,
         d_hkl.data,
         d_lam.data,
         d_out.data,
-        np.float32(V_cm3),
+        cl.LocalMemory(local_bytes),
+        cl.LocalMemory(local_bytes),
+        cl.LocalMemory(local_bytes),
+        cl.LocalMemory(local_bytes),
+        np.float32(V_A3),
         np.float32(sig),
         np.float32(e0),
+        np.float32(edge_blur_scale),
         np.float32(lam_min),
         np.float32(lam_max),
         np.int32(N_orient),
