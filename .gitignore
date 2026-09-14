@@ -56,6 +56,12 @@ Thumbs.db
 .env.*
 *.local
 
+# MATLAB / MTEX folders
+PoleFigureAnalysis/
+SO3KernelFunctions/
+
 # Other stuff
 installation*
 test_import*
+input*
+ideas*
