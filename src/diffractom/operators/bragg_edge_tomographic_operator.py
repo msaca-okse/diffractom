@@ -76,6 +76,9 @@ from ..crystallography.material import Material
 from ..utils.grid import Grid
 from ..utils.instrument import raden_pulse_tail
 
+from scipy.stats import qmc
+
+
 
 # ---------------------------------------------------------------------------
 # OpenCL program loader
@@ -424,6 +427,294 @@ def build_bragg_matrix_gpu(
     return B
 
 
+
+def build_bragg_matrix_quadrature(
+    bragg_table: dict,
+    quad_rots: np.ndarray,
+    weights: np.ndarray,
+    K: int,
+    beam_angles_deg: np.ndarray,
+    lam: np.ndarray,
+    sig: float,
+    e0: float,
+    pulse_tail_fn=raden_pulse_tail,
+    edge_blur_scale: float = 1.0,
+    use_gpu: bool = True,
+    ctx: cl.Context | None = None,
+    queue: cl.CommandQueue | None = None,
+    local_size: int = 64,
+    quadrature_memory_gb: float = 1.0,
+) -> np.ndarray:
+    """
+    Build a Bragg-edge matrix by integrating over SO(3) quadrature
+    points around each orientation.
+
+    The quadrature points are grouped as
+
+        [R_0,1, ..., R_0,A,
+         R_1,1, ..., R_1,A,
+         ...]
+
+    where K is the number of center orientations and A is the number
+    of quadrature points per orientation.
+
+    The Bragg matrix is evaluated in batches to avoid allocating the
+    full quadrature matrix simultaneously.
+
+    Parameters
+    ----------
+    bragg_table
+        Neutron reflection table.
+
+    quad_rots
+        Quadrature rotations with shape (K*A, 3, 3).
+
+    weights
+        Quadrature weights with shape (A,). These should normally be
+        normalized to sum to one if the desired result is an average
+        over each SO(3) ball.
+
+    K
+        Number of center orientations.
+
+    beam_angles_deg
+        Tomographic angles in degrees.
+
+    lam
+        Wavelength grid in Å.
+
+    sig
+        Orientation spread used by the Bragg-edge profile itself.
+
+    e0
+        Instrument resolution parameter.
+
+    quadrature_memory_gb
+        Approximate maximum size of the returned B batch in GB.
+
+    Returns
+    -------
+    B_integrated
+        Array with shape (N_Omega, K, N_lam).
+    """
+
+    quad_rots = np.asarray(
+        quad_rots,
+        dtype=np.float32,
+    )
+
+    weights = np.asarray(
+        weights,
+        dtype=np.float32,
+    )
+
+    beam_angles_deg = np.asarray(
+        beam_angles_deg,
+        dtype=np.float64,
+    )
+
+    lam = np.asarray(
+        lam,
+        dtype=np.float64,
+    )
+
+    if quad_rots.ndim != 3 or quad_rots.shape[1:] != (3, 3):
+        raise ValueError(
+            "quad_rots must have shape (K*A, 3, 3)."
+        )
+
+    if weights.ndim != 1:
+        raise ValueError(
+            "weights must have shape (A,)."
+        )
+
+    if quad_rots.shape[0] % K != 0:
+        raise ValueError(
+            "quad_rots.shape[0] must be divisible by K."
+        )
+
+    N_quad = quad_rots.shape[0] // K
+
+    if len(weights) != N_quad:
+        raise ValueError(
+            f"Expected {N_quad} quadrature weights, "
+            f"got {len(weights)}."
+        )
+
+    if quadrature_memory_gb <= 0:
+        raise ValueError(
+            "quadrature_memory_gb must be positive."
+        )
+
+    N_Omega = len(beam_angles_deg)
+    N_lam = len(lam)
+
+    # --------------------------------------------------------------
+    # Determine how many center orientations fit into one batch.
+    #
+    # B_batch has shape:
+    #
+    #     (N_Omega, K_batch * N_quad, N_lam)
+    #
+    # and is float32.
+    # --------------------------------------------------------------
+
+    bytes_per_orientation = (
+        N_Omega
+        * N_quad
+        * N_lam
+        * np.dtype(np.float32).itemsize
+    )
+
+    max_bytes = quadrature_memory_gb * 1024**3
+
+    batch_K = max(
+        1,
+        int(max_bytes // bytes_per_orientation),
+    )
+
+    batch_K = min(
+        batch_K,
+        K,
+    )
+
+    print(
+        f"Quadrature: K={K}, N_quad={N_quad}, "
+        f"batch_K={batch_K}"
+    )
+
+    batch_bytes = (
+        N_Omega
+        * batch_K
+        * N_quad
+        * N_lam
+        * 4
+    )
+
+    print(
+        f"Maximum B batch size: "
+        f"{batch_bytes / 1024**3:.3f} GB"
+    )
+
+    # --------------------------------------------------------------
+    # Output.
+    # --------------------------------------------------------------
+
+    B_integrated = np.zeros(
+        (N_Omega, K, N_lam),
+        dtype=np.float32,
+    )
+
+    # --------------------------------------------------------------
+    # Process batches of CENTER orientations.
+    #
+    # This is important: we keep all N_quad points belonging to a
+    # center orientation in the same batch.
+    # --------------------------------------------------------------
+
+    for k_start in range(0, K, batch_K):
+
+        k_end = min(
+            k_start + batch_K,
+            K,
+        )
+
+        K_batch = k_end - k_start
+
+        quad_start = k_start * N_quad
+        quad_end = k_end * N_quad
+
+        quad_batch = quad_rots[
+            quad_start:quad_end
+        ]
+
+        # ----------------------------------------------------------
+        # Calculate B for all quadrature points in this batch.
+        # ----------------------------------------------------------
+
+        if use_gpu:
+
+            B_quad = build_bragg_matrix_gpu(
+                bragg_table=bragg_table,
+                rotations=Rotation.from_matrix(
+                    quad_batch
+                ),
+                beam_angles_deg=beam_angles_deg,
+                lam=lam,
+                sig=sig,
+                e0=e0,
+                pulse_tail_fn=pulse_tail_fn,
+                edge_blur_scale=edge_blur_scale,
+                ctx=ctx,
+                queue=queue,
+                local_size=local_size,
+            )
+
+        else:
+
+            B_quad = build_bragg_matrix_cpu(
+                bragg_table=bragg_table,
+                rotations=Rotation.from_matrix(
+                    quad_batch
+                ),
+                beam_angles_deg=beam_angles_deg,
+                lam=lam,
+                sig=sig,
+                e0=e0,
+                pulse_tail_fn=pulse_tail_fn,
+                edge_blur_scale=edge_blur_scale,
+            ).astype(np.float32)
+
+        # ----------------------------------------------------------
+        # Reshape:
+        #
+        #     (N_Omega, K_batch*N_quad, N_lam)
+        #
+        # ->
+        #
+        #     (N_Omega, K_batch, N_quad, N_lam)
+        # ----------------------------------------------------------
+
+        B_quad = B_quad.reshape(
+            N_Omega,
+            K_batch,
+            N_quad,
+            N_lam,
+        )
+
+        # ----------------------------------------------------------
+        # Integrate over the quadrature dimension.
+        #
+        # weights:
+        #     (N_quad,)
+        #
+        # becomes:
+        #     (1, 1, N_quad, 1)
+        # ----------------------------------------------------------
+
+        B_batch = np.sum(
+            B_quad
+            * weights[None, None, :, None],
+            axis=2,
+        )
+
+        B_integrated[
+            :,
+            k_start:k_end,
+            :,
+        ] = B_batch
+
+        print(
+            f"Quadrature batch "
+            f"{k_start}:{k_end} / {K}"
+        )
+
+        del B_quad
+        del B_batch
+
+    return B_integrated
+
+
 # ---------------------------------------------------------------------------
 # Operator class
 # ---------------------------------------------------------------------------
@@ -521,6 +812,9 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         use_gpu: bool = True,
         ctx: cl.Context | None = None,
         queue: cl.CommandQueue | None = None,
+        N_quad: int | None = None,
+        sigma_distance: float | None = None,
+        quadrature_memory_gb: float = 1.0,
         **parent_kwargs,
     ):
         # --- extract orientations and sigma from the grid ---
@@ -566,42 +860,107 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
 
 
         # --- build B ---
-        if use_gpu:
-            B = build_bragg_matrix_gpu(
-                bragg_table    = bragg_table,
-                rotations      = rotations,
-                beam_angles_deg= beam_angles,
-                lam            = lam,
-                sig            = sigma_grid,
-                e0             = e0,
-                pulse_tail_fn  = pulse_tail_fn,
-                edge_blur_scale= edge_blur_scale,
-                ctx            = ctx,
-                queue          = queue,
-            )
+        #
+        # If N_quad is None, retain the original behavior exactly:
+        #
+        #     one orientation -> one column of B
+        #
+        # If N_quad is provided, evaluate B at N_quad orientations
+        # around every grid orientation and integrate over the local
+        # SO(3) ball.
+
+        if N_quad is None:
+
+            # --------------------------------------------------------------
+            # Original implementation.
+            # --------------------------------------------------------------
+
+            if use_gpu:
+
+                B = build_bragg_matrix_gpu(
+                    bragg_table=bragg_table,
+                    rotations=rotations,
+                    beam_angles_deg=beam_angles,
+                    lam=lam,
+                    sig=sigma_grid,
+                    e0=e0,
+                    pulse_tail_fn=pulse_tail_fn,
+                    edge_blur_scale=edge_blur_scale,
+                    ctx=ctx,
+                    queue=queue,
+                )
+
+            else:
+
+                B = build_bragg_matrix_cpu(
+                    bragg_table=bragg_table,
+                    rotations=rotations,
+                    beam_angles_deg=beam_angles,
+                    lam=lam,
+                    sig=sigma_grid,
+                    e0=e0,
+                    pulse_tail_fn=pulse_tail_fn,
+                    edge_blur_scale=edge_blur_scale,
+                ).astype(np.float32)
+
         else:
 
-            B = build_bragg_matrix_cpu(
-                bragg_table    = bragg_table,
-                rotations      = rotations,
-                beam_angles_deg= beam_angles,
-                lam            = lam,
-                sig            = sigma_grid,
-                e0             = e0,
-                pulse_tail_fn  = pulse_tail_fn,
-                edge_blur_scale= edge_blur_scale,
-            ).astype(np.float32)
+            # --------------------------------------------------------------
+            # Quadrature implementation.
+            # --------------------------------------------------------------
 
-        if include_powder:
-            # powder_xs shape: (N_lam,)
-            # tile to (N_Omega, 1, N_lam) and concatenate along axis=1
-            powder_col = np.tile(
-                powder_xs.astype(np.float32)[np.newaxis, np.newaxis, :],
-                (N_Omega, 1, 1),
+            if N_quad <= 0:
+                raise ValueError(
+                    "N_quad must be positive."
+                )
+
+            if sigma_distance is None:
+                raise ValueError(
+                    "sigma_distance must be provided when "
+                    "N_quad is specified."
+                )
+
+            if sigma_distance <= 0:
+                raise ValueError(
+                    "sigma_distance must be positive."
+                )
+
+            # --------------------------------------------------------------
+            # Generate quadrature orientations around every grid point.
+            #
+            # Normalized weights are used so that the result is an average
+            # over each local SO(3) ball and therefore remains on the same
+            # scale as the original B matrix.
+            # --------------------------------------------------------------
+
+            grid_mats = rotations.as_matrix()
+
+            quad_rots, weights = sample_so3_ball_quadrature(
+                rotations=grid_mats,
+                radius=sigma_distance,
+                n_samples=N_quad,
+                normalize_weights=True,
             )
-            B = np.concatenate([B, powder_col], axis=1)
 
-        K = B.shape[1]
+            B = build_bragg_matrix_quadrature(
+                bragg_table=bragg_table,
+                quad_rots=quad_rots,
+                weights=weights,
+                K=N_orient,
+                beam_angles_deg=beam_angles,
+                lam=lam,
+                sig=1.2*sigma_distance/N_quad**(1/3),
+                e0=e0,
+                pulse_tail_fn=pulse_tail_fn,
+                edge_blur_scale=edge_blur_scale,
+                use_gpu=use_gpu,
+                ctx=ctx,
+                queue=queue,
+                quadrature_memory_gb=quadrature_memory_gb,
+            )
+
+            del quad_rots
+            del weights
 
         # --- store build metadata ---
         self.material = material
@@ -622,9 +981,231 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
             B=B,
             angles = self.angles,
             N_Omega=N_Omega,
-            K=K,
+            K=N_orient,
             N_seg=N_lam,
             ctx=ctx,
             queue=queue,
             **parent_kwargs,
         )
+
+
+
+
+
+
+def sample_so3_ball_quadrature(
+    rotations: np.ndarray,
+    radius: float,
+    n_samples: int,
+    *,
+    seed: int | None = 0,
+    normalize_weights: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Generate quadrature points inside an SO(3) ball around each
+    supplied orientation.
+
+    Parameters
+    ----------
+    rotations
+        Center orientations with shape (K, 3, 3).
+
+    radius
+        SO(3) ball radius in radians. Must be smaller than pi.
+
+    n_samples
+        Number of quadrature points per orientation.
+
+    seed
+        Sobol scrambling seed.
+
+    normalize_weights
+        If False, weights approximate integration over the SO(3)
+        ball. If True, weights sum to one and therefore give a
+        local average.
+
+    Returns
+    -------
+    quadrature_rotations
+        Shape (K*A, 3, 3), ordered as
+
+            [R_0,1, ..., R_0,A,
+             R_1,1, ..., R_1,A,
+             ...]
+
+    weights
+        Shape (A,). Same weights are used for every orientation.
+    """
+
+    rotations = np.asarray(
+        rotations,
+        dtype=np.float64,
+    )
+
+    if rotations.ndim != 3 or rotations.shape[1:] != (3, 3):
+        raise ValueError(
+            "rotations must have shape (K, 3, 3)."
+        )
+
+    if radius <= 0:
+        raise ValueError(
+            "radius must be positive."
+        )
+
+    if radius >= np.pi:
+        raise ValueError(
+            "radius must be smaller than pi."
+        )
+
+    if n_samples <= 0:
+        raise ValueError(
+            "n_samples must be positive."
+        )
+
+    K = rotations.shape[0]
+    A = n_samples
+
+    # --------------------------------------------------------------
+    # Generate Sobol points in [0, 1)^3.
+    # --------------------------------------------------------------
+
+    sampler = qmc.Sobol(
+        d=3,
+        scramble=True,
+        seed=seed,
+    )
+
+    m = int(np.ceil(np.log2(A)))
+
+    u = sampler.random_base2(m=m)[:A]
+
+    # --------------------------------------------------------------
+    # Uniform points in a 3D ball.
+    #
+    # rho = R * u^(1/3)
+    # --------------------------------------------------------------
+
+    rho = radius * u[:, 0] ** (1.0 / 3.0)
+
+    cos_theta = 1.0 - 2.0 * u[:, 1]
+
+    sin_theta = np.sqrt(
+        np.maximum(
+            0.0,
+            1.0 - cos_theta**2,
+        )
+    )
+
+    phi = 2.0 * np.pi * u[:, 2]
+
+    omega = np.empty(
+        (A, 3),
+        dtype=np.float64,
+    )
+
+    omega[:, 0] = (
+        rho
+        * sin_theta
+        * np.cos(phi)
+    )
+
+    omega[:, 1] = (
+        rho
+        * sin_theta
+        * np.sin(phi)
+    )
+
+    omega[:, 2] = (
+        rho
+        * cos_theta
+    )
+
+    # --------------------------------------------------------------
+    # SO(3) Haar Jacobian.
+    #
+    # J(theta) =
+    #     (sin(theta/2) / (theta/2))^2
+    # --------------------------------------------------------------
+
+    theta = np.linalg.norm(
+        omega,
+        axis=1,
+    )
+
+    half_theta = theta / 2.0
+
+    jacobian = np.ones(
+        A,
+        dtype=np.float64,
+    )
+
+    mask = half_theta > 1e-12
+
+    jacobian[mask] = (
+        np.sin(half_theta[mask])
+        / half_theta[mask]
+    ) ** 2
+
+    # Uniform Euclidean-ball sampling contributes
+    #
+    #     4*pi*r^3 / (3*A)
+    #
+    # and the Haar correction contributes J(theta).
+
+    euclidean_volume = (
+        4.0
+        * np.pi
+        * radius**3
+        / 3.0
+    )
+
+    weights = (
+        euclidean_volume
+        / A
+        * jacobian
+    )
+
+    if normalize_weights:
+        weights /= weights.sum()
+
+    # --------------------------------------------------------------
+    # Exponential map:
+    #
+    #     omega -> exp([omega]_x)
+    # --------------------------------------------------------------
+
+    local_rotations = Rotation.from_rotvec(
+        omega
+    ).as_matrix()
+
+    # --------------------------------------------------------------
+    # Apply every local rotation to every center.
+    #
+    # R_{k,a} = R_k @ R_a
+    #
+    # First obtain shape (K, A, 3, 3).
+    # --------------------------------------------------------------
+
+    quadrature_rotations = np.einsum(
+        "kij,ajl->kail",
+        rotations,
+        local_rotations,
+    )
+
+    # Flatten K and A.
+    quadrature_rotations = quadrature_rotations.reshape(
+        K * A,
+        3,
+        3,
+    )
+
+    return (
+        np.ascontiguousarray(
+            quadrature_rotations,
+            dtype=np.float32,
+        ),
+        np.ascontiguousarray(
+            weights,
+            dtype=np.float32,
+        ),
+    )

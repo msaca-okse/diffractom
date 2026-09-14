@@ -235,7 +235,9 @@ __kernel void bragg_edge_col(
 
         float amp = 0.0f, sigma = 1.0f, alpha = 1.0f;
 
-        if (lam0 >= lam_min && lam0 <= lam_max) {
+        const float lam_margin = 0.3f;
+
+        if (lam0 >= lam_min - lam_margin && lam0 <= lam_max + lam_margin) {
             float ratio = lam0 / (2.0f * d);
             ratio = clamp(ratio, -1.0f, 1.0f);
             float theta_B  = asin(ratio);
