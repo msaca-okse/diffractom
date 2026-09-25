@@ -53,7 +53,7 @@ On HPC systems, this typically means running on a GPU node and loading the appro
 
 ## Optional dependencies
 
-The following are not required for core functionality, but may be useful for analysis and visualization:
+The following are not required for core functionality, but may be useful for analysis and visualization and in particular for running the example notebook:
 
 ```bash
 conda install -c conda-forge orix notebook

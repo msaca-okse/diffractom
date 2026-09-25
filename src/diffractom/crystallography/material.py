@@ -108,7 +108,7 @@ def _lattice_params_from_matrix_rows(M: np.ndarray):
 
 def _pg_int_matrices(pg_obj) -> list[np.ndarray]:
     """Convert a tuple of scipy Rotations to a list of 3×3 integer rotation matrices."""
-    return [np.rint(r.as_matrix()).astype(int) for r in pg_obj]
+    return [np.rint(p.astype(int)) for p in pg_obj]
 
 
 def _sym_ops_to_hkl_ops(sym_op_strings: list[str]) -> list[np.ndarray]:
@@ -288,6 +288,17 @@ class Material:
         'trigonal':     point_groups.trigonal,
         'hexagonal':    point_groups.hexagonal,
         'cubic':        point_groups.cubic,
+    }
+
+
+    _POINT_GROUP_MAP_PERMUTATION = {
+        'triclinic':    point_groups.trivial,
+        'monoclinic':   point_groups.cyclic_2,
+        'orthorhombic': point_groups.orthorhombic_permutation,
+        'tetragonal':   point_groups.tetragonal_permutation,
+        'trigonal':     point_groups.trigonal_permutation,
+        'hexagonal':    point_groups.hexagonal_permutation,
+        'cubic':        point_groups.cubic_permutation,
     }
 
     # ------------------------------------------------------------------
@@ -895,7 +906,7 @@ class Material:
         if self._hkl_grouping_ops is not None:
             pg_ops = self._hkl_grouping_ops
         else:
-            pg_obj = self._POINT_GROUP_MAP.get(self._normalise_crystal_system(),
+            pg_obj = self._POINT_GROUP_MAP_PERMUTATION.get(self._normalise_crystal_system(),
                                                point_groups.trivial)
             pg_ops = _pg_int_matrices(pg_obj)
 
@@ -1078,7 +1089,7 @@ class Material:
         self.h_vecs        = h_vecs
         self.h_vecs_normed = h_vecs / (norms + 1e-12)
 
-    def attach_point_group(self, point_group_map: dict | None = None) -> None:
+    def attach_point_group(self, point_group_map: dict | None = None, point_group_map_permutation: dict | None = None) -> None:
         """Store the point-group rotation matrices (float32, shape (num_ops, 9)).
 
         Parameters
@@ -1090,13 +1101,25 @@ class Material:
         if point_group_map is None:
             point_group_map = self._POINT_GROUP_MAP
 
+        if point_group_map_permutation is None:
+            point_group_map_permutation = self._POINT_GROUP_MAP_PERMUTATION
+
         system = self._normalise_crystal_system()
         if system not in point_group_map:
             raise ValueError(f"No point group defined for crystal system '{system}'.")
 
+        if system not in point_group_map_permutation:
+            raise ValueError(f"No point group defined for crystal system '{system}'.")
+
+        
         rotations = point_group_map[system]
+        permutations = point_group_map_permutation[system]
+        
         mats = [r.as_matrix().astype(np.float32).reshape(-1) for r in rotations]
+        mats_permutations = [p.astype(np.float32).reshape(-1) for p in permutations]
+
         self.point_group_matrices = np.stack(mats, axis=0)
+        self.point_group_permutations = np.stack(mats, axis=0)
         self.num_sym_ops = self.point_group_matrices.shape[0]
 
     @staticmethod
