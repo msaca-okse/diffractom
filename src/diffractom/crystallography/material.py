@@ -15,6 +15,7 @@ from .cif_parser import parse_cif, _parse_sym_op
 from .form_factors import form_factor_array
 from .lattice import reciprocal_lattice
 from . import point_groups
+from .space_group_centering import resolve_space_group, centering_of, satisfies_centering_condition
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -363,6 +364,15 @@ class Material:
             sys = 'trigonal'
         return sys
 
+    def set_space_group(self, number: int | None = None,
+                     symbol: str | None = None) -> None:
+        """Set space group; both number and symbol are always stored, resolving
+        whichever one wasn't given from the lookup table."""
+        number, symbol = resolve_space_group(number=number, symbol=symbol)
+        self.space_group_number = number
+        self.space_group_symbol = symbol
+        self.crystal_system = _crystal_system_from_sg(number)
+
     # ------------------------------------------------------------------
     # Public setters (incremental construction)
     # ------------------------------------------------------------------
@@ -505,6 +515,7 @@ class Material:
         symmetry_group:     str | None = None,   # old param name
         crystal_system:     str | None = None,   # new param name (alias)
         space_group_number: int | None = None,
+        symbol:             int | None = None,
         # Reflection selection
         wavelength_kev:   float | None = None,
         wavelength_A:     float | None = None,
@@ -575,8 +586,10 @@ class Material:
 
         # ---- space group / crystal system ----
         mat.space_group_number = space_group_number
-        if space_group_number is not None:
-            mat.crystal_system = _crystal_system_from_sg(space_group_number)
+
+        if space_group_number is not None or symbol is not None:
+            mat.set_space_group(number=space_group_number, symbol=symbol)
+
         mat._setup_lattice(a_, b_, c_, alpha_, beta_, gamma_)
         # Explicit string overrides metric inference (but NOT SG-derived value)
         sys_str = crystal_system or symmetry_group
@@ -596,6 +609,10 @@ class Material:
             intensity_cutoff_fraction=0.0,
             global_intensity_norm=global_intensity_norm,
         )
+
+        if mat.space_group_symbol is not None:
+            mat.filter_extinct()
+            
         return mat
 
     # ------------------------------------------------------------------
@@ -1008,6 +1025,21 @@ class Material:
 
         self.compute_h_vectors()
         self.attach_point_group()
+
+
+    def filter_extinct(self, rhombohedral_axes: str = "hexagonal") -> None:
+        """Drop reflections forbidden by the lattice centering (integral
+        extinctions only -- glide-plane / screw-axis extinctions are not
+        handled). Requires space_group_symbol to be set."""
+        if self.space_group_symbol is None:
+            raise RuntimeError(
+                "space_group_symbol is not set; call set_space_group() first."
+            )
+        centering = centering_of(self.space_group_symbol)
+        mask = satisfies_centering_condition(
+            self.reflections['hkl'], centering, rhombohedral_axes=rhombohedral_axes
+        )
+        self.reflections = self.reflections[mask]
 
     # ------------------------------------------------------------------
     # Operator-facing accessor methods (backward-compatible)
