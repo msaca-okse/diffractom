@@ -3,32 +3,38 @@ import pyopencl as cl
 import pyopencl.array as clarray
 import numpy as np
 
+from .launch import elementwise, pixel_orientation
 
+
+# Element-wise kernels use 64-bit indices in a grid-stride loop (see launch.py).
 PROX_KERNELS = r"""
-__kernel void prox_nonneg(__global float *x, int total) {
-    int gid = get_global_id(0);
-    if (gid < total && x[gid] < 0.0f) x[gid] = 0.0f;
+__kernel void prox_nonneg(__global float *x, const ulong n) {
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0))
+        if (x[i] < 0.0f) x[i] = 0.0f;
 }
 
-__kernel void prox_l1(__global float *x, float lambda, int total) {
-    int gid = get_global_id(0);
-    if (gid >= total) return;
-    float v = x[gid];
-    float a = fabs(v) - lambda;
-    x[gid] = (a > 0.0f) ? copysign(a, v) : 0.0f;
+__kernel void prox_l1(__global float *x, float lambda, const ulong n) {
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        float v = x[i];
+        float a = fabs(v) - lambda;
+        x[i] = (a > 0.0f) ? copysign(a, v) : 0.0f;
+    }
 }
 
-__kernel void prox_nonneg_l1(__global float *x, float lambda, int total) {
-    int gid = get_global_id(0);
-    if (gid >= total) return;
-    float v = x[gid] - lambda;
-    x[gid] = (v > 0.0f) ? v : 0.0f;
+__kernel void prox_nonneg_l1(__global float *x, float lambda, const ulong n) {
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        float v = x[i] - lambda;
+        x[i] = (v > 0.0f) ? v : 0.0f;
+    }
 }
 
-// x (Nx, Ny, K) Fortran order: zero every channel of the pixels outside the support
-__kernel void apply_support(__global float *x, __global const uchar *mask, int npix, int total) {
-    int gid = get_global_id(0);
-    if (gid < total && !mask[gid % npix]) x[gid] = 0.0f;
+// x (Nx, Ny, K) Fortran order: zero every channel of the pixels outside the support.
+// Range (npix, <= 64): pixels on axis 0, orientations strided on axis 1.
+__kernel void apply_support(__global float *x, __global const uchar *mask, const int npix, const int K) {
+    const int p = get_global_id(0);
+    if (p >= npix || mask[p]) return;
+    for (int k = get_global_id(1); k < K; k += get_global_size(1))
+        x[(size_t)k * npix + p] = 0.0f;
 }
 """
 
@@ -47,42 +53,22 @@ class ProxKernels:
 
 def prox_nonneg(queue, kernels: ProxKernels, x_gpu):
     """Non-negativity projection in place."""
-    total = np.int32(x_gpu.size)
-    kernels.k_prox_nonneg(
-        queue,
-        (int(total),),
-        None,
-        x_gpu.data,
-        total,
-    )
+    gws, n = elementwise(x_gpu.size)
+    kernels.k_prox_nonneg(queue, gws, None, x_gpu.data, n)
     return x_gpu
 
 
 def prox_l1(queue, kernels: ProxKernels, x_gpu, lam, tau):
     """Soft-thresholding (L1 proximal) in place."""
-    total = np.int32(x_gpu.size)
-    kernels.k_prox_l1(
-        queue,
-        (int(total),),
-        None,
-        x_gpu.data,
-        np.float32(lam * tau),
-        total,
-    )
+    gws, n = elementwise(x_gpu.size)
+    kernels.k_prox_l1(queue, gws, None, x_gpu.data, np.float32(lam * tau), n)
     return x_gpu
 
 
 def prox_nonneg_l1(queue, kernels: ProxKernels, x_gpu, lam, tau):
     """Non-negative soft-thresholding in place."""
-    total = np.int32(x_gpu.size)
-    kernels.k_prox_nonneg_l1(
-        queue,
-        (int(total),),
-        None,
-        x_gpu.data,
-        np.float32(lam * tau),
-        total,
-    )
+    gws, n = elementwise(x_gpu.size)
+    kernels.k_prox_nonneg_l1(queue, gws, None, x_gpu.data, np.float32(lam * tau), n)
     return x_gpu
 
 
@@ -109,7 +95,8 @@ def support_mask_to_gpu(queue, operator, support):
 
 def apply_support(queue, kernels: ProxKernels, x_gpu, mask_gpu):
     """Zero x (Nx, Ny, K, Fortran order) outside the support in place (projection onto the support)."""
-    total = np.int32(x_gpu.size)
-    kernels.k_apply_support(queue, (int(total),), None, x_gpu.data, mask_gpu.data,
-                            np.int32(mask_gpu.size), total)
+    npix = int(mask_gpu.size)
+    K = int(x_gpu.size) // npix
+    kernels.k_apply_support(queue, pixel_orientation(npix, K), None, x_gpu.data, mask_gpu.data,
+                            np.int32(npix), np.int32(K))
     return x_gpu

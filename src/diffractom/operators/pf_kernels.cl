@@ -364,8 +364,9 @@ __kernel void scatter_k_lastaxis_f(
 
     int dst_k = k + i0;
 
-    int src_idx = d + D * (o + O * k);
-    int dst_idx = d + D * (o + O * dst_k);
+    // 64 bit: dst (the full coefficient array) may exceed 2^31 elements
+    size_t src_idx = d + (size_t)D * (o + (size_t)O * k);
+    size_t dst_idx = d + (size_t)D * (o + (size_t)O * dst_k);
 
     dst[dst_idx] = src[src_idx];
 }
@@ -419,10 +420,9 @@ __kernel void SLICE_COEFFS_K_BATCH_F(
 
     int kin = k + K_START;
 
-    // Fortran-order flattening:
-    // idx = i + Nx * (j + Ny * k)
-    COEFFS_OUT[rem + plane_size * k] =
-        COEFFS_IN[rem + plane_size * kin];
+    // Fortran-order flattening, idx = i + Nx * (j + Ny * k); 64 bit, as COEFFS_IN may exceed 2^31 elements
+    COEFFS_OUT[(size_t)rem + (size_t)plane_size * k] =
+        COEFFS_IN[(size_t)rem + (size_t)plane_size * kin];
 }
 
 
@@ -584,6 +584,7 @@ __kernel void scatter_k_batch_c(
 // ---------------------------------------------------------------------------
 
 // data[r, y, j] += sum_k pf[r, k, j] * sino[r, y, k]
+// Range (CP, My, R); array offsets are 64 bit, so the data array may exceed 2^31 elements.
 __kernel void spmm_pf_forward_c(
     __global const float *sino,         // (R, My, Kstride)
     __global const int *row_ptr,        // (R*CP + 1,)
@@ -592,21 +593,21 @@ __kernel void spmm_pf_forward_c(
     __global float *data,               // (R, My, CP)
     const int R, const int My, const int CP, const int Kstride
 ){
-    int gid = get_global_id(0);
-    if (gid >= R * My * CP) return;
-    int j = gid % CP;
-    int tmp = gid / CP;
-    int y = tmp % My;
-    int r = tmp / My;
-    int row = r * CP + j;
-    __global const float *line = sino + ((size_t)r * My + y) * Kstride;
+    const int j = get_global_id(0);
+    const int y = get_global_id(1);
+    const int r = get_global_id(2);
+    if (j >= CP || y >= My || r >= R) return;
+    const int row = r * CP + j;
+    const size_t line = (size_t)r * My + y;
+    __global const float *sino_line = sino + line * Kstride;
     float acc = 0.0f;
     for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i)
-        acc += val[i] * line[col_k[i]];
-    data[gid] += acc;
+        acc += val[i] * sino_line[col_k[i]];
+    data[line * CP + j] += acc;
 }
 
 // sino[r, y, k] = alpha * sum_j pf[r, k, j] * data[r, y, j]   for k < Kb
+// Range (Kb, My, R); array offsets are 64 bit.
 __kernel void spmm_pf_adjoint_c(
     __global const float *data,         // (R, My, CP)
     __global const int *row_ptr,        // (R*Kb + 1,)
@@ -615,16 +616,15 @@ __kernel void spmm_pf_adjoint_c(
     __global float *sino,               // (R, My, Kstride)
     const int R, const int My, const int Kb, const int CP, const int Kstride, const float alpha
 ){
-    int gid = get_global_id(0);
-    if (gid >= R * My * Kb) return;
-    int k = gid % Kb;
-    int tmp = gid / Kb;
-    int y = tmp % My;
-    int r = tmp / My;
-    int row = r * Kb + k;
-    __global const float *line = data + ((size_t)r * My + y) * CP;
+    const int k = get_global_id(0);
+    const int y = get_global_id(1);
+    const int r = get_global_id(2);
+    if (k >= Kb || y >= My || r >= R) return;
+    const int row = r * Kb + k;
+    const size_t line = (size_t)r * My + y;
+    __global const float *data_line = data + line * CP;
     float acc = 0.0f;
     for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i)
-        acc += val[i] * line[col_j[i]];
-    sino[((size_t)r * My + y) * Kstride + k] = alpha * acc;
+        acc += val[i] * data_line[col_j[i]];
+    sino[line * Kstride + k] = alpha * acc;
 }

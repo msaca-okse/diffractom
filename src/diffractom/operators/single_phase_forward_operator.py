@@ -571,6 +571,15 @@ class SinglePhaseForwardOperator:
         # multiple of 4: the native projector handles 4 orientations per work item
         # (the padding rows of the PF matrix are zero)
         self.K_batch_max = -(-self.K_batch_max // 4) * 4
+
+        # The per-batch buffers are indexed with 32-bit integers by some kernels (the full coefficient
+        # and data arrays are not); a smaller max_gb gives smaller batches.
+        Kmax = self.K_batch_max
+        for name, n in [("PF batch (N_Omega, K_batch, N_eta, N_rings)", R * Kmax * C * T),
+                        ("sinogram batch (N_Omega, My, K_batch)", R * self.My * Kmax),
+                        ("image batch (Nx, Ny, K_batch)", self.Nx * self.Ny * Kmax)]:
+            if n >= 2**31:
+                raise ValueError(f"The {name} has {n} elements, more than 2^31 - 1; lower max_gb.")
     
 
 
@@ -779,7 +788,7 @@ class SinglePhaseForwardOperator:
                 sb = self.sparse_batches[ib]
                 self.k.spmm_pf_forward_c(
                     self.queue,
-                    (R * My * CP,),
+                    (CP, My, R),
                     None,
                     self.coeffs_sino_C.data,
                     sb["row_ptr_f"].data,
@@ -906,7 +915,7 @@ class SinglePhaseForwardOperator:
                 sb = self.sparse_batches[ib]
                 self.k.spmm_pf_adjoint_c(
                     self.queue,
-                    (R * My * Kb,),
+                    (Kb, My, R),
                     None,
                     data.data,
                     sb["row_ptr_a"].data,

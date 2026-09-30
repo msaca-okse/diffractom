@@ -1,13 +1,14 @@
+# Element-wise kernels: 64-bit indices in a grid-stride loop (see launch.py), so the coefficient and
+# data arrays may have more than 2^31 elements.
 FISTA_KERNELS = r"""
 __kernel void residual_axpb(
     __global const float *Ax,
     __global const float *b,
     __global float *r,
-    const int total
+    const ulong n
 ){
-    int gid = get_global_id(0);
-    if (gid >= total) return;
-    r[gid] = Ax[gid] - b[gid];
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0))
+        r[i] = Ax[i] - b[i];
 }
 
 // v = y - tau * grad
@@ -16,11 +17,10 @@ __kernel void grad_step(
     __global const float *grad,
     __global float *v,
     const float tau,
-    const int total
+    const ulong n
 ){
-    int gid = get_global_id(0);
-    if (gid >= total) return;
-    v[gid] = y[gid] - tau * grad[gid];
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0))
+        v[i] = y[i] - tau * grad[i];
 }
 
 // y = x + beta * (x - x_old)
@@ -29,23 +29,22 @@ __kernel void extrapolate(
     __global const float *x_old,
     __global float *y,
     const float beta,
-    const int total
+    const ulong n
 ){
-    int gid = get_global_id(0);
-    if (gid >= total) return;
-    float xv = x[gid];
-    y[gid] = xv + beta * (xv - x_old[gid]);
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        float xv = x[i];
+        y[i] = xv + beta * (xv - x_old[i]);
+    }
 }
 
 // x_old <- x (copy kernel to avoid enqueue_copy corner-cases with strides)
 __kernel void copy_buf(
     __global const float *src,
     __global float *dst,
-    const int total
+    const ulong n
 ){
-    int gid = get_global_id(0);
-    if (gid >= total) return;
-    dst[gid] = src[gid];
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0))
+        dst[i] = src[i];
 }
 """
 
@@ -53,15 +52,14 @@ HUBER_KERNELS = r"""
 __kernel void huber_clip_inplace(
     __global float *r,
     const float delta,
-    const int n
+    const ulong n
 ){
-    int gid = get_global_id(0);
-    if (gid >= n) return;
-
-    float v = r[gid];
-    if (v >  delta) v =  delta;
-    if (v < -delta) v = -delta;
-    r[gid] = v;
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        float v = r[i];
+        if (v >  delta) v =  delta;
+        if (v < -delta) v = -delta;
+        r[i] = v;
+    }
 }
 """
 
@@ -70,19 +68,12 @@ __kernel void huber_loss(
     __global const float *r,
     __global float *out,
     const float delta,
-    const int n
+    const ulong n
 ){
-    int gid = get_global_id(0);
-    if (gid >= n) return;
-
-    float v = fabs(r[gid]);
-    float val;
-    if (v <= delta)
-        val = 0.5f * v * v;
-    else
-        val = delta * (v - 0.5f * delta);
-
-    out[gid] = val;
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        float v = fabs(r[i]);
+        out[i] = (v <= delta) ? 0.5f * v * v : delta * (v - 0.5f * delta);
+    }
 }
 """
 
@@ -94,6 +85,7 @@ import pyopencl as cl
 import pyopencl.array as clarray
 import pyopencl.clmath as clmath
 from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels, apply_support, support_mask_to_gpu
+from .launch import elementwise, pixel_orientation
 
 from .prox_tv import (
     TVProxKernels,
@@ -304,9 +296,10 @@ class FISTAHuber:
         # copy x0 -> y,x_old
         if self.support_gpu is not None:  # start inside the support
             apply_support(q, self.prox_kernels, x, self.support_gpu)
-        total_x = np.int32(x.size)
-        self.k_copy_buf(q, (int(total_x),), None, x.data, y.data, total_x)
-        self.k_copy_buf(q, (int(total_x),), None, x.data, x_old.data, total_x)
+        gws_x, n_x = elementwise(x.size)
+        self.k_copy_buf(q, gws_x, None, x.data, y.data, n_x)
+        self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
+        gws_Ax, n_Ax = elementwise(out_gpu.size)
 
         Ax = None
         r = None
@@ -324,13 +317,11 @@ class FISTAHuber:
 
             self.op.direct_cl(y, Ax)
 
-            total_Ax = np.int32(Ax.size)
-
             # ---- r = Ax - b ----
             self.k_residual_axpb(
-                q, (int(total_Ax),), None,
+                q, gws_Ax, None,
                 Ax.data, out_gpu.data, r.data,
-                total_Ax
+                n_Ax
             )
 
             # ---- optional weighting: r <- w * r ----
@@ -347,10 +338,10 @@ class FISTAHuber:
 
             # ---- huber: r <- clip(r, -delta, +delta) ----
             self.k_huber_clip_inplace(
-                q, (int(total_Ax),), None,
+                q, gws_Ax, None,
                 r.data,
                 np.float32(self.huber_delta),
-                total_Ax
+                n_Ax
             )
 
             # ---- grad = A*(r) ----
@@ -359,10 +350,10 @@ class FISTAHuber:
 
             # ---- v = y - tau*grad ----
             self.k_grad_step(
-                q, (int(total_x),), None,
-                y.data, grad.data, x.data,   # update into x (your kernels treat 3rd arg as output)
+                q, gws_x, None,
+                y.data, grad.data, x.data,   # the third argument is the output
                 np.float32(self.tau),
-                total_x
+                n_x
             )
 
             # ---- prox: apply in-place on v (x), then extrapolation uses y ----
@@ -373,14 +364,14 @@ class FISTAHuber:
             beta = (t - 1.0) / t_new
 
             self.k_extrapolate(
-                q, (int(total_x),), None,
+                q, gws_x, None,
                 x.data, x_old.data, y.data,
                 np.float32(beta),
-                total_x
+                n_x
             )
 
             # ---- x_old <- x ----
-            self.k_copy_buf(q, (int(total_x),), None, x.data, x_old.data, total_x)
+            self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
 
             t = t_new
 
@@ -391,24 +382,24 @@ class FISTAHuber:
 
             elif self.prox_kind == "nonneg_tv" and self.lam != 0.0:
                 b = self._tv_buffers
-                total_x_tv = np.int32(x.size)
+                Nx, Ny, K = map(int, x.shape)
 
                 self.tv_kernels.k_grad(
-                    q, (int(total_x_tv),), None,
+                    q, pixel_orientation(Nx * Ny, K), None,
                     x.data,
                     b["gx"].data,
                     b["gy"].data,
-                    np.int32(x.shape[0]),
-                    np.int32(x.shape[1]),
-                    np.int32(x.shape[2]),
+                    np.int32(Nx),
+                    np.int32(Ny),
+                    np.int32(K),
                 )
 
                 self.tv_kernels.k_norm(
-                    q, (int(total_x_tv),), None,
+                    q, gws_x, None,
                     b["gx"].data,
                     b["gy"].data,
                     b["div"].data,
-                    total_x_tv,
+                    n_x,
                 )
 
                 gval = self.lam * float(clarray.sum(b["div"]).get())

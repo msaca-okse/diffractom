@@ -3,8 +3,14 @@ import pyopencl as cl
 import pyopencl.array as clarray
 import numpy as np
 
+from .launch import elementwise, pixel_orientation
+
 
 TV_KERNELS = r"""
+// Arrays (Nx, Ny, K), Fortran order. tv_grad and tv_div run on the range (Nx*Ny, <= 64): pixels on
+// axis 0, orientations strided on axis 1; the other kernels are element-wise, with 64-bit indices in a
+// grid-stride loop (see launch.py).
+
 // ============================================================
 // Forward gradient (x,y only), K independent
 // ============================================================
@@ -16,20 +22,18 @@ __kernel void tv_grad(
     const int Ny,
     const int K
 ){
-    int gid = get_global_id(0);
-    int total = Nx * Ny * K;
-    if (gid >= total) return;
+    const int p = get_global_id(0);
+    if (p >= Nx * Ny) return;
+    const int i = p % Nx;
+    const int j = p / Nx;
+    const size_t npix = (size_t)Nx * Ny;
 
-    int i = gid % Nx;
-    int t = gid / Nx;
-    int j = t % Ny;
-    int k = t / Ny;
-
-    int idx = i + Nx * (j + Ny * k);
-
-    // forward differences (Neumann BC)
-    ux[idx] = (i < Nx-1) ? (u[idx + 1]   - u[idx]) : 0.0f;
-    uy[idx] = (j < Ny-1) ? (u[idx + Nx]  - u[idx]) : 0.0f;
+    for (int k = get_global_id(1); k < K; k += get_global_size(1)) {
+        const size_t idx = p + npix * k;
+        // forward differences (Neumann BC)
+        ux[idx] = (i < Nx-1) ? (u[idx + 1]   - u[idx]) : 0.0f;
+        uy[idx] = (j < Ny-1) ? (u[idx + Nx]  - u[idx]) : 0.0f;
+    }
 }
 
 
@@ -49,28 +53,26 @@ __kernel void tv_div(
     const int Ny,
     const int K
 ){
-    int gid = get_global_id(0);
-    int total = Nx * Ny * K;
-    if (gid >= total) return;
+    const int p = get_global_id(0);
+    if (p >= Nx * Ny) return;
+    const int i = p % Nx;
+    const int j = p / Nx;
+    const size_t npix = (size_t)Nx * Ny;
 
-    int i = gid % Nx;
-    int t = gid / Nx;
-    int j = t % Ny;
-    int k = t / Ny;
+    for (int k = get_global_id(1); k < K; k += get_global_size(1)) {
+        const size_t idx = p + npix * k;
+        float v = 0.0f;
 
-    int idx = i + Nx * (j + Ny * k);
+        // x direction
+        if (i < Nx-1) v -= px[idx];
+        if (i > 0)    v += px[idx - 1];
 
-    float v = 0.0f;
+        // y direction
+        if (j < Ny-1) v -= py[idx];
+        if (j > 0)    v += py[idx - Nx];
 
-    // x direction
-    if (i < Nx-1) v -= px[idx];
-    if (i > 0)    v += px[idx - 1];
-
-    // y direction
-    if (j < Ny-1) v -= py[idx];
-    if (j > 0)    v += py[idx - Nx];
-
-    div[idx] = v;
+        div[idx] = v;
+    }
 }
 
 
@@ -84,19 +86,18 @@ __kernel void tv_dual_update(
     __global const float *uy,
     const float tau,
     const float weight,
-    const int total
+    const ulong n
 ){
-    int gid = get_global_id(0);
-    if (gid >= total) return;
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        float pxn = px[i] + tau * ux[i];
+        float pyn = py[i] + tau * uy[i];
 
-    float pxn = px[gid] + tau * ux[gid];
-    float pyn = py[gid] + tau * uy[gid];
+        float nrm = sqrt(pxn*pxn + pyn*pyn);
+        float denom = fmax(1.0f, nrm / weight);
 
-    float nrm = sqrt(pxn*pxn + pyn*pyn);
-    float denom = fmax(1.0f, nrm / weight);
-
-    px[gid] = pxn / denom;
-    py[gid] = pyn / denom;
+        px[i] = pxn / denom;
+        py[i] = pyn / denom;
+    }
 }
 
 
@@ -107,11 +108,10 @@ __kernel void tv_primal_update(
     __global float *u,
     __global const float *f,
     __global const float *div,
-    const int total
+    const ulong n
 ){
-    int gid = get_global_id(0);
-    if (gid >= total) return;
-    u[gid] = f[gid] - div[gid];
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0))
+        u[i] = f[i] - div[i];
 }
 
 
@@ -120,11 +120,10 @@ __kernel void tv_primal_update(
 // ============================================================
 __kernel void prox_nonneg(
     __global float *x,
-    const int total
+    const ulong n
 ){
-    int gid = get_global_id(0);
-    if (gid >= total) return;
-    if (x[gid] < 0.0f) x[gid] = 0.0f;
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0))
+        if (x[i] < 0.0f) x[i] = 0.0f;
 }
 
 
@@ -132,13 +131,10 @@ __kernel void tv_norm(
     __global const float *gx,
     __global const float *gy,
     __global float *out,
-    const int total
+    const ulong n
 ){
-    int gid = get_global_id(0);
-    if (gid >= total) return;
-
-    float v = sqrt(gx[gid]*gx[gid] + gy[gid]*gy[gid]);
-    out[gid] = v;
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0))
+        out[i] = sqrt(gx[i]*gx[i] + gy[i]*gy[i]);
 }
 
 """
@@ -185,13 +181,13 @@ def prox_tv_nonneg_inplace(
     """
 
     Nx, Ny, K = map(int, x_gpu.shape)
-    total = int(x_gpu.size)
 
     # typed scalars
     iNx = np.int32(Nx)
     iNy = np.int32(Ny)
     iK  = np.int32(K)
-    itotal = np.int32(total)
+    gws, itotal = elementwise(x_gpu.size)          # element-wise kernels
+    gws_pk = pixel_orientation(Nx * Ny, K)          # tv_grad, tv_div
 
     # algorithm constants
     tv_tau = np.float32(0.25)  # = 1/(2*ndim) with ndim=2
@@ -201,12 +197,11 @@ def prox_tv_nonneg_inplace(
     cl.enqueue_copy(queue, y_gpu.data, x_gpu.data)
 
     # Main loop
-    gws = (int(total),)
 
     for _ in range(int(n_iter)):
         # div_p = div(p)
         kernels.k_div(
-            queue, gws, None,
+            queue, gws_pk, None,
             px.data, py.data, div.data,
             iNx, iNy, iK
         )
@@ -220,7 +215,7 @@ def prox_tv_nonneg_inplace(
 
         # grad(u)
         kernels.k_grad(
-            queue, gws, None,
+            queue, gws_pk, None,
             x_gpu.data, ux.data, uy.data,
             iNx, iNy, iK
         )
@@ -239,7 +234,7 @@ def prox_tv_nonneg_inplace(
             last_res = clarray.vdot(div, div)
 
     # final primal u = f - div(p)
-    kernels.k_div(queue, gws, None, px.data, py.data, div.data, iNx, iNy, iK)
+    kernels.k_div(queue, gws_pk, None, px.data, py.data, div.data, iNx, iNy, iK)
     kernels.k_primal(queue, gws, None, x_gpu.data, y_gpu.data, div.data, itotal)
 
     # nonnegativity (sequential prox)
