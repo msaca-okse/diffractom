@@ -127,8 +127,9 @@ support.
 
 `FISTAL2` is the same solver with a least-squares data term. Both solvers
 accept `prox_kind` values `"nonneg"`, `"l1"`, `"nonneg_l1"` and `"nonneg_tv"`
-(with the regularisation weight `lam`), and `run` takes optional
-per-measurement `weights`, where zero weight excludes a data point.
+(with the regularisation weight `lam`). `FISTAHuber.run` also takes optional
+per-measurement `weights`, where zero weight excludes a data point. See
+[docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) for the full API.
 
 ## License
 
