@@ -293,8 +293,8 @@ class Material:
 
 
     _POINT_GROUP_MAP_PERMUTATION = {
-        'triclinic':    point_groups.trivial,
-        'monoclinic':   point_groups.cyclic_2,
+        'triclinic':    point_groups.trivial_permutation,
+        'monoclinic':   point_groups.cyclic_2_permutation,
         'orthorhombic': point_groups.orthorhombic_permutation,
         'tetragonal':   point_groups.tetragonal_permutation,
         'trigonal':     point_groups.trigonal_permutation,
@@ -917,7 +917,7 @@ class Material:
             pg_ops = self._hkl_grouping_ops
         else:
             pg_obj = self._POINT_GROUP_MAP_PERMUTATION.get(self._normalise_crystal_system(),
-                                               point_groups.trivial)
+                                               point_groups.trivial_permutation)
             pg_ops = _pg_int_matrices(pg_obj)
 
         families:  list[tuple] = []
@@ -1144,7 +1144,7 @@ class Material:
         mats_permutations = [p.astype(np.float32).reshape(-1) for p in permutations]
 
         self.point_group_matrices = np.stack(mats, axis=0)
-        self.point_group_permutations = np.stack(mats, axis=0)
+        self.point_group_permutations = np.stack(mats_permutations, axis=0)
         self.num_sym_ops = self.point_group_matrices.shape[0]
 
     @staticmethod

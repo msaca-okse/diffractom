@@ -15,7 +15,7 @@ in this document.
 
 # C1
 trivial = (
-    np.asarray([[1, 0, 0], [0, 1, 0], [0, 0, 1]]),  # I
+    R.from_matrix([[1, 0, 0], [0, 1, 0], [0, 0, 1]]),  # I
 )
 
 # C2
@@ -154,6 +154,11 @@ cubic = (
 )
 
 octahedral = cubic
+
+
+trivial_permutation = (
+    np.asarray([[1, 0, 0], [0, 1, 0], [0, 0, 1]]),  # I
+)
 
 
 cyclic_2_permutation = (
