@@ -50,9 +50,67 @@ __kernel void fista_fused_update(
         x[j] = v;
     }
 }
+
+// Per-work-group partial sums of x^2 (mode 0) or |x| (mode 1) into out[0 .. num_groups-1].
+// pyopencl's reductions (clarray.vdot, ReductionKernel) block the host until the queue is done,
+// which would keep a batch loop from running ahead of the GPU; this plain kernel does not.
+__kernel void partial_sums(
+    __global const float *x,
+    const ulong n,
+    const int mode,
+    __global float *out,
+    const ulong out_offset,
+    __local float *scratch
+){
+    float acc = 0.0f;
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        const float v = x[i];
+        acc += (mode == 0) ? v * v : fabs(v);
+    }
+    const int lid = get_local_id(0);
+    scratch[lid] = acc;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] += scratch[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) out[out_offset + get_group_id(0)] = scratch[0];
+}
 """
 
 PROX_CODES = {"nonneg": 0, "l1": 1, "nonneg_l1": 2}
+SUM_GROUPS, SUM_LOCAL = 256, 256
+
+
+class PartialSums:
+    """Sums of x^2 or |x| over several arrays, accumulated on the GPU without blocking the host:
+    add() enqueues a partial-sum kernel, total() reads all partials back once (reset() to reuse)."""
+
+    def __init__(self, fu, capacity):
+        self.fu = fu
+        self.capacity = capacity
+        self.buf = clarray.empty(fu.queue, (capacity * SUM_GROUPS,), np.float32)
+        self.count = 0
+
+    def reset(self):
+        self.count = 0
+        return self
+
+    def add(self, x_data, n, mode):
+        """Add the sum over the first n elements of the buffer x_data."""
+        assert self.count < self.capacity
+        f = self.fu
+        f.k_sums(f.queue, (SUM_GROUPS * SUM_LOCAL,), (SUM_LOCAL,), x_data, np.uint64(n), np.int32(mode),
+                 self.buf.data, np.uint64(self.count * SUM_GROUPS), cl.LocalMemory(4 * SUM_LOCAL))
+        self.count += 1
+
+    def total(self):
+        if self.count == 0:
+            return 0.0
+        return float(self.buf.get()[:self.count * SUM_GROUPS].astype(np.float64).sum())
+
+    def release(self):
+        self.buf.base_data.release()
 
 
 def fused_available(operator, prox_kind):
@@ -65,10 +123,13 @@ class FusedUpdate:
 
     def __init__(self, ctx, queue):
         self.queue = queue
-        self.k_update = cl.Program(ctx, FUSED_KERNEL).build().fista_fused_update
-        # sum |x| without a coefficient-sized temporary (diagnostic of the L1 term)
+        prg = cl.Program(ctx, FUSED_KERNEL).build()
+        self.k_update = prg.fista_fused_update
+        self.k_sums = prg.partial_sums
+        # sum |x| without a coefficient-sized temporary (diagnostic of the L1 term, once per iteration)
         self.abs_sum_kernel = ReductionKernel(ctx, np.float32, neutral="0", reduce_expr="a+b",
                                               map_expr="fabs(x[i])", arguments="__global const float *x")
+
         self._dummy_mask = clarray.zeros(queue, (1,), np.uint8)
 
     def batch_buffer(self, operator):
@@ -86,19 +147,20 @@ class FusedUpdate:
         use_mask = np.int32(support_gpu is not None)
         code = np.int32(PROX_CODES[prox_kind])
         lt = np.float32(lam * tau)
-        sq = []
+        if getattr(self, "_gsq", None) is None or self._gsq.capacity < len(operator.batches):
+            self._gsq = PartialSums(self, len(operator.batches))
+        sq = self._gsq.reset()
 
         def update(k0, Kb):
             n = npix * Kb
-            gb = g_batch[:n]
-            sq.append(clarray.vdot(gb, gb))
+            sq.add(g_batch.data, n, 0)
             gws, n64 = elementwise(n)
             self.k_update(q, gws, None, g_batch.data, x.data, y.data, mask.data, use_mask,
                           np.uint64(npix * k0), np.uint64(npix), n64,
                           np.float32(tau), np.float32(beta), lt, code)
 
         operator.adjoint_batches_cl(r, g_batch, update)
-        return float(sum(float(s.get()) for s in sq))
+        return sq.total()
 
     def abs_sum(self, x):
         return float(self.abs_sum_kernel(x).get())

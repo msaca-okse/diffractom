@@ -258,6 +258,36 @@ values, and returns it:
 - After the run, `solver.iter_stats` holds one dict per iteration and
   `solver.final_stats` holds a summary.
 
+#### Coefficients in host memory (streaming)
+
+If `x` is a NumPy array (shape `(Nx, Ny, K)`, float32, Fortran order) instead
+of a GPU array, `FISTAHuber.run` keeps the coefficient arrays (`x` and `y`) in
+host memory and streams them through the GPU one orientation batch at a time.
+The GPU then holds the data, the prediction/residual and a few batch-sized
+staging buffers, independent of K; host memory holds `x` (updated in place)
+and one more array of its size. Transfers overlap the computation (one upload
+and one download thread, pinned staging buffers, multi-threaded host copies).
+It needs the fused update (an element-wise prox). With large grids the cost is
+small: on a V100 with a 400 x 400 grid, 360 rotations, 360 eta bins and 14
+rings, an iteration costs 0.84 ms per orientation GPU-resident and 0.83-0.86 ms
+per orientation streamed, for K = 3000 up to K = 20000 (2 x 12.8 GB of
+coefficients). On small grids the transfers are relatively more expensive
+(+12 % on 99 x 99).
+
+```python
+op = SinglePhaseForwardOperator(cfg, mat, grid, max_gb=1.0, normalized=True,
+                                reserve_coefficient_arrays=0)  # no coefficient arrays on the GPU
+L = 1.1 * estimate_L_power_streamed(op, niter=6)
+x = np.zeros((op.Nx, op.Ny, op.K), np.float32, order="F")
+FISTAHuber(op, prox_kind="nonneg", L=L, huber_delta=100).run(x, b_gpu, niter=200, weights=w_gpu)
+```
+
+`reserve_coefficient_arrays` (default 3) is the number of coefficient-sized
+arrays the operator's default sparse-PF budget leaves room for on the GPU;
+pass 0 when streaming, so that the sparse PF matrix gets the memory.
+`estimate_L_power_streamed(op, niter, seed)` is `estimate_L_power` with its
+two coefficient-sized vectors in host memory. `FISTAL2` does not stream.
+
 ## `utils`
 
 | Module | Contents |

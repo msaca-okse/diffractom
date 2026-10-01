@@ -100,6 +100,7 @@ import pyopencl.clmath as clmath
 from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels, apply_support, support_mask_to_gpu
 from .launch import elementwise, pixel_orientation
 from .fused_update import FusedUpdate, fused_available
+from .streaming import Streamer
 
 from .prox_tv import (
     TVProxKernels,
@@ -127,7 +128,7 @@ class FISTAHuber:
     """
 
     def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50, huber_delta=1e-2,
-                 support="fov", fused=True):
+                 support="fov", fused=True, stream_threads=None):
         """Set up FISTA-Huber solver.
 
         Parameters
@@ -156,8 +157,12 @@ class FISTAHuber:
             coefficient-sized arrays (x, y) instead of four (x, y, x_old, grad). Used when the
             prox is element-wise ('nonneg', 'l1', 'nonneg_l1') and the operator provides
             adjoint_batches_cl; otherwise, or with fused=False, the unfused update runs.
+        stream_threads : int, optional
+            CPU threads for the host-side copies when the coefficients are streamed (x0 given
+            as a NumPy array to run()); default min(8, number of CPUs).
         """
         self.op = operator
+        self.stream_threads = stream_threads
         self.ctx = operator.ctx
         self.queue = operator.queue
         self.huber_delta = float(huber_delta)
@@ -256,7 +261,11 @@ class FISTAHuber:
         diagnostics_interval: int = 1,
     ):
         """
-        x0_gpu:   clarray (Nx, Ny, K) float32, order='F'
+        x0_gpu:   clarray (Nx, Ny, K) float32, order='F', or a NumPy array of that shape and
+                order: then x and y stay in host memory and are streamed through the GPU batch by
+                batch (streaming.py), so the GPU holds no coefficient-sized array. Needs the fused
+                update. The iterate is updated in place in the NumPy array (one more host array of
+                that size holds y during the run).
         out_gpu:  clarray (O, D, Nseg) float32, order='C'
         weights:  OPTIONAL clarray float32 with Nseg = N_eta * N_rings elements, C-contiguous,
                 e.g. shaped (N_eta, N_rings) or (Nseg,): one weight per segment (eta bin, ring),
@@ -267,16 +276,20 @@ class FISTAHuber:
         q = self.queue
 
         # ---- basic checks ----
-        if not isinstance(x0_gpu, clarray.Array) or not isinstance(out_gpu, clarray.Array):
-            raise TypeError("x0_gpu and out_gpu must be pyopencl.array.Array")
+        streamed = isinstance(x0_gpu, np.ndarray)
+        if streamed and not self.fused:
+            raise ValueError("streaming the coefficients (x0 as a NumPy array) needs the fused update: an "
+                             "element-wise prox ('nonneg', 'l1', 'nonneg_l1') and fused=True")
+        if not (streamed or isinstance(x0_gpu, clarray.Array)) or not isinstance(out_gpu, clarray.Array):
+            raise TypeError("x0_gpu must be a pyopencl.array.Array or a NumPy array, out_gpu a pyopencl.array.Array")
 
-        if x0_gpu.queue is None or out_gpu.queue is None:
+        if (not streamed and x0_gpu.queue is None) or out_gpu.queue is None:
             raise ValueError("Arrays must have a queue attached (created via clarray on a queue)")
 
         if x0_gpu.dtype != np.float32 or out_gpu.dtype != np.float32:
             raise TypeError("This FISTA assumes float32 arrays")
 
-        if x0_gpu.queue.context.int_ptr != self.ctx.int_ptr:
+        if not streamed and x0_gpu.queue.context.int_ptr != self.ctx.int_ptr:
             raise ValueError("x0_gpu context != operator context")
         if out_gpu.queue.context.int_ptr != self.ctx.int_ptr:
             raise ValueError("out_gpu context != operator context")
@@ -298,13 +311,30 @@ class FISTAHuber:
 
         # ---- persistent buffers ----
         # fused: x (current iterate) and y, plus one batch of the gradient;
-        # unfused: x, y, x_old and grad
-        x = x0_gpu
-        y = clarray.empty(q, x.shape, dtype=np.float32, order="F")
-        if self.fused:
+        # unfused: x, y, x_old and grad; streamed: x and y in host memory
+        streamer = None
+        if streamed:
+            streamer = Streamer(self.op, self.fused_update, self.stream_threads)
+            x_host = streamer.flat(x0_gpu)  # the iterate, updated in place in the caller's array
+            y_host = np.empty_like(x_host)
+            outside = None if self.support_gpu is None else ~self.support_gpu.get().astype(bool)
+
+            def init_batch(ib):  # start inside the support; y = x
+                xv = streamer.view(x_host, ib)
+                if outside is not None:
+                    xv.reshape(-1, outside.size)[:, outside] = 0.0
+                np.copyto(streamer.view(y_host, ib), xv)
+            list(streamer.pool.map(init_batch, range(len(self.op.batches))))
+            x = y = x_old = grad = None
+            g_batch = self.fused_update.batch_buffer(self.op)
+        elif self.fused:
+            x = x0_gpu
+            y = clarray.empty(q, x.shape, dtype=np.float32, order="F")
             x_old = grad = None
             g_batch = self.fused_update.batch_buffer(self.op)
         else:
+            x = x0_gpu
+            y = clarray.empty(q, x.shape, dtype=np.float32, order="F")
             x_old = clarray.empty(q, x.shape, dtype=np.float32, order="F")
             grad = clarray.empty(q, x.shape, dtype=np.float32, order="F")
             g_batch = None
@@ -321,12 +351,13 @@ class FISTAHuber:
             }
 
         # copy x0 -> y,x_old
-        if self.support_gpu is not None:  # start inside the support
-            apply_support(q, self.prox_kernels, x, self.support_gpu)
-        gws_x, n_x = elementwise(x.size)
-        self.k_copy_buf(q, gws_x, None, x.data, y.data, n_x)
-        if x_old is not None:
-            self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
+        if not streamed:
+            if self.support_gpu is not None:  # start inside the support
+                apply_support(q, self.prox_kernels, x, self.support_gpu)
+            gws_x, n_x = elementwise(x.size)
+            self.k_copy_buf(q, gws_x, None, x.data, y.data, n_x)
+            if x_old is not None:
+                self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
         gws_Ax, n_Ax = elementwise(out_gpu.size)
 
         Ax = None  # the prediction A(y), overwritten in place by the (weighted, clipped) residual
@@ -341,7 +372,10 @@ class FISTAHuber:
             if Ax is None:
                 Ax = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
 
-            self.op.direct_cl(y, Ax)
+            if streamed:
+                streamer.forward(y_host, Ax)
+            else:
+                self.op.direct_cl(y, Ax)
 
             # ---- r = w * (Ax - b), in place in Ax ----
             r = Ax
@@ -370,7 +404,12 @@ class FISTAHuber:
             beta = (t - 1.0) / t_new
 
             # NOTE: with weights, the gradient is A*( clip( w*(Ax-b) ) )
-            if self.fused:
+            if streamed:
+                # ---- as below, with x and y streamed from and to host memory ----
+                gsq, xsq, xabs = streamer.adjoint_update(x_host, y_host, r, g_batch, self.tau, beta,
+                                                         self.prox_kind, self.lam, self.support_gpu)
+                gnorm = float(np.sqrt(gsq))
+            elif self.fused:
                 # ---- grad = A*(r) batch by batch, each batch consumed by
                 #      x <- prox(y - tau*grad), y <- x + beta*(x - x_old) ----
                 gnorm = float(np.sqrt(self.fused_update.step(
@@ -406,7 +445,9 @@ class FISTAHuber:
             # ---- regularizer diagnostics ----
             gval = 0.0
             if self.prox_kind in ("l1", "nonneg_l1") and self.lam != 0.0:
-                if self.fused:
+                if streamed:
+                    gval = self.lam * xabs
+                elif self.fused:
                     gval = self.lam * self.fused_update.abs_sum(x)  # no coefficient-sized temporary
                 else:
                     gval = self.lam * float(clarray.sum(clmath.fabs(x)).get())
@@ -436,7 +477,7 @@ class FISTAHuber:
                 gval = self.lam * float(clarray.sum(b["div"]).get())
 
             obj = fval + gval
-            xnorm = float(np.sqrt(clarray.vdot(x, x).get()))
+            xnorm = float(np.sqrt(xsq if streamed else clarray.vdot(x, x).get()))
 
             tv_res = None
             if self.prox_kind == "nonneg_tv":
@@ -484,6 +525,10 @@ class FISTAHuber:
 
         # ---------------- GPU cleanup ----------------
         q.finish()
+        if streamed:
+            streamer.release()
+            del y_host
+            x = x0_gpu
 
         for arr in (y, x_old, grad, g_batch):
             if arr is not None:

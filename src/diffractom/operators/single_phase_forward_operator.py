@@ -38,6 +38,7 @@ class SinglePhaseForwardOperator:
         sparse_max_fill: float = 0.1,
         sparse_max_gb: float | None = None,
         projector: str = "native",
+        reserve_coefficient_arrays: int = 3,
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -83,7 +84,7 @@ class SinglePhaseForwardOperator:
             GPU memory budget (GB) for the sparse matrix, estimated from the first
             batch. Default (``default_sparse_budget_gb``): half of the memory left
             after reserving what a FISTA reconstruction needs besides the operator
-            (5 coefficient-sized and 4 data-sized arrays), the operator's own
+            (reserve_coefficient_arrays coefficient-sized and 2 data-sized arrays), the operator's own
             buffers and a 1 GB margin. The solver's arrays take priority: a large
             sparse matrix (e.g. a dense uniform grid) is not stored, and the dense
             path re-evaluates the PF matrix batch by batch instead.
@@ -93,9 +94,15 @@ class SinglePhaseForwardOperator:
             the orientations; ``"gratopy"`` uses gratopy. Both use the same
             discretisation (they agree to float32 rounding); the native one is
             2-8x faster for many orientations.
+        reserve_coefficient_arrays : int
+            Coefficient-sized (Nx, Ny, K) arrays the default sparse-PF budget leaves room for
+            on the GPU: 3 (default) for FISTA with the fused update (2 arrays and a margin),
+            0 when the solver streams the coefficients from host memory.
         **kwargs
             Override any cfg key (e.g. ``N_Omega=50``).
         """
+
+        self.reserve_coefficient_arrays = int(reserve_coefficient_arrays)
 
         # --- context / queue ---
         if ctx is not None and queue is not None:
@@ -651,10 +658,11 @@ class SinglePhaseForwardOperator:
     def default_sparse_budget_gb(self):
         """
         Default GPU memory budget (GB) for the sparse PF matrix: half of what is
-        left of the device memory after a reserve for the solver (FISTA with the
-        fused update keeps 2 arrays of the coefficient size (Nx, Ny, K), reserved
-        with one more as a margin, and 2 of the data size (N_Omega, My, N_seg):
-        the data and the prediction/residual), the operator's
+        left of the device memory after a reserve for the solver
+        (reserve_coefficient_arrays arrays of the coefficient size (Nx, Ny, K): 3 by
+        default, for FISTA with the fused update, 0 when the coefficients are streamed
+        from host memory; and 2 of the data size (N_Omega, My, N_seg): the data and
+        the prediction/residual), the operator's
         buffers and a 1 GB margin. Conservative on purpose: the GPU may be
         shared, and the solver's arrays take priority.
         """
@@ -664,7 +672,8 @@ class SinglePhaseForwardOperator:
         if buffers is None:  # (only computed with verbose=True)
             buffers = 4 * self.K_batch_max * (self.N_Omega * self.My + self.Nx * self.Ny
                                               + self.N_Omega * self.N_eta * self.N_peaks)
-        free = self.queue.device.global_mem_size - 3 * coeff_bytes - 2 * data_bytes - buffers - 1024**3
+        free = (self.queue.device.global_mem_size - self.reserve_coefficient_arrays * coeff_bytes
+                - 2 * data_bytes - buffers - 1024**3)
         return 0.5 * max(free, 0) / 1024**3
 
 
@@ -766,50 +775,55 @@ class SinglePhaseForwardOperator:
         data : clarray, (N_Omega, My, N_seg), C-order — overwritten.
         """
         data.fill(0.0)
+        for ib, b in enumerate(self.batches):
+            self._direct_batch(coeffs, b["k_start"], self.K, ib, data)
 
+    def _direct_batch(self, src, k_src, K_src, ib, data):
+        """Add the forward projection of orientation batch ib to data. The batch's coefficients
+        are orientations k_src .. k_src+Kb-1 of src, an (Nx, Ny, K_src) Fortran-order array
+        (the full coefficient array, or a batch-sized staging buffer with k_src = 0)."""
+        b = self.batches[ib]
+        k0 = b["k_start"]
+        Kb = b["K_batch"]
         R = int(self.N_Omega)
         CP = int(self.N_eta * self.N_peaks)
         Kmax = self.K_batch_max
         My = self.My
-        sparse = self.pf_mode == "sparse"
 
-        for ib, b in enumerate(self.batches):
-            k0 = b["k_start"]
-            Kb = b["K_batch"]
+        # 1) Radon transform of this batch -> coeffs_sino_C (R, My, Kmax)
+        if self.projector == "native":
+            self.radon.gather(src, self._img_k, k_src, Kb, Kmax)
+            self.radon.forward(self._img_k, self.coeffs_sino_C, Kmax)
+        else:
+            self._radon_gratopy_forward(src, k_src, Kb, K_src)
 
-            # 1) Radon transform of this batch -> coeffs_sino_C (R, My, Kmax)
-            if self.projector == "native":
-                self.radon.gather(coeffs, self._img_k, k0, Kb, Kmax)
-                self.radon.forward(self._img_k, self.coeffs_sino_C, Kmax)
-            else:
-                self._radon_gratopy_forward(coeffs, k0, Kb)
-
-            # 2) PF matrix product, accumulated into data
-            if sparse:
-                sb = self.sparse_batches[ib]
-                self.k.spmm_pf_forward_c(
-                    self.queue,
-                    (CP, My, R),
-                    None,
-                    self.coeffs_sino_C.data,
-                    sb["row_ptr_f"].data,
-                    sb["col_k"].data,
-                    sb["val_f"].data,
-                    data.data,
-                    np.int32(R),
-                    np.int32(My),
-                    np.int32(CP),
-                    np.int32(Kmax),
-                )
-            else:
-                self._dense_pf_batch(k0, Kb)
-                batched_gemm_clblast(self.queue, self.coeffs_sino_C, self._basis_batch_kmax.reshape((R, Kmax, CP)),
-                                     data, R=R, M=My, K=Kmax, N=CP)
+        # 2) PF matrix product, accumulated into data
+        if self.pf_mode == "sparse":
+            sb = self.sparse_batches[ib]
+            self.k.spmm_pf_forward_c(
+                self.queue,
+                (CP, My, R),
+                None,
+                self.coeffs_sino_C.data,
+                sb["row_ptr_f"].data,
+                sb["col_k"].data,
+                sb["val_f"].data,
+                data.data,
+                np.int32(R),
+                np.int32(My),
+                np.int32(CP),
+                np.int32(Kmax),
+            )
+        else:
+            self._dense_pf_batch(k0, Kb)
+            batched_gemm_clblast(self.queue, self.coeffs_sino_C, self._basis_batch_kmax.reshape((R, Kmax, CP)),
+                                 data, R=R, M=My, K=Kmax, N=CP)
 
 
 
-    def _radon_gratopy_forward(self, coeffs, k0, Kb):
-        """gratopy forward projection of orientations k0 .. k0+Kb-1 into coeffs_sino_C."""
+    def _radon_gratopy_forward(self, coeffs, k0, Kb, Ktot=None):
+        """gratopy forward projection of orientations k0 .. k0+Kb-1 of coeffs, an (Nx, Ny, Ktot)
+        Fortran-order array (Ktot: default K), into coeffs_sino_C."""
         Nx, Ny, My, R, Kmax = self.Nx, self.Ny, self.My, self.N_Omega, self.K_batch_max
         self._coeffs_batch_F.fill(0.0)
         self.coeffs_sino_F.fill(0.0)
@@ -817,7 +831,7 @@ class SinglePhaseForwardOperator:
         self.k.SLICE_COEFFS_K_BATCH_F(
             self.queue, (total,), None,
             coeffs.data, self._coeffs_batch_F.data,
-            np.int32(Nx), np.int32(Ny), np.int32(self.K), np.int32(Kb), np.int32(k0),
+            np.int32(Nx), np.int32(Ny), np.int32(self.K if Ktot is None else Ktot), np.int32(Kb), np.int32(k0),
         )
         gratopy.forwardprojection(self._coeffs_batch_F, self.PS, sino=self.coeffs_sino_F)
         total = R * My * Kmax
@@ -1133,7 +1147,8 @@ def estimate_L_power(
         L_est = num / den
 
         znorm = float(np.sqrt(clarray.vdot(z, z).get()) + eps)
-        x[:] = z * np.float32(1.0 / znorm)
+        z *= np.float32(1.0 / znorm)  # in place: no third coefficient-sized array
+        x, z = z, x
         q.finish()
 
         if verbose:
