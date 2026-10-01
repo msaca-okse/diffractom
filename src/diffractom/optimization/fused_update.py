@@ -19,7 +19,7 @@ from .launch import elementwise
 # Same arithmetic, in the same order, as grad_step + prox_* + apply_support + extrapolate.
 FUSED_KERNEL = r"""
 __kernel void fista_fused_update(
-    __global const float *g,          // gradient of this batch: (Npix, Kb), Fortran order
+    __global const float *g,          // gradient of this batch: (Kb, Ny, Nx), C order
     __global float *x,                // current iterate (x_old on entry, x_new on exit), whole array
     __global float *y,                // extrapolated point, whole array
     __global const uchar *mask,       // (Npix,) support, used if use_mask

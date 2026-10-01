@@ -40,7 +40,7 @@ class _Pinned:
 
 
 class Streamer:
-    """Batch-wise transfers of host coefficient arrays (Nx, Ny, K), Fortran order, and the two
+    """Batch-wise transfers of host coefficient arrays (K, Ny, Nx), C order, and the two
     coefficient passes of a fused FISTA iteration."""
 
     def __init__(self, op, fused_update=None, n_threads=None):
@@ -50,7 +50,7 @@ class Streamer:
         self.tq_dn = cl.CommandQueue(op.ctx, op.queue.device)
         self.fu = fused_update
         self.npix = op.Nx * op.Ny
-        self.shape = (op.Nx, op.Ny, op.K)
+        self.shape = (op.K, op.Ny, op.Nx)
         n = self.npix * op.K_batch_max
         dev = lambda: clarray.empty(self.q, (n,), np.float32)
         self.xs, self.ys = [dev(), dev()], [dev(), dev()]  # device staging slots
@@ -67,9 +67,9 @@ class Streamer:
     # ---------------------------------------------------------------- helpers
     def flat(self, x):
         x = np.asarray(x)
-        if x.shape != self.shape or x.dtype != np.float32 or not x.flags.f_contiguous:
-            raise ValueError(f"expected a Fortran-ordered float32 array of shape {self.shape}")
-        return x.ravel(order="F")
+        if x.shape != self.shape or x.dtype != np.float32 or not x.flags.c_contiguous:
+            raise ValueError(f"expected a C-contiguous float32 array of shape {self.shape}")
+        return x.reshape(-1)  # a view
 
     def view(self, flat, ib):
         b = self.op.batches[ib]
@@ -92,7 +92,7 @@ class Streamer:
 
     # ---------------------------------------------------------------- passes
     def forward(self, src_flat, data):
-        """data = A(src) for a host coefficient array (flattened, Fortran order)."""
+        """data = A(src) for a host coefficient array (flattened (K, Ny, Nx))."""
         op, q = self.op, self.q
         nb = len(op.batches)
         data.fill(0.0)
@@ -172,7 +172,7 @@ class Streamer:
         return gsq.total(), xsq.total(), (xabs.total() if want_l1 else 0.0)
 
     def adjoint_to_host(self, r, z_flat):
-        """z = A^T r, batch by batch into a host array (flattened, Fortran order); the downloads
+        """z = A^T r, batch by batch into a host array (flattened (K, Ny, Nx)); the downloads
         run in the download thread (see adjoint_update)."""
         op, q = self.op, self.q
         nb = len(op.batches)

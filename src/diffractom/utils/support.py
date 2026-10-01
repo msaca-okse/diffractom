@@ -31,18 +31,19 @@ def fov_support_mask(Nx, Ny, n_detectors, angles=None, image_width=None, detecto
 
     Returns
     -------
-    (Nx, Ny) bool array, True where the pixel centre projects onto the detector at every angle.
+    (Ny, Nx) bool array, mask[iy, ix] (the layout of a coefficient image), True where the pixel
+    centre projects onto the detector at every angle.
     """
     image_width = float(Nx if image_width is None else image_width)
     detector_width = float(n_detectors if detector_width is None else detector_width)
     delta_x = image_width / max(Nx, Ny)
-    x = (np.arange(Nx) - (Nx - 1) / 2.0)[:, None] * delta_x
-    y = (np.arange(Ny) - (Ny - 1) / 2.0)[None, :] * delta_x
+    x = (np.arange(Nx) - (Nx - 1) / 2.0)[None, :] * delta_x
+    y = (np.arange(Ny) - (Ny - 1) / 2.0)[:, None] * delta_x
     half = detector_width / 2.0
     if angles is None:
         return x ** 2 + y ** 2 <= (half - abs(float(detector_shift))) ** 2
 
-    mask = np.ones((Nx, Ny), dtype=bool)
+    mask = np.ones((Ny, Nx), dtype=bool)
     for a in np.asarray(angles, dtype=np.float64):
         # detector coordinate of the pixel centre relative to the detector centre (ParallelRadon)
         t = np.cos(a - 0.5 * np.pi) * x + np.sin(a - 0.5 * np.pi) * y - detector_shift

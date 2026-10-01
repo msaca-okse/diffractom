@@ -30,12 +30,20 @@ reinterpolation functions (`build_interpolation_kernelSO3`, `interpolateSO3`,
 
 | Array | Shape | Memory order |
 |-------|-------|--------------|
-| Coefficients `x` | `(Nx, Ny, K)` | Fortran (`order="F"`) |
+| Coefficients `x` | `(K, Ny, Nx)`: `x[k]` is the image of orientation k (rows y, columns x) | C |
 | Data `b` (single-phase operator) | `(N_Omega, My, N_eta * N_rings)`, i.e. `(N_Omega, My, N_eta, N_rings)` flattened with rings fastest | C |
 | Data `b` (multi-phase operator) | `(N_Omega, My, N_eta * N_theta)` with `N_theta` detector 2θ bins | C |
 
-All arrays are float32 `pyopencl.array.Array` objects on the operator's queue
-(`op.queue`). K is the number of active leaf nodes of the orientation grid.
+| Weights (FISTAHuber) | `N_eta * N_rings` elements, e.g. `(N_eta, N_rings)` | C |
+| Support mask | `(Ny, Nx)`, boolean | C |
+
+All arrays are float32 and C-contiguous; `op.coeff_shape` and `op.data_shape`
+give the shapes. K is the number of active leaf nodes of the orientation grid.
+The solvers and `direct` / `adjoint` take NumPy arrays (converted to
+C-contiguous float32 if needed; the coefficients are then streamed through the
+GPU, see below) or `pyopencl.array.Array` objects on the operator's queue
+(`op.queue`), which must already be C-contiguous float32 of the right shape;
+otherwise a `ValueError` or `TypeError` says what is wrong.
 
 ## Configuration (`cfg`)
 
@@ -123,9 +131,12 @@ tetragonal, hexagonal and cubic → the group of the same name. Note that
 
 All operators share the same interface:
 
-- `direct(x)` returns a new data array;
+- `direct(x)` returns a new data array: a NumPy array for a NumPy `x` (the
+  coefficients are streamed to the GPU batch by batch), a pyopencl array for a
+  pyopencl `x`;
 - `direct_cl(x, b)` writes the result of the forward operator into `b`;
-- `adjoint(b)` returns a new coefficient array;
+- `adjoint(b)` returns a new coefficient array, NumPy for a NumPy `b` (streamed
+  back batch by batch), pyopencl for a pyopencl `b`;
 - `adjoint_cl(b, x)` writes the result of the adjoint into `x`;
 - `adjoint_batches_cl(b, out_batch, update)` computes the adjoint one orientation
   batch at a time into a batch-sized buffer and calls `update(k0, Kb)` after each
@@ -167,7 +178,7 @@ and azimuthal bin. Arguments:
   orientations.
 - `verbose`: prints a summary of the GPU buffers.
 
-`support_mask()` returns the `(Nx, Ny)` field-of-view mask used by the solvers.
+`support_mask()` returns the `(Ny, Nx)` field-of-view mask used by the solvers.
 
 Array indices are 64-bit, so the coefficient and data arrays may exceed 2³¹
 elements. A single orientation batch must stay below 2³¹ elements, and the
@@ -178,7 +189,7 @@ operator raises an error that asks for a lower `max_gb` otherwise.
 Several materials, each with its own orientation grid. The pole-figure values
 of every reflection are convolved with a Gaussian of width `cfg["peak_width"]`
 (degrees; change it with `set_peak_width`) onto the detector 2θ bins
-`two_thetas` (degrees). The coefficient array has shape `(Nx, Ny, K_sum)`,
+`two_thetas` (degrees). The coefficient array has shape `(K_sum, Ny, Nx)`,
 with the coefficients of the materials one after the other.
 
 ### `BulkTextureForwardOperator(cfg, material, grid, max_gb, ...)`
@@ -218,7 +229,7 @@ need an upper bound, so pass a margin, e.g. `L=1.1 * estimate_L_power(op)`.
 
 ```python
 solver = FISTAHuber(op, prox_kind="nonneg", lam=0.0, L=1.1 * L_est, huber_delta=30)
-solver.run(x_gpu, b_gpu, niter=100, weights=w_gpu, verbose=1, diagnostics_interval=10)
+x = solver.run(x, b, niter=100, weights=w, verbose=1, diagnostics_interval=10)
 ```
 
 The constructor arguments are:
@@ -234,7 +245,7 @@ The constructor arguments are:
     field-of-view disk, i.e. it assumes that the sample stays in the beam
     during the scan.
   - `None` disables the constraint.
-  - An `(Nx, Ny)` boolean array gives a custom support.
+  - An `(Ny, Nx)` boolean array gives a custom support.
 - `fused` (default `True`): fuse the gradient step, the prox and the momentum
   update into the adjoint, one orientation batch at a time. Each batch of the
   gradient is consumed as soon as it is computed, so the solver keeps two
@@ -244,12 +255,16 @@ The constructor arguments are:
   `adjoint_batches_cl` (`SinglePhaseForwardOperator`); otherwise the unfused
   update runs.
 
-`run(x, b, niter, ...)` updates `x` in place, starting from its current
-values, and returns it:
+`run(x, b, niter, ...)` starts from the current values of `x` and returns
+the solution. A NumPy `x` streams the coefficients from host memory (below)
+and is updated in place if it is C-contiguous float32 (otherwise a converted
+copy is updated and returned); a pyopencl `x` keeps everything on the GPU and
+is updated in place. `b` may be a NumPy array (uploaded for the run) or a
+pyopencl array.
 
 - `weights` (`FISTAHuber` only) holds one weight per segment, i.e. per
-  (eta bin, ring): a C-contiguous float32 array with `N_eta * N_rings`
-  elements, e.g. shaped `(N_eta, N_rings)`. The same weights apply to every
+  (eta bin, ring): `N_eta * N_rings` elements, e.g. shaped `(N_eta, N_rings)`,
+  a NumPy or a C-contiguous float32 pyopencl array. The same weights apply to every
   rotation and translation, so the array is small. Zero weights exclude
   segments, e.g. the eta bins along the rotation axis or gaps between
   detector modules. The residual is computed in place in the prediction
@@ -260,7 +275,7 @@ values, and returns it:
 
 #### Coefficients in host memory (streaming)
 
-If `x` is a NumPy array (shape `(Nx, Ny, K)`, float32, Fortran order) instead
+If `x` is a NumPy array (shape `(K, Ny, Nx)`, float32) instead
 of a GPU array, `FISTAHuber.run` keeps the coefficient arrays (`x` and `y`) in
 host memory and streams them through the GPU one orientation batch at a time.
 The GPU then holds the data, the prediction/residual and a few batch-sized
@@ -278,15 +293,15 @@ coefficients). On small grids the transfers are relatively more expensive
 op = SinglePhaseForwardOperator(cfg, mat, grid, max_gb=1.0, normalized=True,
                                 reserve_coefficient_arrays=0)  # no coefficient arrays on the GPU
 L = 1.1 * estimate_L_power_streamed(op, niter=6)
-x = np.zeros((op.Nx, op.Ny, op.K), np.float32, order="F")
-FISTAHuber(op, prox_kind="nonneg", L=L, huber_delta=100).run(x, b_gpu, niter=200, weights=w_gpu)
+x = np.zeros(op.coeff_shape, np.float32)
+x = FISTAHuber(op, prox_kind="nonneg", L=L, huber_delta=100).run(x, b, niter=200, weights=w)
 ```
 
 `reserve_coefficient_arrays` (default 3) is the number of coefficient-sized
 arrays the operator's default sparse-PF budget leaves room for on the GPU;
 pass 0 when streaming, so that the sparse PF matrix gets the memory.
 `estimate_L_power_streamed(op, niter, seed)` is `estimate_L_power` with its
-two coefficient-sized vectors in host memory. `FISTAL2` does not stream.
+two coefficient-sized vectors in host memory. `FISTAL2` streams the same way.
 
 ## `utils`
 

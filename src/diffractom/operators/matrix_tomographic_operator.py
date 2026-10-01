@@ -6,6 +6,7 @@ import pyopencl.array as clarray
 import gratopy
 from pyclblast import gemmStridedBatched
 from .pf_kernels import build_pfo_program
+from ..utils.arrays import check_device
 
 
 class MatrixTomographicOperator:
@@ -155,12 +156,21 @@ class MatrixTomographicOperator:
         print("=======================================\n")
         self.total_bytes = total_bytes
 
+    @property
+    def coeff_shape(self):
+        """Shape of a coefficient array, (K, Ny, Nx): coeffs[k] is the image of channel k."""
+        return (self.K, self.Ny, self.Nx)
+
+    @property
+    def data_shape(self):
+        return (self.N_Omega, self.My, self.N_seg)
+
     def direct(self, coeffs):
         """Forward operator: data = B @ P(coeffs).
 
         Parameters
         ----------
-        coeffs : clarray, shape (Nx, Ny, K), F-order
+        coeffs : clarray, shape (K, Ny, Nx), C-contiguous float32
 
         Returns
         -------
@@ -180,14 +190,16 @@ class MatrixTomographicOperator:
 
         Parameters
         ----------
-        coeffs : clarray, shape (Nx, Ny, K), F-order
-        data   : clarray, shape (N_Omega, My, N_seg), C-order — overwritten.
+        coeffs : clarray, shape (K, Ny, Nx), C-contiguous float32
+        data   : clarray, shape (N_Omega, My, N_seg), C-contiguous float32 — overwritten.
         """
+        check_device(coeffs, self.coeff_shape, "coeffs")
+        check_device(data, self.data_shape, "data")
         self.sino_F.fill(0.0)
         self.sino_C.fill(0.0)
 
-        # 1) Tomographic projection: (Nx, Ny, K) F -> (My, N_Omega, K) F
-        gratopy.forwardprojection(coeffs, self.PS, sino=self.sino_F)
+        # 1) Tomographic projection: (Nx, Ny, K) F (the same memory as (K, Ny, Nx) C) -> (My, N_Omega, K) F
+        gratopy.forwardprojection(coeffs.transpose((2, 1, 0)), self.PS, sino=self.sino_F)
 
         # 2) Transpose: (My, N_Omega, K) F -> (N_Omega, My, K) C
         total = self.N_Omega * self.My * self.K
@@ -227,14 +239,9 @@ class MatrixTomographicOperator:
 
         Returns
         -------
-        coeffs : clarray, shape (Nx, Ny, K), F-order
+        coeffs : clarray, shape (K, Ny, Nx), C order
         """
-        coeffs = clarray.zeros(
-            self.queue,
-            (self.Nx, self.Ny, self.K),
-            dtype=np.float32,
-            order="F",
-        )
+        coeffs = clarray.zeros(self.queue, self.coeff_shape, dtype=np.float32)
         self.adjoint_cl(data, coeffs)
         return coeffs
 
@@ -244,8 +251,10 @@ class MatrixTomographicOperator:
         Parameters
         ----------
         data   : clarray, shape (N_Omega, My, N_seg), C-order
-        coeffs : clarray, shape (Nx, Ny, K), F-order — overwritten.
+        coeffs : clarray, shape (K, Ny, Nx), C-contiguous float32 — overwritten.
         """
+        check_device(data, self.data_shape, "data")
+        check_device(coeffs, self.coeff_shape, "coeffs")
         coeffs.fill(0.0)
         self.sino_C.fill(0.0)
         self.sino_F.fill(0.0)
@@ -279,8 +288,8 @@ class MatrixTomographicOperator:
             np.int32(total),
         )
 
-        # 3) Backprojection: (My, N_Omega, K) F -> (Nx, Ny, K) F
-        gratopy.backprojection(self.sino_F, self.PS, img=coeffs)
+        # 3) Backprojection: (My, N_Omega, K) F -> (Nx, Ny, K) F, the same memory as (K, Ny, Nx) C
+        gratopy.backprojection(self.sino_F, self.PS, img=coeffs.transpose((2, 1, 0)))
 
     def estimate_L_power(self, niter=20, seed=0, eps=1e-30, verbose=1):
         """Estimate the Lipschitz constant L = ||A^T A|| via power iteration.
@@ -306,11 +315,12 @@ class MatrixTomographicOperator:
         q = self.queue
         rng = np.random.default_rng(seed)
 
-        x = clarray.empty(q, (self.Nx, self.Ny, self.K), np.float32, order="F")
+        x = clarray.empty(q, self.coeff_shape, np.float32)
         Ax = clarray.empty(q, (self.N_Omega, self.My, self.N_seg), np.float32, order="C")
-        z = clarray.empty(q, x.shape, np.float32, order="F")
+        z = clarray.empty(q, x.shape, np.float32)
 
-        x_host = rng.standard_normal(x.shape).astype(np.float32, copy=False, order="F")
+        # drawn as (Nx, Ny, K), pixel fastest: the same start as before the (K, Ny, Nx) layout
+        x_host = np.ascontiguousarray(rng.standard_normal((self.Nx, self.Ny, self.K)).astype(np.float32).transpose(2, 1, 0))
         cl.enqueue_copy(q, x.data, x_host)
         q.finish()
 
@@ -329,7 +339,8 @@ class MatrixTomographicOperator:
             L_est = num / den
 
             znorm = float(np.sqrt(clarray.vdot(z, z).get()) + eps)
-            x[:] = z * np.float32(1.0 / znorm)
+            z *= np.float32(1.0 / znorm)  # in place: no third coefficient-sized array
+            x, z = z, x
             q.finish()
 
             if verbose:

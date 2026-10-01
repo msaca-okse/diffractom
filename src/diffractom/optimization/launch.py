@@ -5,7 +5,7 @@ Element-wise kernels loop over their elements in grid-stride fashion,
     for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) ...
 
 so arrays of any size, including beyond 2^31 elements, are covered by a bounded number of work items.
-Kernels that need the pixel of an (Nx, Ny, K) Fortran-order array run on a (pixel, orientation) range
+Kernels that need the pixel of a (K, Ny, Nx) C-order array run on a (pixel, orientation) range
 with the orientations strided, which avoids 64-bit division.
 """
 import numpy as np
@@ -21,6 +21,6 @@ def elementwise(n):
 
 
 def pixel_orientation(npix, K):
-    """Global size of a kernel over an (Nx, Ny, K) Fortran-order array: pixels on axis 0,
+    """Global size of a kernel over a (K, Ny, Nx) C-order array: pixels on axis 0,
     orientations strided over axis 1."""
     return (max(int(npix), 1), max(min(int(K), MAX_K_WORK_ITEMS), 1))

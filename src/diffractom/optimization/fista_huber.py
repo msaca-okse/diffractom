@@ -101,6 +101,7 @@ from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels, apply_suppo
 from .launch import elementwise, pixel_orientation
 from .fused_update import FusedUpdate, fused_available
 from .streaming import Streamer
+from ..utils.arrays import prepare_inputs
 
 from .prox_tv import (
     TVProxKernels,
@@ -123,7 +124,7 @@ class FISTAHuber:
     Solve: min_x 0.5||A x - b||^2 + g(x)
     with FISTA on GPU.
 
-    x layout: (Nx, Ny, K) Fortran (but we treat it as flat for kernels)
+    x layout: (K, Ny, Nx) C order (the kernels treat it as flat)
     Ax layout: (O, D, Nseg) C
     """
 
@@ -146,7 +147,7 @@ class FISTAHuber:
             Inner iterations for TV proximal operator.
         huber_delta : float
             Huber loss transition threshold.
-        support : "fov", None or (Nx, Ny) bool array
+        support : "fov", None or (Ny, Nx) bool array
             Support constraint, applied after the proximal operator: the coefficients
             of pixels outside the support are set to zero. "fov" (default) is the disk
             seen by the detector at every angle (operator.support_mask()), i.e. the
@@ -261,53 +262,28 @@ class FISTAHuber:
         diagnostics_interval: int = 1,
     ):
         """
-        x0_gpu:   clarray (Nx, Ny, K) float32, order='F', or a NumPy array of that shape and
-                order: then x and y stay in host memory and are streamed through the GPU batch by
-                batch (streaming.py), so the GPU holds no coefficient-sized array. Needs the fused
-                update. The iterate is updated in place in the NumPy array (one more host array of
-                that size holds y during the run).
-        out_gpu:  clarray (O, D, Nseg) float32, order='C'
-        weights:  OPTIONAL clarray float32 with Nseg = N_eta * N_rings elements, C-contiguous,
-                e.g. shaped (N_eta, N_rings) or (Nseg,): one weight per segment (eta bin, ring),
-                shared by all rotations and translations. The residual of a data point in
-                segment j is multiplied by weights[j]; zero weight excludes the segment.
-        returns x_gpu solution (same layout as x0_gpu)
+        x0_gpu:   the starting point, (K, Ny, Nx) float32 (coeffs[k] is the image of orientation k):
+                a NumPy array: x and y stay in host memory and are streamed through the GPU batch by
+                batch (streaming.py), so the GPU holds no coefficient-sized array (needs the fused
+                update). The iterate is updated in place if x0_gpu is C-contiguous float32,
+                otherwise in a converted copy; either way run() returns it.
+                Or a pyopencl array, C-contiguous float32: everything stays on the GPU.
+        out_gpu:  the data b, (N_Omega, My, N_seg) float32: a NumPy array (converted to C-contiguous
+                float32 and uploaded) or a C-contiguous pyopencl array.
+        weights:  OPTIONAL, N_seg = N_eta * N_rings elements, e.g. shaped (N_eta, N_rings): one weight
+                per segment (eta bin, ring), shared by all rotations and translations; the residual
+                of a data point in segment j is multiplied by weights[j], zero weight excludes the
+                segment. A NumPy array or a C-contiguous float32 pyopencl array.
+        returns the solution: the NumPy array (streamed) or x0_gpu (on the GPU)
         """
         q = self.queue
 
-        # ---- basic checks ----
-        streamed = isinstance(x0_gpu, np.ndarray)
+        # ---- inputs: shapes, dtype, layout; NumPy data and weights are uploaded ----
+        streamed, x0_gpu, out_gpu, weights, uploaded = prepare_inputs(self.op, q, x0_gpu, out_gpu, weights)
         if streamed and not self.fused:
             raise ValueError("streaming the coefficients (x0 as a NumPy array) needs the fused update: an "
                              "element-wise prox ('nonneg', 'l1', 'nonneg_l1') and fused=True")
-        if not (streamed or isinstance(x0_gpu, clarray.Array)) or not isinstance(out_gpu, clarray.Array):
-            raise TypeError("x0_gpu must be a pyopencl.array.Array or a NumPy array, out_gpu a pyopencl.array.Array")
-
-        if (not streamed and x0_gpu.queue is None) or out_gpu.queue is None:
-            raise ValueError("Arrays must have a queue attached (created via clarray on a queue)")
-
-        if x0_gpu.dtype != np.float32 or out_gpu.dtype != np.float32:
-            raise TypeError("This FISTA assumes float32 arrays")
-
-        if not streamed and x0_gpu.queue.context.int_ptr != self.ctx.int_ptr:
-            raise ValueError("x0_gpu context != operator context")
-        if out_gpu.queue.context.int_ptr != self.ctx.int_ptr:
-            raise ValueError("out_gpu context != operator context")
-
-        # ---- optional weights checks ----
         use_weights = weights is not None
-        if use_weights:
-            if not isinstance(weights, clarray.Array):
-                raise TypeError("weights must be a pyopencl.array.Array or None")
-            if weights.queue is None:
-                raise ValueError("weights must have a queue attached")
-            if weights.dtype != np.float32:
-                raise TypeError("weights must be float32")
-            if weights.queue.context.int_ptr != self.ctx.int_ptr:
-                raise ValueError("weights context != operator context")
-            if weights.size != out_gpu.shape[-1] or not weights.flags.c_contiguous:
-                raise ValueError(f"weights must be C-contiguous with N_eta * N_rings = {out_gpu.shape[-1]} "
-                                 f"elements, one per segment; got shape {weights.shape}")
 
         # ---- persistent buffers ----
         # fused: x (current iterate) and y, plus one batch of the gradient;
@@ -315,7 +291,7 @@ class FISTAHuber:
         streamer = None
         if streamed:
             streamer = Streamer(self.op, self.fused_update, self.stream_threads)
-            x_host = streamer.flat(x0_gpu)  # the iterate, updated in place in the caller's array
+            x_host = streamer.flat(x0_gpu)  # the iterate, updated in place
             y_host = np.empty_like(x_host)
             outside = None if self.support_gpu is None else ~self.support_gpu.get().astype(bool)
 
@@ -329,25 +305,25 @@ class FISTAHuber:
             g_batch = self.fused_update.batch_buffer(self.op)
         elif self.fused:
             x = x0_gpu
-            y = clarray.empty(q, x.shape, dtype=np.float32, order="F")
+            y = clarray.empty(q, x.shape, dtype=np.float32)
             x_old = grad = None
             g_batch = self.fused_update.batch_buffer(self.op)
         else:
             x = x0_gpu
-            y = clarray.empty(q, x.shape, dtype=np.float32, order="F")
-            x_old = clarray.empty(q, x.shape, dtype=np.float32, order="F")
-            grad = clarray.empty(q, x.shape, dtype=np.float32, order="F")
+            y = clarray.empty(q, x.shape, dtype=np.float32)
+            x_old = clarray.empty(q, x.shape, dtype=np.float32)
+            grad = clarray.empty(q, x.shape, dtype=np.float32)
             g_batch = None
 
         # TV buffers: allocate once per run, reuse each iter
         if self.prox_kind == "nonneg_tv":
             self._tv_buffers = {
-                "y":  clarray.empty(q, x.shape, np.float32, order="F"),
-                "gx": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "gy": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "px": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "py": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "div": clarray.zeros(q, x.shape, np.float32, order="F"),
+                "y":  clarray.empty(q, x.shape, np.float32),
+                "gx": clarray.zeros(q, x.shape, np.float32),
+                "gy": clarray.zeros(q, x.shape, np.float32),
+                "px": clarray.zeros(q, x.shape, np.float32),
+                "py": clarray.zeros(q, x.shape, np.float32),
+                "div": clarray.zeros(q, x.shape, np.float32),
             }
 
         # copy x0 -> y,x_old
@@ -416,7 +392,7 @@ class FISTAHuber:
                     self.op, r, x, y, g_batch, self.tau, beta, self.prox_kind, self.lam, self.support_gpu)))
             else:
                 # ---- grad = A*(r) ----
-                self.op.adjoint_cl(r, grad)  # (Nx,Ny,K) Fortran
+                self.op.adjoint_cl(r, grad)  # (K, Ny, Nx)
 
                 # ---- v = y - tau*grad ----
                 self.k_grad_step(
@@ -454,7 +430,7 @@ class FISTAHuber:
 
             elif self.prox_kind == "nonneg_tv" and self.lam != 0.0:
                 b = self._tv_buffers
-                Nx, Ny, K = map(int, x.shape)
+                K, Ny, Nx = map(int, x.shape)
 
                 self.tv_kernels.k_grad(
                     q, pixel_orientation(Nx * Ny, K), None,
@@ -536,6 +512,8 @@ class FISTAHuber:
 
         if Ax is not None:
             Ax.base_data.release()
+        for arr in uploaded:  # data and weights uploaded from NumPy arrays
+            arr.base_data.release()
 
         if self.prox_kind == "nonneg_tv":
             for arr in self._tv_buffers.values():
