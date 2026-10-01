@@ -12,6 +12,7 @@ from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
 from .pf_kernels import build_all_opencl
 from ..utils.support import fov_support_mask
+from ..utils.arrays import check_device
 
 
 
@@ -139,7 +140,7 @@ class MultiPhaseForwardOperator:
 
 
     def support_mask(self):
-        """(Nx, Ny) bool mask of the pixels inside the field of view at every projection angle."""
+        """(Ny, Nx) bool mask of the pixels inside the field of view at every projection angle."""
         return fov_support_mask(self.Nx, self.Ny, self.My, angles=self.angles, image_width=self.Nx,
                                 detector_width=self.My, detector_shift=self.cor_offset)
 
@@ -629,6 +630,15 @@ class MultiPhaseForwardOperator:
 
 
 
+    @property
+    def coeff_shape(self):
+        """Shape of a coefficient array, (K_sum, Ny, Nx): coeffs[k] is the image of orientation k."""
+        return (self.K_sum, self.Ny, self.Nx)
+
+    @property
+    def data_shape(self):
+        return (self.N_Omega, self.My, self.N_seg)
+
     def direct(self, coeffs):
         """
         Allocating convenience wrapper for the OpenCL forward operator.
@@ -657,8 +667,8 @@ class MultiPhaseForwardOperator:
 
         Parameters
         ----------
-        coeffs_gpu_full : clarray
-            Shape (Nx, Ny, K_sum), Fortran order
+        coeffs : clarray
+            Shape (K_sum, Ny, Nx), C-contiguous float32
         out_y : clarray
             Shape (N_Omega, My, N_seg), C order
             Accumulated into (will be zeroed here)
@@ -667,11 +677,9 @@ class MultiPhaseForwardOperator:
 
 
         # --- zero output (important!) ---
-        assert coeffs.flags.f_contiguous
-        assert coeffs.shape == (self.Nx, self.Ny, self.K_sum)
-        assert data.flags.c_contiguous
-        assert data.shape == (self.N_Omega, self.My, self.N_seg)
-        
+        check_device(coeffs, self.coeff_shape, "coeffs")
+        check_device(data, self.data_shape, "data")
+
         data.fill(0)
         R = int(self.N_Omega)
         C = int(self.N_eta)
@@ -805,15 +813,10 @@ class MultiPhaseForwardOperator:
         Returns
         -------
         x_gpu : clarray
-            Shape (Nx, Ny, K_sum), Fortran-order
+            Shape (K_sum, Ny, Nx), C order
         """
 
-        coeffs = clarray.zeros(
-            self.queue,
-            (self.Nx, self.Ny, self.K_sum),
-            dtype=np.float32,
-            order="F",
-        )
+        coeffs = clarray.zeros(self.queue, self.coeff_shape, dtype=np.float32)
 
         self.adjoint_cl(data, coeffs)
         return coeffs
@@ -828,16 +831,13 @@ class MultiPhaseForwardOperator:
         ----------
         y_gpu : clarray
             Shape (N_Omega, My, N_seg), C-order
-        out_x : clarray
-            Shape (Nx, Ny, K_sum), Fortran-order
-            Will be overwritten
+        coeffs : clarray
+            Shape (K_sum, Ny, Nx), C-contiguous float32; overwritten
         """
 
                 # --- zero output (important!) ---
-        assert coeffs.flags.f_contiguous
-        assert coeffs.shape == (self.Nx, self.Ny, self.K_sum)
-        assert data.flags.c_contiguous
-        assert data.shape == (self.N_Omega, self.My, self.N_seg)
+        check_device(data, self.data_shape, "data")
+        check_device(coeffs, self.coeff_shape, "coeffs")
 
         coeffs.fill(0)
         R = int(self.N_Omega)
@@ -1146,15 +1146,16 @@ def estimate_L_power(
     q = op.queue
     rng = np.random.default_rng(seed)
 
-    # x in domain, Fortran
-    x = clarray.empty(q, (op.Nx, op.Ny, op.K_sum), np.float32, order="F")
+    # x in domain, (K_sum, Ny, Nx)
+    x = clarray.empty(q, (op.K_sum, op.Ny, op.Nx), np.float32)
     # y in range, C
     Ax = clarray.empty(q, (op.N_Omega, op.My, op.N_seg), np.float32, order="C")
     # z = A^*Ax in domain
-    z = clarray.empty(q, x.shape, np.float32, order="F")
+    z = clarray.empty(q, x.shape, np.float32)
 
-    # init x random
-    x_host = rng.standard_normal(x.shape).astype(np.float32, copy=False, order="F")
+    # init x random (drawn as (Nx, Ny, K_sum), pixel fastest: the same start as before the
+    # coefficients became (K_sum, Ny, Nx) C-order)
+    x_host = np.ascontiguousarray(rng.standard_normal((op.Nx, op.Ny, op.K_sum)).astype(np.float32).transpose(2, 1, 0))
     assert x.data is not None
     cl.enqueue_copy(q, x.data, x_host)
     q.finish()
@@ -1175,7 +1176,8 @@ def estimate_L_power(
         L_est = num / den
 
         znorm = float(np.sqrt(clarray.vdot(z, z).get()) + eps)
-        x[:] = z * np.float32(1.0 / znorm)
+        z *= np.float32(1.0 / znorm)  # in place: no third coefficient-sized array
+        x, z = z, x
         q.finish()
 
         if verbose:

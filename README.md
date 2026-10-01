@@ -78,10 +78,8 @@ The following runs on the example data from the repository root:
 ```python
 import h5py
 import numpy as np
-import pyopencl.array as clarray
 import yaml
-from diffractom import Material, Grid, SinglePhaseForwardOperator, FISTAHuber
-from diffractom.operators.single_phase_forward_operator import estimate_L_power
+from diffractom import Material, Grid, SinglePhaseForwardOperator, FISTAHuber, estimate_L_power_streamed
 
 with open("examples/config.yaml") as f:
     cfg = yaml.safe_load(f)
@@ -103,32 +101,34 @@ grid = Grid.from_random_fundamental_zone(50000, "cubic", np.deg2rad(2.0))
 grid.prune_close_orientations(theta_deg=3.0, target=15000)
 K = len(grid.nodes_at_level(0))
 
-# Forward operator
-op = SinglePhaseForwardOperator(cfg=cfg, material=mat, grid=grid, max_gb=0.5, normalized=True)
+# Forward operator; reserve_coefficient_arrays=0: the coefficients stay in host memory
+op = SinglePhaseForwardOperator(cfg=cfg, material=mat, grid=grid, max_gb=0.5, normalized=True,
+                                reserve_coefficient_arrays=0)
 
-# Data as (N_Omega, My, N_eta * N_theta) float32; coefficients as (Nx, Ny, K) in Fortran order
-b_gpu = clarray.to_device(op.queue, np.ascontiguousarray(
-    data.reshape(cfg["N_Omega"], cfg["My"], -1), dtype=np.float32))
-x_gpu = clarray.zeros(op.queue, (cfg["Nx"], cfg["Ny"], K), dtype=np.float32, order="F")
+# NumPy arrays in and out: data (N_Omega, My, N_eta * N_rings), coefficients (K, Ny, Nx),
+# coefficients[k] being the image of orientation k
+b = data.reshape(cfg["N_Omega"], cfg["My"], -1)
+x = np.zeros(op.coeff_shape, dtype=np.float32)
 
-# FISTA with a Huber data term; x_gpu is updated in place
-L = estimate_L_power(op, niter=6)
+# FISTA with a Huber data term; x is updated in place (streamed through the GPU)
+L = estimate_L_power_streamed(op, niter=6)
 solver = FISTAHuber(op, prox_kind="nonneg", L=1.1 * L, huber_delta=30)
-solver.run(x_gpu, b_gpu, niter=100, verbose=1, diagnostics_interval=10)
-coefficients = x_gpu.get()
+x = solver.run(x, b, niter=100, verbose=1, diagnostics_interval=10)
+prediction = op.direct(x)  # (N_Omega, My, N_eta * N_rings)
 ```
 
 The FISTA solvers constrain the reconstruction to the field of view by default
 (`support="fov"`: the pixels whose centre projects onto the detector at every
 angle, i.e. the disk r <= My/2 - |cor_offset| for a full rotation). This
 assumes that the sample stays in the beam during the scan. `support=None`
-disables the constraint, and an `(Nx, Ny)` boolean array gives a custom
+disables the constraint, and an `(Ny, Nx)` boolean array gives a custom
 support.
 
 `FISTAL2` is the same solver with a least-squares data term. Both solvers
 accept `prox_kind` values `"nonneg"`, `"l1"`, `"nonneg_l1"` and `"nonneg_tv"`
 (with the regularisation weight `lam`). `FISTAHuber.run` also takes optional
-per-measurement `weights`, where zero weight excludes a data point. See
+`weights`, one per segment (eta bin, ring) and shared by all rotations and
+translations, where zero weight excludes the segment. See
 [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) for the full API.
 
 ## License

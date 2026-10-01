@@ -7,7 +7,7 @@ from .launch import elementwise, pixel_orientation
 
 
 TV_KERNELS = r"""
-// Arrays (Nx, Ny, K), Fortran order. tv_grad and tv_div run on the range (Nx*Ny, <= 64): pixels on
+// Arrays (K, Ny, Nx), C order. tv_grad and tv_div run on the range (Nx*Ny, <= 64): pixels on
 // axis 0, orientations strided on axis 1; the other kernels are element-wise, with 64-bit indices in a
 // grid-stride loop (see launch.py).
 
@@ -157,7 +157,7 @@ class TVProxKernels:
 def prox_tv_nonneg_inplace(
     queue,
     kernels: TVProxKernels,
-    x_gpu,      # (Nx, Ny, K) Fortran, modified IN PLACE
+    x_gpu,      # (K, Ny, Nx) C order, modified IN PLACE
     y_gpu,      # buffer holding f (same shape)
     ux, uy,     # gradient buffers
     px, py,     # dual buffers
@@ -180,7 +180,7 @@ def prox_tv_nonneg_inplace(
       - tau here is ignored; algorithm uses tv_tau = 1/(2*ndim)=0.25 for 2D
     """
 
-    Nx, Ny, K = map(int, x_gpu.shape)
+    K, Ny, Nx = map(int, x_gpu.shape)
 
     # typed scalars
     iNx = np.int32(Nx)

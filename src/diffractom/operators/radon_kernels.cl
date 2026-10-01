@@ -72,7 +72,7 @@ __kernel void radon_forward_k(
 
 
 // Backward projection of 4 channels per work item, into a channel-fastest
-// (Npix, Kstride4) float4 array (the caller scatters it to Fortran order).
+// (Npix, Kstride4) float4 array (the caller scatters it to the (K, Ny, Nx) coefficients).
 __kernel void radon_backward_k(
     __global const float4 *sino,         // (R, Ns, Kstride4)
     __global float4 *out,                // (Npix, Kstride4)
@@ -101,7 +101,7 @@ __kernel void radon_backward_k(
 
 
 // Scatter channels k < Kb of a channel-fastest (Npix, Kstride) array into a
-// (Npix, Ktot) Fortran-order array at channel offset k0 (the inverse of
+// (Ktot, Npix) C-order array (the coefficients (K, Ny, Nx)) at channel offset k0 (the inverse of
 // gather_channels_k_fastest), tiled through local memory.
 __kernel void scatter_channels_k_fastest(
     __global const float *inp,
@@ -129,7 +129,7 @@ __kernel void scatter_channels_k_fastest(
 }
 
 
-// Gather channels k0 .. k0+Kb-1 of a (Npix, Ktot) Fortran-order array into the
+// Gather channels k0 .. k0+Kb-1 of a (Ktot, Npix) C-order array (the coefficients) into the
 // channel-fastest (Npix, Kstride) layout; channels Kb .. Kstride-1 are set to zero.
 // Tiled through local memory so that both the reads and the writes are contiguous.
 __kernel void gather_channels_k_fastest(

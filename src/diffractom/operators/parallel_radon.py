@@ -84,21 +84,21 @@ class ParallelRadon:
         self._gather = self.prg.gather_channels_k_fastest
         self._scatter = self.prg.scatter_channels_k_fastest
 
-    def gather(self, coeffs_F, img_k, k0, Kb, Kstride):
-        """img_k[p, k] = coeffs_F[p, k0 + k] for k < Kb, 0 for Kb <= k < Kstride.
+    def gather(self, coeffs, img_k, k0, Kb, Kstride):
+        """img_k[p, k] = coeffs[k0 + k, p] for k < Kb (p: flat pixel index), 0 for Kb <= k < Kstride.
 
-        coeffs_F : (Nx, Ny, Ktot) Fortran-order.
+        coeffs : (Ktot, Ny, Nx), C order: coeffs[k] is an image, pixel p = x + Nx * y.
         """
         Npix = self.Nx * self.Ny
         gsize = (_round_up(Npix, 32), _round_up(Kstride, 32) // 32 * 8)
-        self._gather(self.queue, gsize, (32, 8), coeffs_F.data, img_k.data,
+        self._gather(self.queue, gsize, (32, 8), coeffs.data, img_k.data,
                      np.int32(Npix), np.int32(k0), np.int32(Kb), np.int32(Kstride))
 
-    def scatter(self, img_k, coeffs_F, k0, Kb, Kstride):
-        """coeffs_F[p, k0 + k] = img_k[p, k] for k < Kb (the inverse of gather)."""
+    def scatter(self, img_k, coeffs, k0, Kb, Kstride):
+        """coeffs[k0 + k, p] = img_k[p, k] for k < Kb (the inverse of gather)."""
         Npix = self.Nx * self.Ny
         gsize = (_round_up(Npix, 32), _round_up(Kstride, 32) // 32 * 8)
-        self._scatter(self.queue, gsize, (32, 8), img_k.data, coeffs_F.data,
+        self._scatter(self.queue, gsize, (32, 8), img_k.data, coeffs.data,
                       np.int32(Npix), np.int32(k0), np.int32(Kb), np.int32(Kstride))
 
     def forward(self, img_k, sino_k, Kstride):

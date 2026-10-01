@@ -14,6 +14,7 @@ from .create_pfo_matrix import build_pf_program
 from .pf_kernels import build_all_opencl
 from .parallel_radon import ParallelRadon
 from ..utils.support import fov_support_mask
+from ..utils.arrays import as_host, check_device
 
 
 class SinglePhaseForwardOperator:
@@ -38,6 +39,7 @@ class SinglePhaseForwardOperator:
         sparse_max_fill: float = 0.1,
         sparse_max_gb: float | None = None,
         projector: str = "native",
+        reserve_coefficient_arrays: int = 3,
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -83,7 +85,7 @@ class SinglePhaseForwardOperator:
             GPU memory budget (GB) for the sparse matrix, estimated from the first
             batch. Default (``default_sparse_budget_gb``): half of the memory left
             after reserving what a FISTA reconstruction needs besides the operator
-            (5 coefficient-sized and 4 data-sized arrays), the operator's own
+            (reserve_coefficient_arrays coefficient-sized and 2 data-sized arrays), the operator's own
             buffers and a 1 GB margin. The solver's arrays take priority: a large
             sparse matrix (e.g. a dense uniform grid) is not stored, and the dense
             path re-evaluates the PF matrix batch by batch instead.
@@ -93,9 +95,15 @@ class SinglePhaseForwardOperator:
             the orientations; ``"gratopy"`` uses gratopy. Both use the same
             discretisation (they agree to float32 rounding); the native one is
             2-8x faster for many orientations.
+        reserve_coefficient_arrays : int
+            Coefficient-sized (K, Ny, Nx) arrays the default sparse-PF budget leaves room for
+            on the GPU: 3 (default) for FISTA with the fused update (2 arrays and a margin),
+            0 when the solver streams the coefficients from host memory.
         **kwargs
             Override any cfg key (e.g. ``N_Omega=50``).
         """
+
+        self.reserve_coefficient_arrays = int(reserve_coefficient_arrays)
 
         # --- context / queue ---
         if ctx is not None and queue is not None:
@@ -212,7 +220,7 @@ class SinglePhaseForwardOperator:
 
 
     def support_mask(self):
-        """(Nx, Ny) bool mask of the pixels inside the field of view at every projection angle."""
+        """(Ny, Nx) bool mask of the pixels inside the field of view at every projection angle."""
         return fov_support_mask(self.Nx, self.Ny, self.My, angles=self.angles, image_width=self.Nx,
                                 detector_width=self.My, detector_shift=self.cor_offset)
 
@@ -583,25 +591,38 @@ class SinglePhaseForwardOperator:
     
 
 
+    @property
+    def coeff_shape(self):
+        """Shape of a coefficient array, (K, Ny, Nx): coeffs[k] is the image of orientation k."""
+        return (self.K, self.Ny, self.Nx)
+
+    @property
+    def data_shape(self):
+        """Shape of a data array, (N_Omega, My, N_seg), N_seg = N_eta * N_rings."""
+        return (self.N_Omega, self.My, self.N_seg)
+
     def direct(self, coeffs):
         """
-        Allocating convenience wrapper for the OpenCL forward operator.
+        The forward operator, allocating its output.
 
-        Returns
-        -------
-        yin_gpu : clarray
-            Shape (N_Omega, My, N_seg), C order
+        coeffs : NumPy array (K, Ny, Nx) (converted to C-contiguous float32 if needed), streamed
+            to the GPU batch by batch, so no coefficient-sized array is allocated on the GPU;
+            returns a NumPy array (N_Omega, My, N_seg).
+            Or a pyopencl array (K, Ny, Nx), C-contiguous float32; returns a pyopencl array.
         """
-
-        data = clarray.zeros(
-            self.queue,
-            (self.N_Omega, self.My, self.N_seg),
-            dtype=np.float32,
-            order="C",
-        )
-
-        self.direct_cl(coeffs, data)
-        return data
+        if isinstance(coeffs, clarray.Array):
+            data = clarray.empty(self.queue, self.data_shape, dtype=np.float32)
+            self.direct_cl(coeffs, data)
+            return data
+        from ..optimization.streaming import Streamer
+        x = as_host(coeffs, self.coeff_shape, "coeffs")
+        data = clarray.empty(self.queue, self.data_shape, dtype=np.float32)
+        st = Streamer(self)
+        st.forward(x.ravel(), data)
+        st.release()
+        out = data.get()
+        data.base_data.release()
+        return out
 
 
 
@@ -651,9 +672,11 @@ class SinglePhaseForwardOperator:
     def default_sparse_budget_gb(self):
         """
         Default GPU memory budget (GB) for the sparse PF matrix: half of what is
-        left of the device memory after a reserve for the solver (FISTA keeps
-        ~5 arrays of the coefficient size (Nx, Ny, K) and ~4 of the data size
-        (N_Omega, My, N_seg), including the data and weights), the operator's
+        left of the device memory after a reserve for the solver
+        (reserve_coefficient_arrays arrays of the coefficient size (K, Ny, Nx): 3 by
+        default, for FISTA with the fused update, 0 when the coefficients are streamed
+        from host memory; and 2 of the data size (N_Omega, My, N_seg): the data and
+        the prediction/residual), the operator's
         buffers and a 1 GB margin. Conservative on purpose: the GPU may be
         shared, and the solver's arrays take priority.
         """
@@ -663,7 +686,8 @@ class SinglePhaseForwardOperator:
         if buffers is None:  # (only computed with verbose=True)
             buffers = 4 * self.K_batch_max * (self.N_Omega * self.My + self.Nx * self.Ny
                                               + self.N_Omega * self.N_eta * self.N_peaks)
-        free = self.queue.device.global_mem_size - 5 * coeff_bytes - 4 * data_bytes - buffers - 1024**3
+        free = (self.queue.device.global_mem_size - self.reserve_coefficient_arrays * coeff_bytes
+                - 2 * data_bytes - buffers - 1024**3)
         return 0.5 * max(free, 0) / 1024**3
 
 
@@ -761,54 +785,61 @@ class SinglePhaseForwardOperator:
 
         Parameters
         ----------
-        coeffs : clarray, (Nx, Ny, K), F-order
-        data : clarray, (N_Omega, My, N_seg), C-order — overwritten.
+        coeffs : clarray, (K, Ny, Nx), C-contiguous float32
+        data : clarray, (N_Omega, My, N_seg), C-contiguous float32 — overwritten.
         """
+        check_device(coeffs, self.coeff_shape, "coeffs")
+        check_device(data, self.data_shape, "data")
         data.fill(0.0)
+        for ib, b in enumerate(self.batches):
+            self._direct_batch(coeffs, b["k_start"], self.K, ib, data)
 
+    def _direct_batch(self, src, k_src, K_src, ib, data):
+        """Add the forward projection of orientation batch ib to data. The batch's coefficients
+        are orientations k_src .. k_src+Kb-1 of src, a (K_src, Ny, Nx) C-order array (the full
+        coefficient array, or a batch-sized staging buffer with k_src = 0)."""
+        b = self.batches[ib]
+        k0 = b["k_start"]
+        Kb = b["K_batch"]
         R = int(self.N_Omega)
         CP = int(self.N_eta * self.N_peaks)
         Kmax = self.K_batch_max
         My = self.My
-        sparse = self.pf_mode == "sparse"
 
-        for ib, b in enumerate(self.batches):
-            k0 = b["k_start"]
-            Kb = b["K_batch"]
+        # 1) Radon transform of this batch -> coeffs_sino_C (R, My, Kmax)
+        if self.projector == "native":
+            self.radon.gather(src, self._img_k, k_src, Kb, Kmax)
+            self.radon.forward(self._img_k, self.coeffs_sino_C, Kmax)
+        else:
+            self._radon_gratopy_forward(src, k_src, Kb, K_src)
 
-            # 1) Radon transform of this batch -> coeffs_sino_C (R, My, Kmax)
-            if self.projector == "native":
-                self.radon.gather(coeffs, self._img_k, k0, Kb, Kmax)
-                self.radon.forward(self._img_k, self.coeffs_sino_C, Kmax)
-            else:
-                self._radon_gratopy_forward(coeffs, k0, Kb)
-
-            # 2) PF matrix product, accumulated into data
-            if sparse:
-                sb = self.sparse_batches[ib]
-                self.k.spmm_pf_forward_c(
-                    self.queue,
-                    (CP, My, R),
-                    None,
-                    self.coeffs_sino_C.data,
-                    sb["row_ptr_f"].data,
-                    sb["col_k"].data,
-                    sb["val_f"].data,
-                    data.data,
-                    np.int32(R),
-                    np.int32(My),
-                    np.int32(CP),
-                    np.int32(Kmax),
-                )
-            else:
-                self._dense_pf_batch(k0, Kb)
-                batched_gemm_clblast(self.queue, self.coeffs_sino_C, self._basis_batch_kmax.reshape((R, Kmax, CP)),
-                                     data, R=R, M=My, K=Kmax, N=CP)
+        # 2) PF matrix product, accumulated into data
+        if self.pf_mode == "sparse":
+            sb = self.sparse_batches[ib]
+            self.k.spmm_pf_forward_c(
+                self.queue,
+                (CP, My, R),
+                None,
+                self.coeffs_sino_C.data,
+                sb["row_ptr_f"].data,
+                sb["col_k"].data,
+                sb["val_f"].data,
+                data.data,
+                np.int32(R),
+                np.int32(My),
+                np.int32(CP),
+                np.int32(Kmax),
+            )
+        else:
+            self._dense_pf_batch(k0, Kb)
+            batched_gemm_clblast(self.queue, self.coeffs_sino_C, self._basis_batch_kmax.reshape((R, Kmax, CP)),
+                                 data, R=R, M=My, K=Kmax, N=CP)
 
 
 
-    def _radon_gratopy_forward(self, coeffs, k0, Kb):
-        """gratopy forward projection of orientations k0 .. k0+Kb-1 into coeffs_sino_C."""
+    def _radon_gratopy_forward(self, coeffs, k0, Kb, Ktot=None):
+        """gratopy forward projection of orientations k0 .. k0+Kb-1 of coeffs, a (Ktot, Ny, Nx)
+        C-order array (Ktot: default K), into coeffs_sino_C."""
         Nx, Ny, My, R, Kmax = self.Nx, self.Ny, self.My, self.N_Omega, self.K_batch_max
         self._coeffs_batch_F.fill(0.0)
         self.coeffs_sino_F.fill(0.0)
@@ -816,7 +847,7 @@ class SinglePhaseForwardOperator:
         self.k.SLICE_COEFFS_K_BATCH_F(
             self.queue, (total,), None,
             coeffs.data, self._coeffs_batch_F.data,
-            np.int32(Nx), np.int32(Ny), np.int32(self.K), np.int32(Kb), np.int32(k0),
+            np.int32(Nx), np.int32(Ny), np.int32(self.K if Ktot is None else Ktot), np.int32(Kb), np.int32(k0),
         )
         gratopy.forwardprojection(self._coeffs_batch_F, self.PS, sino=self.coeffs_sino_F)
         total = R * My * Kmax
@@ -828,8 +859,9 @@ class SinglePhaseForwardOperator:
 
 
 
-    def _radon_gratopy_backward(self, coeffs, k0, Kb):
-        """gratopy backprojection of coeffs_sino_C into orientations k0 .. k0+Kb-1 of coeffs."""
+    def _radon_gratopy_backward(self, coeffs, k0, Kb, Ktot=None):
+        """gratopy backprojection of coeffs_sino_C into orientations k0 .. k0+Kb-1 of coeffs,
+        a (Ktot, Ny, Nx) C-order array (Ktot: default K)."""
         Nx, Ny, My, R, Kmax = self.Nx, self.Ny, self.My, self.N_Omega, self.K_batch_max
         self._coeffs_batch_F.fill(0.0)
         self.coeffs_sino_F.fill(0.0)
@@ -844,35 +876,33 @@ class SinglePhaseForwardOperator:
         self.k.scatter_k_lastaxis_f(
             self.queue, (total,), None,
             coeffs.data, self._coeffs_batch_F.data,
-            np.int32(Nx), np.int32(Ny), np.int32(self.K), np.int32(k0), np.int32(Kb), np.int32(total),
+            np.int32(Nx), np.int32(Ny), np.int32(self.K if Ktot is None else Ktot), np.int32(k0), np.int32(Kb),
+            np.int32(total),
         )
 
 
 
     def adjoint(self, data):
         """
-        Allocating convenience wrapper for the OpenCL adjoint.
+        The adjoint operator, allocating its output.
 
-        Parameters
-        ----------
-        y_gpu : clarray
-            Shape (N_Omega, My, N_seg), C-order
-
-        Returns
-        -------
-        x_gpu : clarray
-            Shape (Nx, Ny, K_sum), Fortran-order
+        data : NumPy array (N_Omega, My, N_seg) (converted to C-contiguous float32 if needed);
+            the result is streamed to the host batch by batch, so no coefficient-sized array is
+            allocated on the GPU; returns a NumPy array (K, Ny, Nx).
+            Or a pyopencl array (N_Omega, My, N_seg), C-contiguous float32; returns a pyopencl array.
         """
-
-        coeffs = clarray.zeros(
-            self.queue,
-            (self.Nx, self.Ny, self.K),
-            dtype=np.float32,
-            order="F",
-        )
-
-        self.adjoint_cl(data, coeffs)
-        return coeffs
+        if isinstance(data, clarray.Array):
+            coeffs = clarray.empty(self.queue, self.coeff_shape, dtype=np.float32)
+            self.adjoint_cl(data, coeffs)
+            return coeffs
+        from ..optimization.streaming import Streamer
+        d = clarray.to_device(self.queue, as_host(data, self.data_shape, "data"))
+        out = np.empty(self.coeff_shape, np.float32)
+        st = Streamer(self)
+        st.adjoint_to_host(d, out.ravel())
+        st.release()
+        d.base_data.release()
+        return out
 
 
 
@@ -883,64 +913,81 @@ class SinglePhaseForwardOperator:
         Parameters
         ----------
         data : clarray
-            Shape (N_Omega, My, N_seg), C-order
+            Shape (N_Omega, My, N_seg), C-contiguous float32
         coeffs : clarray
-            Shape (Nx, Ny, K_sum), Fortran-order
-            Will be overwritten
+            Shape (K, Ny, Nx), C-contiguous float32; overwritten
         """
+        check_device(data, self.data_shape, "data")
+        check_device(coeffs, self.coeff_shape, "coeffs")
 
-        # ---------------- checks ----------------
-        assert data.shape == (self.N_Omega, self.My, self.N_seg)
-        assert data.flags.c_contiguous
+        # every orientation is written by exactly one batch
+        for ib, b in enumerate(self.batches):
+            self._adjoint_batch(data, ib, coeffs, b["k_start"], self.K)
 
-        assert coeffs.shape == (self.Nx, self.Ny, self.K)
-        assert coeffs.flags.f_contiguous
+    def adjoint_batches_cl(self, data, out_batch, update):
+        """
+        The adjoint, one orientation batch at a time, without a coefficient-sized output.
 
-        # ---------------- zero output ----------------
-        coeffs.fill(0.0)
+        For every batch of orientations k0 .. k0+Kb-1, their part of A^T data is written to
+        the first Kb * Ny * Nx elements of out_batch (a (Kb, Ny, Nx) C-order block), and then
+        update(k0, Kb) is called, e.g. to enqueue a
+        kernel that consumes it before the next batch overwrites it.
 
+        Parameters
+        ----------
+        data : clarray, (N_Omega, My, N_seg), C-order
+        out_batch : clarray, float32, at least Nx * Ny * K_batch_max elements
+        update : callable (k0, Kb)
+        """
+        check_device(data, self.data_shape, "data")
+        assert out_batch.dtype == np.float32 and out_batch.size >= self.Nx * self.Ny * self.K_batch_max
+        for ib, b in enumerate(self.batches):
+            self._adjoint_batch(data, ib, out_batch, 0, self.K_batch_max)
+            update(b["k_start"], b["K_batch"])
+
+    def _adjoint_batch(self, data, ib, target, k_target, K_target):
+        """A^T data for orientation batch ib, written to orientations k_target .. k_target+Kb-1
+        of target, a (K_target, Ny, Nx) C-order array."""
+        b = self.batches[ib]
+        k0 = b["k_start"]
+        Kb = b["K_batch"]
         Kmax = self.K_batch_max
         R = self.N_Omega
         CP = int(self.N_eta * self.N_peaks)
         My = self.My
         alpha = R / np.pi
-        sparse = self.pf_mode == "sparse"
 
-        for ib, b in enumerate(self.batches):
-            k0 = b["k_start"]
-            Kb = b["K_batch"]
+        # 1) PF^T product -> coeffs_sino_C (R, My, Kmax)
+        if self.pf_mode == "sparse":
+            sb = self.sparse_batches[ib]
+            self.k.spmm_pf_adjoint_c(
+                self.queue,
+                (Kb, My, R),
+                None,
+                data.data,
+                sb["row_ptr_a"].data,
+                sb["col_j"].data,
+                sb["val_a"].data,
+                self.coeffs_sino_C.data,
+                np.int32(R),
+                np.int32(My),
+                np.int32(Kb),
+                np.int32(CP),
+                np.int32(Kmax),
+                np.float32(alpha),
+            )
+        else:
+            self._dense_pf_batch(k0, Kb)
+            # batched gemm with the PF batch transposed on the fly; overwrites coeffs_sino_C
+            batched_gemm_adj_clblast(self.queue, data, self._basis_batch_kmax.reshape((R, Kmax, CP)),
+                                     self.coeffs_sino_C, R, My, CP, Kmax, alpha)
 
-            # 1) PF^T product -> coeffs_sino_C (R, My, Kmax)
-            if sparse:
-                sb = self.sparse_batches[ib]
-                self.k.spmm_pf_adjoint_c(
-                    self.queue,
-                    (Kb, My, R),
-                    None,
-                    data.data,
-                    sb["row_ptr_a"].data,
-                    sb["col_j"].data,
-                    sb["val_a"].data,
-                    self.coeffs_sino_C.data,
-                    np.int32(R),
-                    np.int32(My),
-                    np.int32(Kb),
-                    np.int32(CP),
-                    np.int32(Kmax),
-                    np.float32(alpha),
-                )
-            else:
-                self._dense_pf_batch(k0, Kb)
-                # batched gemm with the PF batch transposed on the fly; overwrites coeffs_sino_C
-                batched_gemm_adj_clblast(self.queue, data, self._basis_batch_kmax.reshape((R, Kmax, CP)),
-                                         self.coeffs_sino_C, R, My, CP, Kmax, alpha)
-
-            # 2) backprojection into orientations k0 .. k0+Kb-1 of coeffs
-            if self.projector == "native":
-                self.radon.backward(self.coeffs_sino_C, self._img_k, Kmax)
-                self.radon.scatter(self._img_k, coeffs, k0, Kb, Kmax)
-            else:
-                self._radon_gratopy_backward(coeffs, k0, Kb)
+        # 2) backprojection into the target
+        if self.projector == "native":
+            self.radon.backward(self.coeffs_sino_C, self._img_k, Kmax)
+            self.radon.scatter(self._img_k, target, k_target, Kb, Kmax)
+        else:
+            self._radon_gratopy_backward(target, k_target, Kb, K_target)
 
 
 
@@ -1075,15 +1122,16 @@ def estimate_L_power(
     q = op.queue
     rng = np.random.default_rng(seed)
 
-    # x in domain, Fortran
-    x = clarray.empty(q, (op.Nx, op.Ny, op.K), np.float32, order="F")
+    # x in domain, (K, Ny, Nx)
+    x = clarray.empty(q, (op.K, op.Ny, op.Nx), np.float32)
     # y in range, C
     Ax = clarray.empty(q, (op.N_Omega, op.My, op.N_seg), np.float32, order="C")
     # z = A^*Ax in domain
-    z = clarray.empty(q, x.shape, np.float32, order="F")
+    z = clarray.empty(q, x.shape, np.float32)
 
-    # init x random
-    x_host = rng.standard_normal(x.shape).astype(np.float32, copy=False, order="F")
+    # init x random (drawn as (Nx, Ny, K) and stored with the pixel fastest, as before the
+    # coefficients became (K, Ny, Nx) C-order: the same start, the same estimate)
+    x_host = np.ascontiguousarray(rng.standard_normal((op.Nx, op.Ny, op.K)).astype(np.float32).transpose(2, 1, 0))
     assert x.data is not None
     cl.enqueue_copy(q, x.data, x_host)
     q.finish()
@@ -1106,7 +1154,8 @@ def estimate_L_power(
         L_est = num / den
 
         znorm = float(np.sqrt(clarray.vdot(z, z).get()) + eps)
-        x[:] = z * np.float32(1.0 / znorm)
+        z *= np.float32(1.0 / znorm)  # in place: no third coefficient-sized array
+        x, z = z, x
         q.finish()
 
         if verbose:

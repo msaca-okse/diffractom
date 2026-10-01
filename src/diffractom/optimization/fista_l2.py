@@ -6,6 +6,9 @@ import pyopencl.array as clarray
 import pyopencl.clmath as clmath
 from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels, apply_support, support_mask_to_gpu
 from .launch import elementwise, pixel_orientation
+from .fused_update import FusedUpdate, fused_available
+from .streaming import Streamer
+from ..utils.arrays import prepare_inputs
 
 from .prox_tv import (
     TVProxKernels,
@@ -75,11 +78,12 @@ class FISTAL2:
     Solve: min_x 0.5||A x - b||^2 + g(x)
     with FISTA on GPU.
 
-    x layout: (Nx, Ny, K) Fortran (but we treat it as flat for kernels)
+    x layout: (K, Ny, Nx) C order (the kernels treat it as flat)
     Ax layout: (O, D, Nseg) C
     """
 
-    def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50, support="fov"):
+    def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50, support="fov",
+                 fused=True, stream_threads=None):
         """Set up FISTA solver.
 
         Parameters
@@ -95,11 +99,16 @@ class FISTAL2:
             Step size (overrides L).
         tv_niter : int
             Inner iterations for TV proximal operator.
-        support : "fov", None or (Nx, Ny) bool array
+        support : "fov", None or (Ny, Nx) bool array
             Support constraint, applied after the proximal operator: the coefficients
             of pixels outside the support are set to zero. "fov" (default) is the disk
             seen by the detector at every angle (operator.support_mask()), i.e. the
             assumption that the sample stays in the field of view; None disables it.
+        fused : bool
+            Fuse the gradient step, the prox and the momentum update into the adjoint, one
+            orientation batch at a time (see fused_update.py): two coefficient-sized arrays
+            (x, y) instead of four. Used for element-wise proxes with an operator that provides
+            adjoint_batches_cl; otherwise, or with fused=False, the unfused update runs.
         """
         self.op = operator
         self.ctx = operator.ctx
@@ -117,6 +126,9 @@ class FISTAL2:
 
         self.prox_kind = prox_kind
         self.lam = float(lam)
+        self.stream_threads = stream_threads
+        self.fused = bool(fused) and fused_available(operator, prox_kind)
+        self.fused_update = FusedUpdate(self.ctx, self.queue) if self.fused else None
 
         if tau is None:
             if L is None:
@@ -194,50 +206,68 @@ class FISTAL2:
         diagnostics_interval: int = 1,
     ):
         """
-        x0_gpu: clarray (Nx, Ny, K) float32, order='F'
-        out_gpu:  clarray (O, D, Nseg) float32, order='C'
-        returns x_gpu solution (same layout as x0_gpu)
+        x0_gpu:   the starting point, (K, Ny, Nx) float32: a NumPy array (streamed from host
+                memory, see FISTAHuber.run; updated in place if C-contiguous float32, else in a
+                converted copy) or a C-contiguous pyopencl array (everything on the GPU).
+        out_gpu:  the data b, (N_Omega, My, N_seg) float32: a NumPy array (uploaded) or a
+                C-contiguous pyopencl array.
+        returns the solution: the NumPy array (streamed) or x0_gpu (on the GPU)
         """
         q = self.queue
 
-        # ---- basic checks ----
-        if not isinstance(x0_gpu, clarray.Array) or not isinstance(out_gpu, clarray.Array):
-            raise TypeError("x0_gpu and out_gpu must be pyopencl.array.Array")
-
-        if x0_gpu.queue is None or out_gpu.queue is None:
-            raise ValueError("Arrays must have a queue attached (created via clarray on a queue)")
-
-        if x0_gpu.dtype != np.float32 or out_gpu.dtype != np.float32:
-            raise TypeError("This FISTA assumes float32 arrays")
-
-        if x0_gpu.queue.context.int_ptr != self.ctx.int_ptr:
-            raise ValueError("x0_gpu context != operator context")
-        if out_gpu.queue.context.int_ptr != self.ctx.int_ptr:
-            raise ValueError("out_gpu context != operator context")
+        # ---- inputs: shapes, dtype, layout; NumPy data are uploaded ----
+        streamed, x0_gpu, out_gpu, _, uploaded = prepare_inputs(self.op, q, x0_gpu, out_gpu, None)
+        if streamed and not self.fused:
+            raise ValueError("streaming the coefficients (x0 as a NumPy array) needs the fused update: an "
+                             "element-wise prox ('nonneg', 'l1', 'nonneg_l1') and fused=True")
 
         # ---- persistent buffers ----
-        x = x0_gpu        # reuse input buffer
-        y = clarray.empty(q, x.shape, dtype=np.float32, order="F")
-        x_old = clarray.empty(q, x.shape, dtype=np.float32, order="F")
-        grad = clarray.empty(q, x.shape, dtype=np.float32, order="F")
+        streamer = None
+        if streamed:
+            streamer = Streamer(self.op, self.fused_update, self.stream_threads)
+            x_host = streamer.flat(x0_gpu)  # the iterate, updated in place
+            y_host = np.empty_like(x_host)
+            outside = None if self.support_gpu is None else ~self.support_gpu.get().astype(bool)
+
+            def init_batch(ib):  # start inside the support; y = x
+                xv = streamer.view(x_host, ib)
+                if outside is not None:
+                    xv.reshape(-1, outside.size)[:, outside] = 0.0
+                np.copyto(streamer.view(y_host, ib), xv)
+            list(streamer.pool.map(init_batch, range(len(self.op.batches))))
+            x = y = x_old = grad = None
+            g_batch = self.fused_update.batch_buffer(self.op)
+        elif self.fused:
+            x = x0_gpu
+            y = clarray.empty(q, x.shape, dtype=np.float32)
+            x_old = grad = None
+            g_batch = self.fused_update.batch_buffer(self.op)
+        else:
+            x = x0_gpu
+            y = clarray.empty(q, x.shape, dtype=np.float32)
+            x_old = clarray.empty(q, x.shape, dtype=np.float32)
+            grad = clarray.empty(q, x.shape, dtype=np.float32)
+            g_batch = None
 
         # TV buffers: allocate once per run, reuse each iter
         if self.prox_kind == "nonneg_tv":
             self._tv_buffers = {
-                "y":  clarray.empty(q, x.shape, np.float32, order="F"),
-                "gx": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "gy": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "px": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "py": clarray.zeros(q, x.shape, np.float32, order="F"),
-                "div": clarray.zeros(q, x.shape, np.float32, order="F"),
+                "y":  clarray.empty(q, x.shape, np.float32),
+                "gx": clarray.zeros(q, x.shape, np.float32),
+                "gy": clarray.zeros(q, x.shape, np.float32),
+                "px": clarray.zeros(q, x.shape, np.float32),
+                "py": clarray.zeros(q, x.shape, np.float32),
+                "div": clarray.zeros(q, x.shape, np.float32),
             }
 
         # copy x0 -> x,y,x_old
-        if self.support_gpu is not None:  # start inside the support
-            apply_support(q, self.prox_kernels, x, self.support_gpu)
-        gws_x, n_x = elementwise(x.size)
-        self.k_copy_buf(q, gws_x, None, x.data, y.data, n_x)
-        self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
+        if not streamed:
+            if self.support_gpu is not None:  # start inside the support
+                apply_support(q, self.prox_kernels, x, self.support_gpu)
+            gws_x, n_x = elementwise(x.size)
+            self.k_copy_buf(q, gws_x, None, x.data, y.data, n_x)
+            if x_old is not None:
+                self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
         gws_Ax, n_Ax = elementwise(out_gpu.size)
 
         Ax = None
@@ -255,7 +285,10 @@ class FISTAL2:
                 Ax = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
 
 
-            self.op.direct_cl(y, Ax)
+            if streamed:
+                streamer.forward(y_host, Ax)
+            else:
+                self.op.direct_cl(y, Ax)
 
 
             # ---- r = Ax - b ----
@@ -268,46 +301,61 @@ class FISTAL2:
             r2 = clarray.vdot(Ax, Ax).get()
             fval = 0.5 * float(r2)
 
-            # ---- grad = A*(r) ----
-            self.op.adjoint_cl(Ax, grad)  # (Nx,Ny,K) Fortran
-
-
-            # ---- v = y - tau*grad ----
-            self.k_grad_step(
-                q, gws_x, None,
-                y.data, grad.data, x.data,
-                np.float32(self.tau),
-                n_x
-            )
-
-
-            # ---- prox: apply in-place on v, then copy v -> x ----
-            self._apply_prox(x)   # MUST modify v in-place and return v
-
-            # ---- momentum update ----
+            # ---- momentum coefficient ----
             t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
             beta = (t - 1.0) / t_new
 
-            # ---- y = x + beta*(x - x_old) ----
-            self.k_extrapolate(
-                q, gws_x, None,
-                x.data, x_old.data, y.data,
-                np.float32(beta),
-                n_x
-            )
+            if streamed:
+                # ---- as below, with x and y streamed from and to host memory ----
+                gsq, xsq, xabs = streamer.adjoint_update(x_host, y_host, Ax, g_batch, self.tau, beta,
+                                                         self.prox_kind, self.lam, self.support_gpu)
+                gnorm = float(np.sqrt(gsq))
+            elif self.fused:
+                # ---- grad = A*(r) batch by batch, each batch consumed by
+                #      x <- prox(y - tau*grad), y <- x + beta*(x - x_old) ----
+                gnorm = float(np.sqrt(self.fused_update.step(
+                    self.op, Ax, x, y, g_batch, self.tau, beta, self.prox_kind, self.lam, self.support_gpu)))
+            else:
+                # ---- grad = A*(r) ----
+                self.op.adjoint_cl(Ax, grad)  # (K, Ny, Nx)
 
-            # ---- x_old <- x ----
-            self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
+                # ---- v = y - tau*grad ----
+                self.k_grad_step(
+                    q, gws_x, None,
+                    y.data, grad.data, x.data,
+                    np.float32(self.tau),
+                    n_x
+                )
+
+                # ---- prox: apply in-place on v, then copy v -> x ----
+                self._apply_prox(x)   # MUST modify v in-place and return v
+
+                # ---- y = x + beta*(x - x_old) ----
+                self.k_extrapolate(
+                    q, gws_x, None,
+                    x.data, x_old.data, y.data,
+                    np.float32(beta),
+                    n_x
+                )
+
+                # ---- x_old <- x ----
+                self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
+                gnorm = float(np.sqrt(clarray.vdot(grad, grad).get()))
 
             t = t_new
 
             gval = 0.0
             if self.prox_kind in ("l1", "nonneg_l1") and self.lam != 0.0:
-                gval = self.lam * float(clarray.sum(clmath.fabs(x)).get())
+                if streamed:
+                    gval = self.lam * xabs
+                elif self.fused:
+                    gval = self.lam * self.fused_update.abs_sum(x)  # no coefficient-sized temporary
+                else:
+                    gval = self.lam * float(clarray.sum(clmath.fabs(x)).get())
 
             elif self.prox_kind == "nonneg_tv" and self.lam != 0.0:
                 b = self._tv_buffers
-                Nx, Ny, K = map(int, x.shape)
+                K, Ny, Nx = map(int, x.shape)
 
                 self.tv_kernels.k_grad(
                     q, pixel_orientation(Nx * Ny, K), None,
@@ -330,8 +378,7 @@ class FISTAL2:
                 gval = self.lam * float(clarray.sum(b["div"]).get())
 
             obj = fval + gval
-            xnorm = float(np.sqrt(clarray.vdot(x, x).get()))
-            gnorm = float(np.sqrt(clarray.vdot(grad, grad).get()))
+            xnorm = float(np.sqrt(xsq if streamed else clarray.vdot(x, x).get()))
 
             tv_res = None
             if self.prox_kind == "nonneg_tv":
@@ -378,21 +425,29 @@ class FISTAL2:
 
         # ---------------- GPU cleanup ----------------
         q.finish()
+        if streamed:
+            streamer.release()
+            del y_host
+            x = x0_gpu
 
-        for arr in (y, x_old, grad):
+        for arr in (y, x_old, grad, g_batch):
             if arr is not None:
                 arr.base_data.release()
 
         if Ax is not None:
             Ax.base_data.release()
+        for arr in uploaded:  # data uploaded from a NumPy array
+            arr.base_data.release()
 
         if self.prox_kind == "nonneg_tv":
             for arr in self._tv_buffers.values():
                 arr.base_data.release()
             del self._tv_buffers
 
-        del y, x_old, grad, Ax
+        del y, x_old, grad, g_batch, Ax
         import gc
         gc.collect()
         q.finish()
         # --------------------------------------------
+
+        return x
