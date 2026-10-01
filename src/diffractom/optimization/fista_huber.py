@@ -99,6 +99,7 @@ import pyopencl.array as clarray
 import pyopencl.clmath as clmath
 from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels, apply_support, support_mask_to_gpu
 from .launch import elementwise, pixel_orientation
+from .fused_update import FusedUpdate, fused_available
 
 from .prox_tv import (
     TVProxKernels,
@@ -126,7 +127,7 @@ class FISTAHuber:
     """
 
     def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50, huber_delta=1e-2,
-                 support="fov"):
+                 support="fov", fused=True):
         """Set up FISTA-Huber solver.
 
         Parameters
@@ -149,6 +150,12 @@ class FISTAHuber:
             of pixels outside the support are set to zero. "fov" (default) is the disk
             seen by the detector at every angle (operator.support_mask()), i.e. the
             assumption that the sample stays in the field of view; None disables it.
+        fused : bool
+            Fuse the gradient step, the prox and the momentum update into the adjoint, one
+            orientation batch at a time (see fused_update.py): the solver then keeps two
+            coefficient-sized arrays (x, y) instead of four (x, y, x_old, grad). Used when the
+            prox is element-wise ('nonneg', 'l1', 'nonneg_l1') and the operator provides
+            adjoint_batches_cl; otherwise, or with fused=False, the unfused update runs.
         """
         self.op = operator
         self.ctx = operator.ctx
@@ -170,6 +177,8 @@ class FISTAHuber:
 
         self.prox_kind = prox_kind
         self.lam = float(lam)
+        self.fused = bool(fused) and fused_available(operator, prox_kind)
+        self.fused_update = FusedUpdate(self.ctx, self.queue) if self.fused else None
 
         if tau is None:
             if L is None:
@@ -288,10 +297,17 @@ class FISTAHuber:
                                  f"elements, one per segment; got shape {weights.shape}")
 
         # ---- persistent buffers ----
+        # fused: x (current iterate) and y, plus one batch of the gradient;
+        # unfused: x, y, x_old and grad
         x = x0_gpu
         y = clarray.empty(q, x.shape, dtype=np.float32, order="F")
-        x_old = clarray.empty(q, x.shape, dtype=np.float32, order="F")
-        grad = clarray.empty(q, x.shape, dtype=np.float32, order="F")
+        if self.fused:
+            x_old = grad = None
+            g_batch = self.fused_update.batch_buffer(self.op)
+        else:
+            x_old = clarray.empty(q, x.shape, dtype=np.float32, order="F")
+            grad = clarray.empty(q, x.shape, dtype=np.float32, order="F")
+            g_batch = None
 
         # TV buffers: allocate once per run, reuse each iter
         if self.prox_kind == "nonneg_tv":
@@ -309,7 +325,8 @@ class FISTAHuber:
             apply_support(q, self.prox_kernels, x, self.support_gpu)
         gws_x, n_x = elementwise(x.size)
         self.k_copy_buf(q, gws_x, None, x.data, y.data, n_x)
-        self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
+        if x_old is not None:
+            self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
         gws_Ax, n_Ax = elementwise(out_gpu.size)
 
         Ax = None  # the prediction A(y), overwritten in place by the (weighted, clipped) residual
@@ -348,41 +365,51 @@ class FISTAHuber:
                 n_Ax
             )
 
-            # ---- grad = A*(r) ----
-            # NOTE: with weights, this is A*( clip( w*(Ax-b) ) )
-            self.op.adjoint_cl(r, grad)  # (Nx,Ny,K) Fortran
-
-            # ---- v = y - tau*grad ----
-            self.k_grad_step(
-                q, gws_x, None,
-                y.data, grad.data, x.data,   # the third argument is the output
-                np.float32(self.tau),
-                n_x
-            )
-
-            # ---- prox: apply in-place on v (x), then extrapolation uses y ----
-            self._apply_prox(x)  # MUST modify x in-place and return x (or ignore return)
-
-            # ---- momentum update ----
+            # ---- momentum coefficient ----
             t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
             beta = (t - 1.0) / t_new
 
-            self.k_extrapolate(
-                q, gws_x, None,
-                x.data, x_old.data, y.data,
-                np.float32(beta),
-                n_x
-            )
+            # NOTE: with weights, the gradient is A*( clip( w*(Ax-b) ) )
+            if self.fused:
+                # ---- grad = A*(r) batch by batch, each batch consumed by
+                #      x <- prox(y - tau*grad), y <- x + beta*(x - x_old) ----
+                gnorm = float(np.sqrt(self.fused_update.step(
+                    self.op, r, x, y, g_batch, self.tau, beta, self.prox_kind, self.lam, self.support_gpu)))
+            else:
+                # ---- grad = A*(r) ----
+                self.op.adjoint_cl(r, grad)  # (Nx,Ny,K) Fortran
 
-            # ---- x_old <- x ----
-            self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
+                # ---- v = y - tau*grad ----
+                self.k_grad_step(
+                    q, gws_x, None,
+                    y.data, grad.data, x.data,   # the third argument is the output
+                    np.float32(self.tau),
+                    n_x
+                )
+
+                # ---- prox: apply in-place on v (x), then extrapolation uses y ----
+                self._apply_prox(x)  # MUST modify x in-place and return x (or ignore return)
+
+                self.k_extrapolate(
+                    q, gws_x, None,
+                    x.data, x_old.data, y.data,
+                    np.float32(beta),
+                    n_x
+                )
+
+                # ---- x_old <- x ----
+                self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
+                gnorm = float(np.sqrt(clarray.vdot(grad, grad).get()))
 
             t = t_new
 
             # ---- regularizer diagnostics ----
             gval = 0.0
             if self.prox_kind in ("l1", "nonneg_l1") and self.lam != 0.0:
-                gval = self.lam * float(clarray.sum(clmath.fabs(x)).get())
+                if self.fused:
+                    gval = self.lam * self.fused_update.abs_sum(x)  # no coefficient-sized temporary
+                else:
+                    gval = self.lam * float(clarray.sum(clmath.fabs(x)).get())
 
             elif self.prox_kind == "nonneg_tv" and self.lam != 0.0:
                 b = self._tv_buffers
@@ -410,7 +437,6 @@ class FISTAHuber:
 
             obj = fval + gval
             xnorm = float(np.sqrt(clarray.vdot(x, x).get()))
-            gnorm = float(np.sqrt(clarray.vdot(grad, grad).get()))
 
             tv_res = None
             if self.prox_kind == "nonneg_tv":
@@ -459,7 +485,7 @@ class FISTAHuber:
         # ---------------- GPU cleanup ----------------
         q.finish()
 
-        for arr in (y, x_old, grad):
+        for arr in (y, x_old, grad, g_batch):
             if arr is not None:
                 arr.base_data.release()
 
@@ -471,7 +497,7 @@ class FISTAHuber:
                 arr.base_data.release()
             del self._tv_buffers
 
-        del y, x_old, grad, Ax
+        del y, x_old, grad, g_batch, Ax
         import gc
         gc.collect()
         q.finish()

@@ -127,6 +127,9 @@ All operators share the same interface:
 - `direct_cl(x, b)` writes the result of the forward operator into `b`;
 - `adjoint(b)` returns a new coefficient array;
 - `adjoint_cl(b, x)` writes the result of the adjoint into `x`;
+- `adjoint_batches_cl(b, out_batch, update)` computes the adjoint one orientation
+  batch at a time into a batch-sized buffer and calls `update(k0, Kb)` after each
+  batch (used by the fused FISTA update);
 - `free_memory()` releases the operator's GPU buffers.
 
 Each operator creates its own OpenCL context unless `ctx` and `queue` are
@@ -232,6 +235,14 @@ The constructor arguments are:
     during the scan.
   - `None` disables the constraint.
   - An `(Nx, Ny)` boolean array gives a custom support.
+- `fused` (default `True`): fuse the gradient step, the prox and the momentum
+  update into the adjoint, one orientation batch at a time. Each batch of the
+  gradient is consumed as soon as it is computed, so the solver keeps two
+  coefficient-sized arrays (`x` and `y`) instead of four (`x`, `y`, `x_old`
+  and the gradient), with identical iterates. It applies to the element-wise
+  proxes (`"nonneg"`, `"l1"`, `"nonneg_l1"`) with an operator that provides
+  `adjoint_batches_cl` (`SinglePhaseForwardOperator`); otherwise the unfused
+  update runs.
 
 `run(x, b, niter, ...)` updates `x` in place, starting from its current
 values, and returns it:

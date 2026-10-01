@@ -651,9 +651,10 @@ class SinglePhaseForwardOperator:
     def default_sparse_budget_gb(self):
         """
         Default GPU memory budget (GB) for the sparse PF matrix: half of what is
-        left of the device memory after a reserve for the solver (FISTA keeps
-        ~5 arrays of the coefficient size (Nx, Ny, K) and 2 of the data size
-        (N_Omega, My, N_seg): the data and the prediction/residual), the operator's
+        left of the device memory after a reserve for the solver (FISTA with the
+        fused update keeps 2 arrays of the coefficient size (Nx, Ny, K), reserved
+        with one more as a margin, and 2 of the data size (N_Omega, My, N_seg):
+        the data and the prediction/residual), the operator's
         buffers and a 1 GB margin. Conservative on purpose: the GPU may be
         shared, and the solver's arrays take priority.
         """
@@ -663,7 +664,7 @@ class SinglePhaseForwardOperator:
         if buffers is None:  # (only computed with verbose=True)
             buffers = 4 * self.K_batch_max * (self.N_Omega * self.My + self.Nx * self.Ny
                                               + self.N_Omega * self.N_eta * self.N_peaks)
-        free = self.queue.device.global_mem_size - 5 * coeff_bytes - 2 * data_bytes - buffers - 1024**3
+        free = self.queue.device.global_mem_size - 3 * coeff_bytes - 2 * data_bytes - buffers - 1024**3
         return 0.5 * max(free, 0) / 1024**3
 
 
@@ -828,8 +829,9 @@ class SinglePhaseForwardOperator:
 
 
 
-    def _radon_gratopy_backward(self, coeffs, k0, Kb):
-        """gratopy backprojection of coeffs_sino_C into orientations k0 .. k0+Kb-1 of coeffs."""
+    def _radon_gratopy_backward(self, coeffs, k0, Kb, Ktot=None):
+        """gratopy backprojection of coeffs_sino_C into orientations k0 .. k0+Kb-1 of coeffs,
+        an (Nx, Ny, Ktot) Fortran-order array (Ktot: default K)."""
         Nx, Ny, My, R, Kmax = self.Nx, self.Ny, self.My, self.N_Omega, self.K_batch_max
         self._coeffs_batch_F.fill(0.0)
         self.coeffs_sino_F.fill(0.0)
@@ -844,7 +846,8 @@ class SinglePhaseForwardOperator:
         self.k.scatter_k_lastaxis_f(
             self.queue, (total,), None,
             coeffs.data, self._coeffs_batch_F.data,
-            np.int32(Nx), np.int32(Ny), np.int32(self.K), np.int32(k0), np.int32(Kb), np.int32(total),
+            np.int32(Nx), np.int32(Ny), np.int32(self.K if Ktot is None else Ktot), np.int32(k0), np.int32(Kb),
+            np.int32(total),
         )
 
 
@@ -896,51 +899,75 @@ class SinglePhaseForwardOperator:
         assert coeffs.shape == (self.Nx, self.Ny, self.K)
         assert coeffs.flags.f_contiguous
 
-        # ---------------- zero output ----------------
-        coeffs.fill(0.0)
+        # every orientation is written by exactly one batch
+        for ib, b in enumerate(self.batches):
+            self._adjoint_batch(data, ib, coeffs, b["k_start"], self.K)
 
+    def adjoint_batches_cl(self, data, out_batch, update):
+        """
+        The adjoint, one orientation batch at a time, without a coefficient-sized output.
+
+        For every batch of orientations k0 .. k0+Kb-1, their part of A^T data is written to
+        the first Nx * Ny * Kb elements of out_batch (Fortran order: pixel fastest, then the
+        orientation within the batch), and then update(k0, Kb) is called, e.g. to enqueue a
+        kernel that consumes it before the next batch overwrites it.
+
+        Parameters
+        ----------
+        data : clarray, (N_Omega, My, N_seg), C-order
+        out_batch : clarray, float32, at least Nx * Ny * K_batch_max elements
+        update : callable (k0, Kb)
+        """
+        assert data.shape == (self.N_Omega, self.My, self.N_seg)
+        assert data.flags.c_contiguous
+        assert out_batch.dtype == np.float32 and out_batch.size >= self.Nx * self.Ny * self.K_batch_max
+        for ib, b in enumerate(self.batches):
+            self._adjoint_batch(data, ib, out_batch, 0, self.K_batch_max)
+            update(b["k_start"], b["K_batch"])
+
+    def _adjoint_batch(self, data, ib, target, k_target, K_target):
+        """A^T data for orientation batch ib, written to orientations k_target .. k_target+Kb-1
+        of target, an (Nx, Ny, K_target) Fortran-order array."""
+        b = self.batches[ib]
+        k0 = b["k_start"]
+        Kb = b["K_batch"]
         Kmax = self.K_batch_max
         R = self.N_Omega
         CP = int(self.N_eta * self.N_peaks)
         My = self.My
         alpha = R / np.pi
-        sparse = self.pf_mode == "sparse"
 
-        for ib, b in enumerate(self.batches):
-            k0 = b["k_start"]
-            Kb = b["K_batch"]
+        # 1) PF^T product -> coeffs_sino_C (R, My, Kmax)
+        if self.pf_mode == "sparse":
+            sb = self.sparse_batches[ib]
+            self.k.spmm_pf_adjoint_c(
+                self.queue,
+                (Kb, My, R),
+                None,
+                data.data,
+                sb["row_ptr_a"].data,
+                sb["col_j"].data,
+                sb["val_a"].data,
+                self.coeffs_sino_C.data,
+                np.int32(R),
+                np.int32(My),
+                np.int32(Kb),
+                np.int32(CP),
+                np.int32(Kmax),
+                np.float32(alpha),
+            )
+        else:
+            self._dense_pf_batch(k0, Kb)
+            # batched gemm with the PF batch transposed on the fly; overwrites coeffs_sino_C
+            batched_gemm_adj_clblast(self.queue, data, self._basis_batch_kmax.reshape((R, Kmax, CP)),
+                                     self.coeffs_sino_C, R, My, CP, Kmax, alpha)
 
-            # 1) PF^T product -> coeffs_sino_C (R, My, Kmax)
-            if sparse:
-                sb = self.sparse_batches[ib]
-                self.k.spmm_pf_adjoint_c(
-                    self.queue,
-                    (Kb, My, R),
-                    None,
-                    data.data,
-                    sb["row_ptr_a"].data,
-                    sb["col_j"].data,
-                    sb["val_a"].data,
-                    self.coeffs_sino_C.data,
-                    np.int32(R),
-                    np.int32(My),
-                    np.int32(Kb),
-                    np.int32(CP),
-                    np.int32(Kmax),
-                    np.float32(alpha),
-                )
-            else:
-                self._dense_pf_batch(k0, Kb)
-                # batched gemm with the PF batch transposed on the fly; overwrites coeffs_sino_C
-                batched_gemm_adj_clblast(self.queue, data, self._basis_batch_kmax.reshape((R, Kmax, CP)),
-                                         self.coeffs_sino_C, R, My, CP, Kmax, alpha)
-
-            # 2) backprojection into orientations k0 .. k0+Kb-1 of coeffs
-            if self.projector == "native":
-                self.radon.backward(self.coeffs_sino_C, self._img_k, Kmax)
-                self.radon.scatter(self._img_k, coeffs, k0, Kb, Kmax)
-            else:
-                self._radon_gratopy_backward(coeffs, k0, Kb)
+        # 2) backprojection into the target
+        if self.projector == "native":
+            self.radon.backward(self.coeffs_sino_C, self._img_k, Kmax)
+            self.radon.scatter(self._img_k, target, k_target, Kb, Kmax)
+        else:
+            self._radon_gratopy_backward(target, k_target, Kb, K_target)
 
 
 
