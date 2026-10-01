@@ -226,8 +226,11 @@ def estimate_L_power_streamed(op, niter=20, seed=0, eps=1e-30, verbose=1):
     rng = np.random.default_rng(seed)
     x = np.empty(op.Nx * op.Ny * op.K, np.float32)
     z = np.empty_like(x)
-    for i in range(0, x.size, 1 << 24):
-        x[i:i + (1 << 24)] = rng.standard_normal(min(1 << 24, x.size - i)).astype(np.float32)
+    # the random start of estimate_L_power (drawn as (Nx, Ny, K), C order), one x column at a
+    # time so that no full-size float64 array is needed: the same estimate up to rounding
+    x3 = x.reshape(op.K, op.Ny, op.Nx)
+    for ix in range(op.Nx):
+        x3[:, :, ix] = rng.standard_normal((op.Ny, op.K)).astype(np.float32).T
     x *= np.float32(1.0 / (np.sqrt(_dot(x, x)) + eps))
     Ax = clarray.empty(op.queue, (op.N_Omega, op.My, op.N_seg), np.float32, order="C")
     L_est = 0.0
