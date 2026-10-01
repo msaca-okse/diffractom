@@ -1,14 +1,27 @@
 # Element-wise kernels: 64-bit indices in a grid-stride loop (see launch.py), so the coefficient and
 # data arrays may have more than 2^31 elements.
 FISTA_KERNELS = r"""
-__kernel void residual_axpb(
-    __global const float *Ax,
+// Ax <- Ax - b, in place (the prediction buffer becomes the residual)
+__kernel void residual_inplace(
+    __global float *Ax,
     __global const float *b,
-    __global float *r,
     const ulong n
 ){
     for (size_t i = get_global_id(0); i < n; i += get_global_size(0))
-        r[i] = Ax[i] - b[i];
+        Ax[i] = Ax[i] - b[i];
+}
+
+// Ax <- w * (Ax - b), in place; one weight per segment (eta bin, ring), shared by all
+// (omega, translation): the data are (O, D, nseg) C-order, so the segment is i % nseg
+__kernel void weighted_residual_inplace(
+    __global float *Ax,
+    __global const float *b,
+    __global const float *w,
+    const ulong nseg,
+    const ulong n
+){
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0))
+        Ax[i] = w[i % nseg] * (Ax[i] - b[i]);
 }
 
 // v = y - tau * grad
@@ -91,11 +104,6 @@ from .prox_tv import (
     TVProxKernels,
     prox_tv_nonneg_inplace,
 )
-#######################
-#
-#    AN EXTRA DATA ARRAY IS ALLOCATED FOR DIAGNOSTICS
-#
-######################
 
 
 # -------------------- FISTA helper kernels --------------------
@@ -149,7 +157,8 @@ class FISTAHuber:
 
         self.fista_prg = build_fista_program(self.ctx)
         self.k_copy_buf       = cl.Kernel(self.fista_prg, "copy_buf")
-        self.k_residual_axpb  = cl.Kernel(self.fista_prg, "residual_axpb")
+        self.k_residual_inplace = cl.Kernel(self.fista_prg, "residual_inplace")
+        self.k_weighted_residual_inplace = cl.Kernel(self.fista_prg, "weighted_residual_inplace")
         self.k_grad_step      = cl.Kernel(self.fista_prg, "grad_step")
         self.k_extrapolate    = cl.Kernel(self.fista_prg, "extrapolate")
         self.k_huber_clip_inplace = cl.Kernel(self.fista_prg, "huber_clip_inplace")
@@ -240,9 +249,10 @@ class FISTAHuber:
         """
         x0_gpu:   clarray (Nx, Ny, K) float32, order='F'
         out_gpu:  clarray (O, D, Nseg) float32, order='C'
-        weights:  OPTIONAL clarray (O, D, Nseg) float32, order='C'
-                If provided, residuals are multiplied elementwise by weights.
-                weights==0 masks out (ignores) corrupted data points.
+        weights:  OPTIONAL clarray float32 with Nseg = N_eta * N_rings elements, C-contiguous,
+                e.g. shaped (N_eta, N_rings) or (Nseg,): one weight per segment (eta bin, ring),
+                shared by all rotations and translations. The residual of a data point in
+                segment j is multiplied by weights[j]; zero weight excludes the segment.
         returns x_gpu solution (same layout as x0_gpu)
         """
         q = self.queue
@@ -273,8 +283,9 @@ class FISTAHuber:
                 raise TypeError("weights must be float32")
             if weights.queue.context.int_ptr != self.ctx.int_ptr:
                 raise ValueError("weights context != operator context")
-            if weights.shape != out_gpu.shape:
-                raise ValueError(f"weights.shape {weights.shape} must match out_gpu.shape {out_gpu.shape}")
+            if weights.size != out_gpu.shape[-1] or not weights.flags.c_contiguous:
+                raise ValueError(f"weights must be C-contiguous with N_eta * N_rings = {out_gpu.shape[-1]} "
+                                 f"elements, one per segment; got shape {weights.shape}")
 
         # ---- persistent buffers ----
         x = x0_gpu
@@ -301,8 +312,7 @@ class FISTAHuber:
         self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
         gws_Ax, n_Ax = elementwise(out_gpu.size)
 
-        Ax = None
-        r = None
+        Ax = None  # the prediction A(y), overwritten in place by the (weighted, clipped) residual
         t = 1.0
 
         # ---- diagnostics storage (always collected) ----
@@ -313,22 +323,16 @@ class FISTAHuber:
             # ---- Ax = A(y) ----
             if Ax is None:
                 Ax = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
-                r  = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
 
             self.op.direct_cl(y, Ax)
 
-            # ---- r = Ax - b ----
-            self.k_residual_axpb(
-                q, gws_Ax, None,
-                Ax.data, out_gpu.data, r.data,
-                n_Ax
-            )
-
-            # ---- optional weighting: r <- w * r ----
+            # ---- r = w * (Ax - b), in place in Ax ----
+            r = Ax
             if use_weights:
-                # (requires weights to be contiguous like r/out_gpu; all are order='C' here)
-                # elementwise multiply in-place on r
-                r *= weights
+                self.k_weighted_residual_inplace(q, gws_Ax, None, Ax.data, out_gpu.data, weights.data,
+                                                 np.uint64(out_gpu.shape[-1]), n_Ax)
+            else:
+                self.k_residual_inplace(q, gws_Ax, None, Ax.data, out_gpu.data, n_Ax)
 
             # ---- L2 data term (diagnostic only) ----
             # f = 0.5 * || (w*(Ax-b)) ||^2   if weights is provided
@@ -461,15 +465,13 @@ class FISTAHuber:
 
         if Ax is not None:
             Ax.base_data.release()
-        if r is not None:
-            r.base_data.release()
 
         if self.prox_kind == "nonneg_tv":
             for arr in self._tv_buffers.values():
                 arr.base_data.release()
             del self._tv_buffers
 
-        del y, x_old, grad, Ax, r
+        del y, x_old, grad, Ax
         import gc
         gc.collect()
         q.finish()

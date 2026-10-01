@@ -652,8 +652,8 @@ class SinglePhaseForwardOperator:
         """
         Default GPU memory budget (GB) for the sparse PF matrix: half of what is
         left of the device memory after a reserve for the solver (FISTA keeps
-        ~5 arrays of the coefficient size (Nx, Ny, K) and ~4 of the data size
-        (N_Omega, My, N_seg), including the data and weights), the operator's
+        ~5 arrays of the coefficient size (Nx, Ny, K) and 2 of the data size
+        (N_Omega, My, N_seg): the data and the prediction/residual), the operator's
         buffers and a 1 GB margin. Conservative on purpose: the GPU may be
         shared, and the solver's arrays take priority.
         """
@@ -663,7 +663,7 @@ class SinglePhaseForwardOperator:
         if buffers is None:  # (only computed with verbose=True)
             buffers = 4 * self.K_batch_max * (self.N_Omega * self.My + self.Nx * self.Ny
                                               + self.N_Omega * self.N_eta * self.N_peaks)
-        free = self.queue.device.global_mem_size - 5 * coeff_bytes - 4 * data_bytes - buffers - 1024**3
+        free = self.queue.device.global_mem_size - 5 * coeff_bytes - 2 * data_bytes - buffers - 1024**3
         return 0.5 * max(free, 0) / 1024**3
 
 

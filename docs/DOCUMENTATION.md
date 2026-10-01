@@ -236,8 +236,13 @@ The constructor arguments are:
 `run(x, b, niter, ...)` updates `x` in place, starting from its current
 values, and returns it:
 
-- `weights` (`FISTAHuber` only) is an array shaped like `b`. Zero weights
-  exclude data points, e.g. gaps between detector modules.
+- `weights` (`FISTAHuber` only) holds one weight per segment, i.e. per
+  (eta bin, ring): a C-contiguous float32 array with `N_eta * N_rings`
+  elements, e.g. shaped `(N_eta, N_rings)`. The same weights apply to every
+  rotation and translation, so the array is small. Zero weights exclude
+  segments, e.g. the eta bins along the rotation axis or gaps between
+  detector modules. The residual is computed in place in the prediction
+  buffer, so the solver holds two data-sized arrays: `b` and that buffer.
 - `verbose` and `diagnostics_interval` control the progress output.
 - After the run, `solver.iter_stats` holds one dict per iteration and
   `solver.final_stats` holds a summary.
