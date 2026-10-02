@@ -250,11 +250,12 @@ class Streamer:
 
 
 def fits_next_forward(op, streamer, extra_bytes, margin_gb=1.5):
-    """Whether one more data-sized array fits on the GPU (for adjoint_update's forward_into), given the
-    operator's buffers, the streamer's and extra_bytes of the solver's (data, prediction, gradient
-    batch, ...): an estimate, with a margin."""
+    """Whether one more data-sized array fits on the GPU (for the forward_into of adjoint_update or
+    FusedUpdate.step), given the operator's buffers, the streamer's (None: no streaming) and
+    extra_bytes of the solver's (data, prediction, gradient batch, coefficients on the GPU, ...):
+    an estimate, with a margin."""
     data_bytes = 4 * int(np.prod(op.data_shape))
-    used = op.device_bytes() + streamer.nbytes() + extra_bytes
+    used = op.device_bytes() + (streamer.nbytes() if streamer is not None else 0) + extra_bytes
     return used + data_bytes + margin_gb * 1024**3 <= op.queue.device.global_mem_size
 
 

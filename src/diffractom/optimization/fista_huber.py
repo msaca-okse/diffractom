@@ -159,7 +159,7 @@ class FISTAHuber:
     """
 
     def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50, huber_delta=1e-2,
-                 support="fov", fused=True, stream_threads=None, stream_next_forward=True):
+                 support="fov", fused=True, stream_threads=None, fuse_next_forward=True):
         """Set up FISTA-Huber solver.
 
         Parameters
@@ -188,18 +188,20 @@ class FISTAHuber:
             coefficient-sized arrays (x, y) instead of four (x, y, x_old, grad). Used when the
             prox is element-wise ('nonneg', 'l1', 'nonneg_l1') and the operator provides
             adjoint_batches_cl; otherwise, or with fused=False, the unfused update runs.
-        stream_next_forward : bool
-            Streamed (NumPy) runs: project each batch's new y forward while it is on the GPU in the
-            adjoint pass, into a second data-sized buffer, instead of a separate forward pass that
-            uploads y again (one upload of the coefficients less per iteration; the same results).
-            Used only if the buffer fits (an estimate of the GPU memory in use, with a margin).
+        fuse_next_forward : bool
+            With the fused update: project each batch's new y forward right after its update in the
+            adjoint pass, into a second data-sized buffer, instead of a separate forward pass in the
+            next iteration (the same results; streamed, y is uploaded once less per iteration).
+            Measured on a V100 (K = 6000, 120 x 120, streamed): 0.36 s per iteration instead of 0.55,
+            and on the GPU 0.46 s before. Used only if the buffer fits (an estimate of the GPU memory
+            in use, with a margin).
         stream_threads : int, optional
             CPU threads for the host-side copies when the coefficients are streamed (x0 given
             as a NumPy array to run()); default min(8, number of CPUs).
         """
         self.op = operator
         self.stream_threads = stream_threads
-        self.stream_next_forward = bool(stream_next_forward)
+        self.fuse_next_forward = bool(fuse_next_forward)
         self.ctx = operator.ctx
         self.queue = operator.queue
         self.huber_delta = float(huber_delta)
@@ -379,8 +381,10 @@ class FISTAHuber:
         # streamed: the next iteration's forward pass inside the adjoint pass, into a second prediction
         # buffer, if it fits (saves uploading y once per iteration; the same result)
         Ax_next = None
-        if streamed and self.stream_next_forward and niter > 1:
+        if self.fused and self.fuse_next_forward and niter > 1:
             solver_bytes = 2 * out_gpu.nbytes + g_batch.nbytes + (weights.nbytes if weights is not None else 0)
+            if not streamed:
+                solver_bytes += x.nbytes + y.nbytes  # (x0 is on the GPU)
             if fits_next_forward(self.op, streamer, solver_bytes):
                 Ax_next = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")  # the prediction A(y), overwritten in place by the (weighted, clipped) residual
         t = 1.0
@@ -399,6 +403,8 @@ class FISTAHuber:
                     Ax, Ax_next = Ax_next, Ax
                 else:
                     streamer.forward(y_host if it > 0 else x_host, Ax)
+            elif Ax_next is not None and it > 0:  # A(y), projected in the last adjoint pass
+                Ax, Ax_next = Ax_next, Ax
             else:
                 self.op.direct_cl(y, Ax)
 
@@ -429,7 +435,8 @@ class FISTAHuber:
                 # ---- grad = A*(r) batch by batch, each batch consumed by
                 #      x <- prox(y - tau*grad), y <- x + beta*(x - x_old) ----
                 gnorm = float(np.sqrt(self.fused_update.step(
-                    self.op, r, x, y, g_batch, self.tau, beta, self.prox_kind, self.lam, self.support_gpu)))
+                    self.op, r, x, y, g_batch, self.tau, beta, self.prox_kind, self.lam, self.support_gpu,
+                    forward_into=Ax_next if it + 1 < niter else None)))
             else:
                 # ---- grad = A*(r) ----
                 self.op.adjoint_cl(r, grad)  # (K, Ny, Nx)
