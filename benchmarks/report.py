@@ -27,6 +27,7 @@ LABELS = {
     "fbc8934": "NumPy API, (K, Ny, Nx) layout",
     "2c38f65": "sparse PF matrix generated directly, faster sparse products, store what fits, "
                "Radon in slices, larger batches",
+    "2c5f3f3": "Fourier-slice projector (projector=\"fft\"), the default above 400 x 400 pixels (results differ by ~1 %)",
     "8540fc1": "defaults: PF Gaussians cut at 3 sigma (was 3.46; results change by ~1 %), parallel random start of "
                "the streamed power iteration",
     "9702663": "streamed power iteration on all cores, streaming buffers kept with the operator; sparse up to 30 % "

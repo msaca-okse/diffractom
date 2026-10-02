@@ -23,6 +23,10 @@ dependencies = [
   "pyclblast"
 ]
 
+[project.optional-dependencies]
+# the Fourier-slice projector (projector="fft", the default for grids of more than 400 x 400 pixels)
+fft = ["pyvkfft"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

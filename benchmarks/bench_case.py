@@ -102,6 +102,7 @@ def main():
         out["K"], out["N_seg"] = int(op.K), int(op.N_seg)
         out["pf_mode"] = getattr(op, "pf_mode", "dense")  # versions before the sparse path: always dense
         out["pf_storage"] = getattr(op, "pf_storage", None)  # sparse modes, from 6a33ab7
+        out["projector"] = getattr(op, "projector", "native")
         out["batches"], out["K_batch_max"] = len(op.batches), int(op.K_batch_max)
         new_layout = hasattr(op, "coeff_shape")
         cshape = (op.K, op.Ny, op.Nx) if new_layout else (op.Nx, op.Ny, op.K)
