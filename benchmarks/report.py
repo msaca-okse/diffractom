@@ -27,6 +27,10 @@ LABELS = {
     "fbc8934": "NumPy API, (K, Ny, Nx) layout",
     "2c38f65": "sparse PF matrix generated directly, faster sparse products, store what fits, "
                "Radon in slices, larger batches",
+    "8540fc1": "defaults: PF Gaussians cut at 3 sigma (was 3.46; results change by ~1 %), parallel random start of "
+               "the streamed power iteration",
+    "9702663": "streamed power iteration on all cores, streaming buffers kept with the operator; sparse up to 30 % "
+               "fill when stored (results unchanged)",
     "9be35fb": "tiled Radon projections (image rows / sinogram bins staged in local memory); "
                "at least 4 batches in the sparse modes",
 }
@@ -392,8 +396,10 @@ def summary(rows, idx, versions):
     new = versions[-1]["sha"]
     old = next((v["sha"] for v in versions[::-1][1:] if any(r["version"]["sha"] == v["sha"] and r["case"]["mode"] == "stream" for r in rows)),
                versions[-2]["sha"])
-    out = ["", f"## Newest (`{new}`) against the previous main (`{old}`)", "",
-           "Seconds per FISTA iteration; speed-up = previous / newest (below 1: slower).", "",
+    out = ["", f"## Newest (`{new}`) against the version before it (`{old}`)", "",
+           "Seconds per FISTA iteration, steady state (without the first iteration, which includes the setup) "
+           "where both versions recorded it (marked s), else the average of the two iterations; "
+           "speed-up = previous / newest (below 1: slower). Single short runs: differences within about 10 % are noise.", "",
            "| case | mode | previous | newest | speed-up |", "|---|---|---:|---:|---:|"]
     cases = sorted({(r["case"]["K"], r["case"]["N"], r["case"]["sigma_deg"]) for r in rows if r["version"]["sha"] == new})
     for mode in ("gpu", "stream"):
@@ -402,7 +408,11 @@ def summary(rows, idx, versions):
             if a is None or b is None:
                 continue
             fa, fb = fista(a), fista(b)
-            sp = f"{fa / fb:.2f}x" if fa and fb else ""
+            steady = lambda r: r.get("phases", {}).get("fista", {}).get("steady_per_iteration") if r["status"] == "ok" else None
+            mark = ""
+            if steady(a) and steady(b):
+                fa, fb, mark = steady(a), steady(b), " s"
+            sp = f"{fa / fb:.2f}x{mark}" if fa and fb else ""
             if fa and fb and fa / fb < 0.95:
                 sp = f"**{sp}** (slower)"
             out.append(f"| K = {K}, {N} x {N}, sigma = {sig:g} | {mode} | {cell(a, fa)} | {cell(b, fb)} | {sp} |")

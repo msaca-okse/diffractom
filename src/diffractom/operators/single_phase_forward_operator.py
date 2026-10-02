@@ -42,10 +42,12 @@ class SinglePhaseForwardOperator:
         ctx: cl.Context | None = None,
         queue: cl.CommandQueue | None = None,
         pf_mode: str = "auto",
-        sparse_max_fill: float = 0.1,
+        sparse_max_fill: float = 0.3,
+        sparse_max_fill_partial: float = 0.1,
         sparse_max_gb: float | None = None,
         projector: str = "native",
         reserve_coefficient_arrays: int = 3,
+        pf_cutoff_sigma: float | None = 3.0,
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -82,15 +84,23 @@ class SinglePhaseForwardOperator:
               once and reused; otherwise it is re-evaluated batch by batch in
               every call.
             * ``"auto"`` (default): sparse, unless the fill fraction of the first
-              batch exceeds ``sparse_max_fill`` (then dense) or the sparse matrix
-              would not fit in ``sparse_max_gb`` (then generated).
+              batch exceeds ``sparse_max_fill``, or exceeds ``sparse_max_fill_partial``
+              and both CSR copies would not fit in ``sparse_max_gb`` (then dense). A
+              sparse matrix that does not fit is stored in part and generated in part.
 
             Measured on an A100 (simulated Al data, 360 omega x 180 eta x 8
             rings): sparse was 1.4-2.6x faster per FISTA iteration than dense for
             fill fractions of 0.2 % (sigma = 0.4 deg) and 5 % (sigma = 2 deg).
         sparse_max_fill : float
-            Largest fill fraction for which ``pf_mode="auto"`` chooses sparse.
-            The default, 10 %, is roughly where the two break even.
+            Largest fill fraction for which ``pf_mode="auto"`` chooses sparse, if the whole
+            matrix (both CSR copies) is stored. Default 30 %: measured on an A40 (sigma = 4 deg,
+            25 % fill), the stored sparse matrix took 0.99 s per FISTA iteration and the dense
+            path 1.85 s (120 x 120, K = 4000; 400 x 400, K = 2000: 1.95 s and 2.34 s); at 48 %
+            the dense path was faster.
+        sparse_max_fill_partial : float
+            Largest fill fraction for which ``pf_mode="auto"`` chooses sparse when only part of it
+            fits (the adjoint copy, the rest generated in every call): generating or transposing
+            at high fill costs more than the dense path. Default 10 %.
         sparse_max_gb : float, optional
             GPU memory budget (GB) for the sparse matrix, estimated from the first
             batch. Default (``default_sparse_budget_gb``): half of the memory left
@@ -105,6 +115,17 @@ class SinglePhaseForwardOperator:
             the orientations; ``"gratopy"`` uses gratopy. Both use the same
             discretisation (they agree to float32 rounding); the native one is
             2-8x faster for many orientations.
+        pf_cutoff_sigma : float, optional
+            Where the Gaussian of each pole is cut to zero, in units of its width sigma: the PF
+            matrix entries are exp(-(1 - |cos a|) / sigma^2) of the angle a between pole and probed
+            direction, set to zero where (1 - |cos a|) / sigma^2 >= pf_cutoff_sigma^2 / 2, i.e.
+            for a >= pf_cutoff_sigma * sigma (small angles). Default 3: the Gaussian is cut at
+            exp(-4.5) = 1.1 % of its peak, and 1.1 % of its mass lies beyond (the kept entries are
+            not rescaled). None: the threshold 6 of versions before 2026-10-02, a cut at
+            sqrt(12) = 3.46 sigma (0.25 %). Fewer non-zeros for smaller values, about
+            (pf_cutoff_sigma / 3.46)^2 as many (3 sigma: 0.75): faster, and more of the sparse
+            matrix fits. Measured change of the forward projection and a FISTA result against None:
+            3 sigma 0.9 %, 2.5 sigma 4.2 %, 2 sigma 13 %.
         reserve_coefficient_arrays : int
             Coefficient-sized (K, Ny, Nx) arrays the default sparse-PF budget leaves room for
             on the GPU: 3 (default) for FISTA with the fused update (2 arrays and a margin),
@@ -114,6 +135,9 @@ class SinglePhaseForwardOperator:
         """
 
         self.reserve_coefficient_arrays = int(reserve_coefficient_arrays)
+        self.pf_cutoff_sigma = pf_cutoff_sigma
+        # compile option of the PF kernels (none by default: their built-in threshold 6.0f)
+        self.pf_cut_options = [] if pf_cutoff_sigma is None else [f"-DPF_CUT={float(pf_cutoff_sigma) ** 2 / 2!r}f"]
 
         # --- context / queue ---
         if ctx is not None and queue is not None:
@@ -164,7 +188,7 @@ class SinglePhaseForwardOperator:
 
         # --- build kernels ---
         self.prg, self.k, self.pf_prg = build_all_opencl(self.ctx, ts=16)
-        self.pf_prg = build_pf_program(self.ctx)
+        self.pf_prg = build_pf_program(self.ctx, self.pf_cut_options)
         self.pfmatrix_eval_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval")
         self.pfpoles_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval_poles")
 
@@ -215,7 +239,8 @@ class SinglePhaseForwardOperator:
         if sparse_max_gb is None:
             sparse_max_gb = self.default_sparse_budget_gb()
         if pf_mode != "dense":
-            self.build_sparse_pf(mode=pf_mode, max_fill=sparse_max_fill, max_gb=sparse_max_gb)
+            self.build_sparse_pf(mode=pf_mode, max_fill=sparse_max_fill, max_gb=sparse_max_gb,
+                                 max_fill_partial=sparse_max_fill_partial)
         if self.verbose:
             if self.pf_mode == "generated":
                 how = f"{len(self.batches)} batches, stored: {self.pf_storage}, the others generated in every call"
@@ -486,11 +511,21 @@ class SinglePhaseForwardOperator:
 
 
 
+    def release_streamer(self):
+        """Release the buffers of streaming NumPy coefficients through the GPU (pinned host
+        buffers, 4 image batches on the GPU), kept between calls; the next streamed call makes
+        them again."""
+        st = getattr(self, "_streamer", None)
+        if st is not None:
+            st.release()
+            self._streamer = None
+
     def free_memory(self):
         """
         Release OpenCL buffers created by allocate_coefficient_buffer() and
         remove the corresponding attributes from this object.
         """
+        self.release_streamer()
         buffer_names = [
             "coeffs_sino_F",
             "coeffs_sino_C",
@@ -644,12 +679,11 @@ class SinglePhaseForwardOperator:
             data = clarray.empty(self.queue, self.data_shape, dtype=np.float32)
             self.direct_cl(coeffs, data)
             return data
-        from ..optimization.streaming import Streamer
+        from ..optimization.streaming import streamer_for
         x = as_host(coeffs, self.coeff_shape, "coeffs")
         data = clarray.empty(self.queue, self.data_shape, dtype=np.float32)
-        st = Streamer(self)
+        st = streamer_for(self)
         st.forward(x.ravel(), data)
-        st.release()
         out = data.get()
         data.base_data.release()
         return out
@@ -722,13 +756,14 @@ class SinglePhaseForwardOperator:
 
 
 
-    def build_sparse_pf(self, mode="auto", max_fill=0.1, max_gb=None):
+    def build_sparse_pf(self, mode="auto", max_fill=0.3, max_gb=None, max_fill_partial=0.1):
         """
         Set up the sparse PF matrix (SparsePFGenerator): per K-batch, two CSR structures, forward
         rows (r, j) listing orientations and adjoint rows (r, k) listing segments, j = c*P + p.
 
         The fill fraction is measured on the first (dense-sized) batch. mode "auto": dense if it
-        exceeds ``max_fill``. Otherwise the batches are made larger (sparse_batch_size), and the
+        exceeds ``max_fill``, or ``max_fill_partial`` while both CSR copies would not fit in
+        ``max_gb``. Otherwise the batches are made larger (sparse_batch_size), and the
         matrix is stored as far as ``max_gb`` allows, in this order of preference:
           both CSRs of every batch;
           the adjoint CSR of every batch (the forward one is transposed from it in every call);
@@ -765,11 +800,19 @@ class SinglePhaseForwardOperator:
         nnz0 = int(g["row_ptr_a"][n_rows0:n_rows0 + 1].get()[0])
         gen.release()
         fill = nnz0 / (R * b0["K_batch"] * CP)
+        reason = None
         if auto and fill > max_fill:
+            reason = f"fill fraction {100 * fill:.2f} % > {100 * max_fill:.2f} %"
+        elif auto and fill > max_fill_partial and max_gb is not None:
+            nb_est = -(-self.K // self.sparse_batch_size(fill))
+            both_est = 12 * fill * R * self.K * CP + 4 * (nb_est * (R * CP + 1) + R * self.K + nb_est)
+            if both_est > max_gb * 1024**3:
+                reason = (f"fill fraction {100 * fill:.2f} % > {100 * max_fill_partial:.2f} % and the whole "
+                          f"sparse matrix ({both_est / 1024**3:.1f} GB) does not fit in {max_gb:.1f} GB")
+        if reason is not None:
             self.pf_mode = "dense"
             if self.verbose:
-                print(f"Sparse PF matrix: fill fraction {100 * fill:.2f} % > {100 * max_fill:.2f} %, "
-                      "using the dense PF path")
+                print(f"Sparse PF matrix: {reason}, using the dense PF path")
             return
 
         # larger batches than a dense PF batch allows; no dense batch buffer
@@ -1113,12 +1156,11 @@ class SinglePhaseForwardOperator:
             coeffs = clarray.empty(self.queue, self.coeff_shape, dtype=np.float32)
             self.adjoint_cl(data, coeffs)
             return coeffs
-        from ..optimization.streaming import Streamer
+        from ..optimization.streaming import streamer_for
         d = clarray.to_device(self.queue, as_host(data, self.data_shape, "data"))
         out = np.empty(self.coeff_shape, np.float32)
-        st = Streamer(self)
+        st = streamer_for(self)
         st.adjoint_to_host(d, out.ravel())
-        st.release()
         d.base_data.release()
         return out
 

@@ -57,12 +57,25 @@ class Streamer:
         pin = lambda: _Pinned(op.ctx, self.q, n)
         self.pin_up = {"x": [pin(), pin()], "y": [pin(), pin()]}
         self.pin_dn = {"x": [pin(), pin()], "y": [pin(), pin()]}
-        self.pool = ThreadPoolExecutor(n_threads or min(8, os.cpu_count() or 1))  # CPU copies
+        self.n_threads = n_threads or min(8, os.cpu_count() or 1)
+        self.pool = ThreadPoolExecutor(self.n_threads)  # CPU copies
         self.io_up = ThreadPoolExecutor(1)  # transfers of the adjoint pass, in order
-        if fused_update is not None:  # norms of the adjoint pass, without blocking the host
-            nb = len(op.batches)
-            self.sums = [PartialSums(fused_update, nb) for _ in range(3)]
         self.io_dn = ThreadPoolExecutor(1)
+        self.k_batch_max = op.K_batch_max
+        self.released = False
+        self.fu, self.sums = None, []
+        self.use_fused_update(fused_update)
+
+    def use_fused_update(self, fused_update):
+        """Set the fused update whose kernels compute the norms of the adjoint pass."""
+        if fused_update is self.fu:
+            return
+        for p in self.sums:
+            p.release()
+        self.fu, self.sums = fused_update, []
+        if fused_update is not None:  # norms of the adjoint pass, without blocking the host
+            nb = len(self.op.batches)
+            self.sums = [PartialSums(fused_update, nb) for _ in range(3)]
 
     # ---------------------------------------------------------------- helpers
     def flat(self, x):
@@ -109,10 +122,11 @@ class Streamer:
                 up[ib + 1] = self._upload(self.view(src_flat, ib + 1), self.pin_up["y"][t], self.ys[t],
                                           [done[t]] if done[t] is not None else None)
 
-    def adjoint_update(self, x_flat, y_flat, r, g_batch, tau, beta, prox_kind, lam, support_gpu):
+    def adjoint_update(self, x_flat, y_flat, r, g_batch, tau, beta, prox_kind, lam, support_gpu, y_src=None):
         """grad = A^T r batch by batch; x <- prox(y - tau*grad), y <- x + beta*(x - x_old), with x
-        and y streamed from and to the host arrays. Returns ||grad||^2, ||x||^2 and sum|x| (the
-        latter only for L1 proxes).
+        and y streamed from and to the host arrays (y read from y_src if given, e.g. x in the first
+        iteration, when y = x). Returns ||grad||^2, ||x||^2 and sum|x| (the latter only for L1
+        proxes).
 
         The transfers run in two worker threads (uploads, downloads): NVIDIA's OpenCL blocks the
         calling thread in a device-to-host copy until it has run, so the thread that enqueues
@@ -123,6 +137,7 @@ class Streamer:
         use_mask = np.int32(support_gpu is not None)
         code = np.int32(PROX_CODES[prox_kind])
         want_l1 = prox_kind in ("l1", "nonneg_l1") and lam != 0.0
+        y_in = y_flat if y_src is None else y_src
         up, dn = [None] * nb, [None] * nb
         gsq, xsq, xabs = (p.reset() for p in self.sums)
         start = cl.enqueue_marker(q)  # the forward pass, which used the staging slots, is done
@@ -134,7 +149,7 @@ class Streamer:
                 dn[ib - 2].result()  # slot s has been downloaded
             else:
                 start.wait()
-            for name, flat, stage in (("x", x_flat, self.xs[s]), ("y", y_flat, self.ys[s])):
+            for name, flat, stage in (("x", x_flat, self.xs[s]), ("y", y_in, self.ys[s])):
                 pin = self.pin_up[name][s]
                 n = self.npix * op.batches[ib]["K_batch"]
                 self._pcopy(pin.arr[:n], self.view(flat, ib))
@@ -202,6 +217,9 @@ class Streamer:
         self.tq_dn.finish()
 
     def release(self):
+        if self.released:
+            return
+        self.released = True
         self.finish()
         self.pool.shutdown()
         self.io_up.shutdown()
@@ -210,40 +228,110 @@ class Streamer:
             p.release()
         for a in self.xs + self.ys:
             a.base_data.release()
-        for p in getattr(self, "sums", []):
+        for p in self.sums:
             p.release()
+        self.sums = []
 
 
-def _dot(a, b, chunk=1 << 24):
-    """float64 dot product of two float32 arrays, in chunks (no full-size float64 temporary)."""
-    return float(sum(np.dot(a[i:i + chunk].astype(np.float64), b[i:i + chunk]) for i in range(0, a.size, chunk)))
+def streamer_for(op, fused_update=None, n_threads=None):
+    """The operator's Streamer: created on first use and kept (released by op.release_streamer()
+    or op.free_memory()), so that its pinned host buffers and device staging slots are allocated
+    once, not in every call (37 s per call at 1200 x 1200 pixels, K = 20000). The staging slots
+    hold 4 batches of images on the GPU meanwhile."""
+    st = getattr(op, "_streamer", None)
+    if st is not None and (st.released or st.k_batch_max != op.K_batch_max
+                           or (n_threads is not None and n_threads != st.n_threads)):
+        st.release()
+        st = None
+    if st is None:
+        st = Streamer(op, None, n_threads)
+        op._streamer = st
+    st.use_fused_update(fused_update)
+    return st
 
 
-def estimate_L_power_streamed(op, niter=20, seed=0, eps=1e-30, verbose=1):
+def _chunks(n, chunk):
+    return [(i, min(i + chunk, n)) for i in range(0, n, chunk)]
+
+
+def _dot(a, b, chunk=1 << 24, pool=None):
+    """float64 dot product of two float32 arrays, in chunks (no full-size float64 temporary). The
+    chunks' dot products are summed in order, with or without a thread pool."""
+    f = lambda c: np.dot(a[c[0]:c[1]].astype(np.float64), b[c[0]:c[1]])
+    cs = _chunks(a.size, chunk)
+    return float(sum(pool.map(f, cs) if pool is not None else map(f, cs)))
+
+
+def _scale(x, factor, pool, chunk=1 << 24):
+    """x *= factor (float32), in chunks on the thread pool."""
+    def f(c):
+        x[c[0]:c[1]] *= factor
+    list(pool.map(f, _chunks(x.size, chunk)))
+
+
+def _random_start(x3, rng, pool, seed, parallel):
+    """The random start of estimate_L_power, drawn as (Nx, Ny, K) in C order, into x3 (K, Ny, Nx).
+
+    parallel=False: the same numbers as estimate_L_power (a single random stream, drawn one x
+    column at a time on this thread; converting and writing them, the slower part, runs on the
+    pool, a block of columns at a time). parallel=True: column ix from its own stream
+    (default_rng([seed, ix])), all on the pool: much faster, but different numbers, so a slightly
+    different estimate of L."""
+    K, Ny, Nx = x3.shape
+    if parallel:
+        def col(ix):
+            x3[:, :, ix] = np.random.default_rng([seed, ix]).standard_normal((Ny, K)).astype(np.float32).T
+        list(pool.map(col, range(Nx)))
+        return
+    B = max(1, min(Nx, (256 << 20) // (4 * Ny * K)))  # columns per block (~256 MB in float32)
+    kc = _chunks(K, max(1, -(-K // (4 * pool._max_workers))))
+
+    def write(ix0, blk):  # x3[:, :, ix0 + b] = blk[b].T, K-ranges in parallel
+        def part(c):
+            x3[c[0]:c[1], :, ix0:ix0 + len(blk)] = blk[:, :, c[0]:c[1]].transpose(2, 1, 0)
+        list(pool.map(part, kc))
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(1) as writer:  # writes block b while block b + 1 is drawn
+        pending = None
+        for ix0 in range(0, Nx, B):
+            blk = np.empty((min(B, Nx - ix0), Ny, K), np.float32)
+            for b in range(len(blk)):
+                blk[b] = rng.standard_normal((Ny, K))   # float64 -> float32, as .astype(np.float32)
+            if pending is not None:
+                pending.result()
+            pending = writer.submit(write, ix0, blk)
+        pending.result()
+
+
+def estimate_L_power_streamed(op, niter=20, seed=0, eps=1e-30, verbose=1, parallel_start=True):
     """estimate_L_power with the two coefficient-sized vectors in host memory, streamed batch by
-    batch (for problems whose coefficient arrays do not fit on the GPU)."""
-    st = Streamer(op)
+    batch (for problems whose coefficient arrays do not fit on the GPU).
+
+    The host work (the random start, dot products, scaling) runs on the operator's thread pool;
+    the result is the same as with one thread. By default (parallel_start=True) the random start is
+    drawn in parallel, a column from its own stream (default_rng([seed, ix])): a few seconds.
+    parallel_start=False draws the same numbers as estimate_L_power (the GPU version), from one
+    stream, which cannot be parallelised: about 7 minutes for 1200 x 1200 pixels and K = 20000.
+    The two starts give slightly different estimates (and so slightly different FISTA steps)."""
+    st = streamer_for(op)
+    pool = st.pool
     rng = np.random.default_rng(seed)
     x = np.empty(op.Nx * op.Ny * op.K, np.float32)
     z = np.empty_like(x)
-    # the random start of estimate_L_power (drawn as (Nx, Ny, K), C order), one x column at a
-    # time so that no full-size float64 array is needed: the same estimate up to rounding
-    x3 = x.reshape(op.K, op.Ny, op.Nx)
-    for ix in range(op.Nx):
-        x3[:, :, ix] = rng.standard_normal((op.Ny, op.K)).astype(np.float32).T
-    x *= np.float32(1.0 / (np.sqrt(_dot(x, x)) + eps))
+    _random_start(x.reshape(op.K, op.Ny, op.Nx), rng, pool, seed, parallel_start)
+    _scale(x, np.float32(1.0 / (np.sqrt(_dot(x, x, pool=pool)) + eps)), pool)
     Ax = clarray.empty(op.queue, (op.N_Omega, op.My, op.N_seg), np.float32, order="C")
     L_est = 0.0
     for it in range(niter):
         st.forward(x, Ax)
         st.adjoint_to_host(Ax, z)
         st.finish()
-        L_est = _dot(x, z) / (_dot(x, x) + eps)
-        znorm = float(np.sqrt(_dot(z, z))) + eps
-        z *= np.float32(1.0 / znorm)
+        L_est = _dot(x, z, pool=pool) / (_dot(x, x, pool=pool) + eps)
+        znorm = float(np.sqrt(_dot(z, z, pool=pool))) + eps
+        _scale(z, np.float32(1.0 / znorm), pool)
         x, z = z, x
         if verbose:
             print(f"[power {it+1:02d}] L_est={L_est:.6e}  ||z||={znorm:.6e}")
     Ax.base_data.release()
-    st.release()
     return L_est

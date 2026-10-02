@@ -100,7 +100,7 @@ import pyopencl.clmath as clmath
 from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels, apply_support, support_mask_to_gpu
 from .launch import elementwise, pixel_orientation
 from .fused_update import FusedUpdate, fused_available
-from .streaming import Streamer
+from .streaming import streamer_for
 from ..utils.arrays import prepare_inputs
 
 from .prox_tv import (
@@ -291,17 +291,16 @@ class FISTAHuber:
         # unfused: x, y, x_old and grad; streamed: x and y in host memory
         streamer = None
         if streamed:
-            streamer = Streamer(self.op, self.fused_update, self.stream_threads)
+            streamer = streamer_for(self.op, self.fused_update, self.stream_threads)
             x_host = streamer.flat(x0_gpu)  # the iterate, updated in place
             y_host = np.empty_like(x_host)
             outside = None if self.support_gpu is None else ~self.support_gpu.get().astype(bool)
 
-            def init_batch(ib):  # start inside the support; y = x
+            def init_batch(ib):  # start inside the support; y = x: the first iteration reads x
                 xv = streamer.view(x_host, ib)
-                if outside is not None:
-                    xv.reshape(-1, outside.size)[:, outside] = 0.0
-                np.copyto(streamer.view(y_host, ib), xv)
-            list(streamer.pool.map(init_batch, range(len(self.op.batches))))
+                xv.reshape(-1, outside.size)[:, outside] = 0.0
+            if outside is not None:
+                list(streamer.pool.map(init_batch, range(len(self.op.batches))))
             x = y = x_old = grad = None
             g_batch = self.fused_update.batch_buffer(self.op)
         elif self.fused:
@@ -350,7 +349,7 @@ class FISTAHuber:
                 Ax = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
 
             if streamed:
-                streamer.forward(y_host, Ax)
+                streamer.forward(y_host if it > 0 else x_host, Ax)
             else:
                 self.op.direct_cl(y, Ax)
 
@@ -384,7 +383,8 @@ class FISTAHuber:
             if streamed:
                 # ---- as below, with x and y streamed from and to host memory ----
                 gsq, xsq, xabs = streamer.adjoint_update(x_host, y_host, r, g_batch, self.tau, beta,
-                                                         self.prox_kind, self.lam, self.support_gpu)
+                                                         self.prox_kind, self.lam, self.support_gpu,
+                                                         y_src=None if it > 0 else x_host)
                 gnorm = float(np.sqrt(gsq))
             elif self.fused:
                 # ---- grad = A*(r) batch by batch, each batch consumed by
@@ -504,7 +504,7 @@ class FISTAHuber:
         # ---------------- GPU cleanup ----------------
         q.finish()
         if streamed:
-            streamer.release()
+            streamer.use_fused_update(None)  # (the Streamer stays with the operator)
             del y_host
             x = x0_gpu
 
