@@ -276,6 +276,7 @@ class FISTAHuber:
                 segment. A NumPy array or a C-contiguous float32 pyopencl array.
         returns the solution: the NumPy array (streamed) or x0_gpu (on the GPU)
         """
+        t_start = time.perf_counter()  # iteration times in iter_stats count from here (setup in the first)
         q = self.queue
 
         # ---- inputs: shapes, dtype, layout; NumPy data and weights are uploaded ----
@@ -470,6 +471,7 @@ class FISTAHuber:
                 "beta": beta,
                 "tau": self.tau,
                 "tv_residual": tv_res,
+                "time": time.perf_counter() - t_start,  # after the iteration's last host read
                 "weighted": use_weights,
             })
 

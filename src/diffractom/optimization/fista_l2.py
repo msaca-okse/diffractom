@@ -213,6 +213,7 @@ class FISTAL2:
                 C-contiguous pyopencl array.
         returns the solution: the NumPy array (streamed) or x0_gpu (on the GPU)
         """
+        t_start = time.perf_counter()  # iteration times in iter_stats count from here (setup in the first)
         q = self.queue
 
         # ---- inputs: shapes, dtype, layout; NumPy data are uploaded ----
@@ -395,6 +396,7 @@ class FISTAL2:
                 "beta": beta,
                 "tau": self.tau,
                 "tv_residual": tv_res,
+                "time": time.perf_counter() - t_start,  # after the iteration's last host read
             })
 
             # ---- conditional printing only ----

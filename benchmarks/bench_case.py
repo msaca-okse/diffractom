@@ -134,6 +134,12 @@ def main():
             solver = FISTAHuber(op, prox_kind="nonneg", L=1.1 * L)
             phase("fista", lambda: run(lambda: solver.run(x, b, niter=fista_iters, verbose=0)))
         phases["fista"]["per_iteration"] = phases["fista"]["seconds"] / fista_iters
+        times = [st.get("time") for st in getattr(solver, "iter_stats", [])]
+        if times and all(t is not None for t in times):  # versions from 355cd4f on
+            its = [b - a for a, b in zip([0.0] + times[:-1], times)]
+            phases["fista"]["iterations"] = its
+            if len(its) > 1:  # without the first iteration, which includes the setup (e.g. streaming buffers)
+                phases["fista"]["steady_per_iteration"] = sum(its[1:]) / (len(its) - 1)
     except Exception as e:  # noqa: BLE001
         msg = f"{type(e).__name__}: {e}"
         oom = any(s in msg.upper() for s in ("MEM_OBJECT_ALLOCATION_FAILURE", "OUT_OF_RESOURCES", "OUT_OF_HOST_MEMORY",
