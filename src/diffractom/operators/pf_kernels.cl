@@ -611,6 +611,7 @@ __kernel void spmm_pf_forward_c(
     const size_t line0 = (size_t)r * My + y0;
     int i = 0, e = 0;
     if (j < CP) { i = row_ptr[r * CP + j]; e = row_ptr[r * CP + j + 1]; }
+    const int nonempty = i < e;   // an empty row adds nothing: skip its read-modify-write of data
     float acc[SPMM_TY];
     #pragma unroll
     for (int t = 0; t < SPMM_TY; ++t) acc[t] = 0.0f;
@@ -632,7 +633,7 @@ __kernel void spmm_pf_forward_c(
                 if (t < ny) acc[t] += v * lsino[t * KC + (k - k0)];
         }
     }
-    if (j < CP) {
+    if (j < CP && nonempty) {
         #pragma unroll
         for (int t = 0; t < SPMM_TY; ++t)
             if (t < ny) data[(line0 + t) * CP + j] += acc[t];

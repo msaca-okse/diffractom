@@ -122,11 +122,16 @@ class Streamer:
                 up[ib + 1] = self._upload(self.view(src_flat, ib + 1), self.pin_up["y"][t], self.ys[t],
                                           [done[t]] if done[t] is not None else None)
 
-    def adjoint_update(self, x_flat, y_flat, r, g_batch, tau, beta, prox_kind, lam, support_gpu, y_src=None):
+    def adjoint_update(self, x_flat, y_flat, r, g_batch, tau, beta, prox_kind, lam, support_gpu, y_src=None,
+                       forward_into=None):
         """grad = A^T r batch by batch; x <- prox(y - tau*grad), y <- x + beta*(x - x_old), with x
         and y streamed from and to the host arrays (y read from y_src if given, e.g. x in the first
         iteration, when y = x). Returns ||grad||^2, ||x||^2 and sum|x| (the latter only for L1
         proxes).
+
+        forward_into (a data-sized array): also forward_into = A(y) of the new y, every batch
+        projected while it is on the device (the forward pass of the next iteration, without
+        uploading y again; the same sum over the batches, in the same order, as forward()).
 
         The transfers run in two worker threads (uploads, downloads): NVIDIA's OpenCL blocks the
         calling thread in a device-to-host copy until it has run, so the thread that enqueues
@@ -140,6 +145,8 @@ class Streamer:
         y_in = y_flat if y_src is None else y_src
         up, dn = [None] * nb, [None] * nb
         gsq, xsq, xabs = (p.reset() for p in self.sums)
+        if forward_into is not None:
+            forward_into.fill(0.0)
         start = cl.enqueue_marker(q)  # the forward pass, which used the staging slots, is done
         q.flush()  # (other threads wait for markers: they must have been submitted)
 
@@ -179,6 +186,8 @@ class Streamer:
             xsq.add(self.xs[s].data, n, 0)
             if want_l1:
                 xabs.add(self.xs[s].data, n, 1)
+            if forward_into is not None:  # (before the marker: slot s is reused after its download)
+                op._direct_batch(self.ys[s], 0, op.K_batch_max, ib, forward_into)
             ev = cl.enqueue_marker(q)
             q.flush()
             dn[ib] = self.io_dn.submit(download, ib, ev)
@@ -231,6 +240,20 @@ class Streamer:
         for p in self.sums:
             p.release()
         self.sums = []
+
+
+    def nbytes(self):
+        """GPU memory of the staging slots."""
+        return sum(a.nbytes for a in self.xs + self.ys)
+
+
+def fits_next_forward(op, streamer, extra_bytes, margin_gb=1.5):
+    """Whether one more data-sized array fits on the GPU (for adjoint_update's forward_into), given the
+    operator's buffers, the streamer's and extra_bytes of the solver's (data, prediction, gradient
+    batch, ...): an estimate, with a margin."""
+    data_bytes = 4 * int(np.prod(op.data_shape))
+    used = op.device_bytes() + streamer.nbytes() + extra_bytes
+    return used + data_bytes + margin_gb * 1024**3 <= op.queue.device.global_mem_size
 
 
 def streamer_for(op, fused_update=None, n_threads=None):

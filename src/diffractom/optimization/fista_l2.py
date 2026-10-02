@@ -5,9 +5,9 @@ import pyopencl as cl
 import pyopencl.array as clarray
 import pyopencl.clmath as clmath
 from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels, apply_support, support_mask_to_gpu
-from .launch import elementwise, pixel_orientation
+from .launch import reduction, elementwise, pixel_orientation
 from .fused_update import FusedUpdate, fused_available
-from .streaming import streamer_for
+from .streaming import fits_next_forward, streamer_for
 from ..utils.arrays import prepare_inputs
 
 from .prox_tv import (
@@ -19,6 +19,34 @@ from .prox_tv import (
 
 # Element-wise kernels: 64-bit indices in a grid-stride loop (see launch.py).
 FISTA_KERNELS = r"""
+// The data-space steps of an iteration in one pass: r = Ax - b (or w * (Ax - b) with one weight per
+// segment), the work-group's partial sum of r^2 (the diagnostic objective), and (clip) r clipped to
+// [-delta, delta], written in place. r and its clipping as residual_inplace / weighted_residual_inplace
+// and huber_clip_inplace.
+__kernel void residual_sumsq(
+    __global float *Ax, __global const float *b, __global const float *w, const ulong nseg, const int weighted,
+    const int clip, const float delta, const ulong n, __global float *partial, __local float *scratch)
+{
+    float s = 0.0f;
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        float v = weighted ? w[i % nseg] * (Ax[i] - b[i]) : Ax[i] - b[i];
+        s += v * v;
+        if (clip) {
+            if (v >  delta) v =  delta;
+            if (v < -delta) v = -delta;
+        }
+        Ax[i] = v;
+    }
+    const int lid = get_local_id(0);
+    scratch[lid] = s;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int h = get_local_size(0) / 2; h > 0; h >>= 1) {
+        if (lid < h) scratch[lid] += scratch[lid + h];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) partial[get_group_id(0)] = scratch[0];
+}
+
 __kernel void residual_axpb(
     __global const float *Ax,
     __global const float *b,
@@ -83,7 +111,7 @@ class FISTAL2:
     """
 
     def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50, support="fov",
-                 fused=True, stream_threads=None):
+                 fused=True, stream_threads=None, stream_next_forward=True):
         """Set up FISTA solver.
 
         Parameters
@@ -109,6 +137,13 @@ class FISTAL2:
             orientation batch at a time (see fused_update.py): two coefficient-sized arrays
             (x, y) instead of four. Used for element-wise proxes with an operator that provides
             adjoint_batches_cl; otherwise, or with fused=False, the unfused update runs.
+        stream_threads : int, optional
+            Threads of the host-side copies when the coefficients are streamed (NumPy arrays).
+        stream_next_forward : bool
+            Streamed (NumPy) runs: project each batch's new y forward while it is on the GPU in the
+            adjoint pass, into a second data-sized buffer, instead of a separate forward pass that
+            uploads y again (one upload of the coefficients less per iteration; the same results).
+            Used only if the buffer fits (an estimate of the GPU memory in use, with a margin).
         """
         self.op = operator
         self.ctx = operator.ctx
@@ -117,6 +152,7 @@ class FISTAL2:
         self.fista_prg = build_fista_program(self.ctx)
         self.k_copy_buf       = cl.Kernel(self.fista_prg, "copy_buf")
         self.k_residual_axpb  = cl.Kernel(self.fista_prg, "residual_axpb")
+        self.k_residual_sumsq = cl.Kernel(self.fista_prg, "residual_sumsq")
         self.k_grad_step      = cl.Kernel(self.fista_prg, "grad_step")
         self.k_extrapolate    = cl.Kernel(self.fista_prg, "extrapolate")
 
@@ -127,6 +163,7 @@ class FISTAL2:
         self.prox_kind = prox_kind
         self.lam = float(lam)
         self.stream_threads = stream_threads
+        self.stream_next_forward = bool(stream_next_forward)
         self.fused = bool(fused) and fused_available(operator, prox_kind)
         self.fused_update = FusedUpdate(self.ctx, self.queue) if self.fused else None
 
@@ -269,8 +306,17 @@ class FISTAL2:
             if x_old is not None:
                 self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
         gws_Ax, n_Ax = elementwise(out_gpu.size)
+        red_g, red_l, red_n, n_partial = reduction(out_gpu.size)
+        partial = clarray.empty(q, (n_partial,), np.float32)
 
         Ax = None
+        # streamed: the next iteration's forward pass inside the adjoint pass, into a second prediction
+        # buffer, if it fits (saves uploading y once per iteration; the same result)
+        Ax_next = None
+        if streamed and self.stream_next_forward and niter > 1:
+            solver_bytes = 2 * out_gpu.nbytes + g_batch.nbytes
+            if fits_next_forward(self.op, streamer, solver_bytes):
+                Ax_next = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
         t = 1.0
 
 
@@ -286,20 +332,20 @@ class FISTAL2:
 
 
             if streamed:
-                streamer.forward(y_host if it > 0 else x_host, Ax)
+                if Ax_next is not None and it > 0:  # A(y) of this iteration, projected in the last adjoint pass
+                    Ax, Ax_next = Ax_next, Ax
+                else:
+                    streamer.forward(y_host if it > 0 else x_host, Ax)
             else:
                 self.op.direct_cl(y, Ax)
 
 
-            # ---- r = Ax - b ----
-            self.k_residual_axpb(
-                q, gws_Ax, None,
-                Ax.data, out_gpu.data, Ax.data,
-                n_Ax
-            )
-
-            r2 = clarray.vdot(Ax, Ax).get()
-            fval = 0.5 * float(r2)
+            # ---- r = Ax - b and its squared norm (f, a diagnostic): one pass, in place in Ax ----
+            self.k_residual_sumsq(q, red_g, red_l, Ax.data, out_gpu.data, out_gpu.data, np.uint64(1),
+                                  np.int32(0), np.int32(0), np.float32(0.0), red_n, partial.data,
+                                  cl.LocalMemory(4 * red_l[0]))
+            r2 = float(partial.get().astype(np.float64).sum())
+            fval = 0.5 * r2
 
             # ---- momentum coefficient ----
             t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
@@ -309,7 +355,8 @@ class FISTAL2:
                 # ---- as below, with x and y streamed from and to host memory ----
                 gsq, xsq, xabs = streamer.adjoint_update(x_host, y_host, Ax, g_batch, self.tau, beta,
                                                          self.prox_kind, self.lam, self.support_gpu,
-                                                         y_src=None if it > 0 else x_host)
+                                                         y_src=None if it > 0 else x_host,
+                                                         forward_into=Ax_next if it + 1 < niter else None)
                 gnorm = float(np.sqrt(gsq))
             elif self.fused:
                 # ---- grad = A*(r) batch by batch, each batch consumed by
@@ -416,6 +463,7 @@ class FISTAL2:
 
                 # ---- final summary stats ----
         self.final_stats = {
+            "next_forward_fused": Ax_next is not None,
             "niter": niter,
             "final_f": self.iter_stats[-1]["f"],
             "final_g": self.iter_stats[-1]["g"],
@@ -438,6 +486,9 @@ class FISTAL2:
 
         if Ax is not None:
             Ax.base_data.release()
+        for arr in (Ax_next, partial):
+            if arr is not None and arr.base_data is not None:
+                arr.base_data.release()
         for arr in uploaded:  # data uploaded from a NumPy array
             arr.base_data.release()
 
