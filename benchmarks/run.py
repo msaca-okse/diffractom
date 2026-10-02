@@ -93,7 +93,7 @@ def main():
     ap.add_argument("--versions", default=",".join(DEFAULT_VERSIONS), help="comma-separated git revisions")
     ap.add_argument("--suite", default="default", help=f"comma-separated suites: {', '.join(SUITES)}")
     ap.add_argument("--modes", default="gpu,stream", help="gpu, stream (stream only runs on versions that have it)")
-    ap.add_argument("--fista-iters", type=int, default=2)
+    ap.add_argument("--fista-iters", type=int, default=3)  # the first includes the setup: 2 steady samples
     ap.add_argument("--timeout", type=float, default=300, help="seconds per case (more is recorded as timeout)")
     ap.add_argument("--results-dir", default=os.path.join(HERE, "results"))
     ap.add_argument("--harness", default=None, help="commit of the benchmark scripts (recorded in the results)")
