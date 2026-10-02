@@ -49,10 +49,15 @@ class ParallelRadon:
         Default: pi / R, i.e. R evenly spaced angles covering 180 degrees.
     bins_per_item : int
         Detector bins computed per work item in the forward projection.
+    channels_per_launch : int, optional
+        The projections run in slices of this many channels (a multiple of 4). Default: 64 for
+        images of 160 x 160 pixels or more, 128 otherwise. Measured on an A40 (360 angles): for
+        400 x 400 pixels, one launch over 256-1024 channels took 2.6x as long as slices of 64;
+        for 99 x 99 up to 3x as long as slices of 128 (from about 512 channels on).
     """
 
     def __init__(self, queue, img_shape, angles, n_detectors, image_width, detector_width,
-                 detector_shift=0.0, angle_weights=None, bins_per_item=3):
+                 detector_shift=0.0, angle_weights=None, bins_per_item=3, channels_per_launch=None):
         self.queue = queue
         self.Nx, self.Ny = (int(n) for n in img_shape)
         self.Ns = int(n_detectors)
@@ -77,6 +82,11 @@ class ParallelRadon:
         self.geo_gpu = clarray.to_device(queue, np.ascontiguousarray(geo))
 
         self.bins_per_item = int(bins_per_item)
+        if channels_per_launch is None:
+            channels_per_launch = 64 if self.Nx * self.Ny >= 160 * 160 else 128
+        if channels_per_launch % 4 or channels_per_launch <= 0:
+            raise ValueError("channels_per_launch must be a positive multiple of 4")
+        self.channels_per_launch = int(channels_per_launch)
         src = Path(__file__).with_name("radon_kernels.cl").read_text()
         self.prg = cl.Program(queue.context, src).build(options=[f"-DNB={self.bins_per_item}"])
         self._fwd = self.prg.radon_forward_k
@@ -105,15 +115,22 @@ class ParallelRadon:
         """sino_k (R, Ns, Kstride) = forward projection of img_k (Nx*Ny, Kstride)."""
         assert Kstride % 4 == 0, "Kstride must be a multiple of 4"
         n_strips = -(-self.Ns // self.bins_per_item)
-        gsize = (_round_up(Kstride // 4, 32), _round_up(n_strips, 4), self.R)
-        self._fwd(self.queue, gsize, (32, 4, 1), img_k.data, sino_k.data, self.geo_gpu.data,
-                  np.int32(self.Nx), np.int32(self.Ny), np.int32(self.Ns), np.int32(self.R),
-                  np.int32(Kstride // 4), self.scale)
+        for k4, n4 in self._slices(Kstride):
+            gsize = (_round_up(n4, 32), _round_up(n_strips, 4), self.R)
+            self._fwd(self.queue, gsize, (32, 4, 1), img_k.data, sino_k.data, self.geo_gpu.data,
+                      np.int32(self.Nx), np.int32(self.Ny), np.int32(self.Ns), np.int32(self.R),
+                      np.int32(Kstride // 4), np.int32(k4), np.int32(n4), self.scale)
 
     def backward(self, sino_k, img_k, Kstride):
         """img_k (Nx*Ny, Kstride) = backward projection of sino_k (R, Ns, Kstride)."""
         assert Kstride % 4 == 0, "Kstride must be a multiple of 4"
-        gsize = (_round_up(Kstride // 4, 32), _round_up(self.Nx, 4), self.Ny)
-        self._bwd(self.queue, gsize, (32, 4, 1), sino_k.data, img_k.data, self.geo_gpu.data,
-                  np.int32(self.Nx), np.int32(self.Ny), np.int32(self.Ns), np.int32(self.R),
-                  np.int32(Kstride // 4))
+        for k4, n4 in self._slices(Kstride):
+            gsize = (_round_up(n4, 32), _round_up(self.Nx, 4), self.Ny)
+            self._bwd(self.queue, gsize, (32, 4, 1), sino_k.data, img_k.data, self.geo_gpu.data,
+                      np.int32(self.Nx), np.int32(self.Ny), np.int32(self.Ns), np.int32(self.R),
+                      np.int32(Kstride // 4), np.int32(k4), np.int32(n4))
+
+    def _slices(self, Kstride):
+        """(first, count) of the channel slices, in float4 units."""
+        K4, c4 = Kstride // 4, self.channels_per_launch // 4
+        return [(k4, min(c4, K4 - k4)) for k4 in range(0, K4, c4)]
