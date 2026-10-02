@@ -243,8 +243,10 @@ class Streamer:
 
 
     def nbytes(self):
-        """GPU memory of the staging slots."""
-        return sum(a.nbytes for a in self.xs + self.ys)
+        """GPU memory of the staging slots and of the pinned host buffers (NVIDIA's OpenCL backs an
+        ALLOC_HOST_PTR buffer with device memory of the same size)."""
+        pins = self.pin_up["x"] + self.pin_up["y"] + self.pin_dn["x"] + self.pin_dn["y"]
+        return sum(a.nbytes for a in self.xs + self.ys) + sum(p.buf.size for p in pins)
 
 
 def fits_next_forward(op, streamer, extra_bytes, margin_gb=1.5):
