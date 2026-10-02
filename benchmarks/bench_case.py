@@ -137,7 +137,8 @@ def main():
     except Exception as e:  # noqa: BLE001
         msg = f"{type(e).__name__}: {e}"
         oom = any(s in msg.upper() for s in ("MEM_OBJECT_ALLOCATION_FAILURE", "OUT_OF_RESOURCES", "OUT_OF_HOST_MEMORY",
-                                              "MEMORYERROR", "OUT OF MEMORY"))
+                                              "MEMORYERROR", "OUT OF MEMORY",
+                                              "INVALID_BUFFER_SIZE"))  # an array larger than the GPU's largest buffer
         out["status"] = "oom" if oom else "error"
         out["error"] = msg[:500]
         out["traceback"] = traceback.format_exc()[-2000:]
