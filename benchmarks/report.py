@@ -27,8 +27,9 @@ LABELS = {
     "fbc8934": "NumPy API, (K, Ny, Nx) layout",
     "2c38f65": "sparse PF matrix generated directly, faster sparse products, store what fits, "
                "Radon in slices, larger batches",
+    "9be35fb": "tiled Radon projections (image rows / sinogram bins staged in local memory); "
+               "at least 4 batches in the sparse modes",
 }
-SHORT = {"bec0dc7": "first (bec0dc7)", "fbc8934": "previous main (fbc8934)"}
 
 SWEEPS = [  # sweep, varied parameter, label, unit
     ("K", "K", "orientations K", ""),
@@ -155,8 +156,11 @@ def figures(rows, idx, versions):
     os.makedirs(FIG, exist_ok=True)
     shas = [v["sha"] for v in versions]
     newest = shas[-1]
-    picks = [newest] + [s for s in ("fbc8934", "bec0dc7") if s in shas and s != newest]  # newest: slot 1
-    name = lambda s: SHORT.get(s, f"newest ({s})" if s == newest else s)
+    picks = [newest] + ([shas[-2]] if len(shas) > 1 else []) + ([shas[0]] if len(shas) > 2 else [])  # newest: slot 1
+    role = {newest: "newest", shas[0]: "first"}
+    if len(shas) > 1:
+        role[shas[-2]] = "previous"
+    name = lambda s: f"{role.get(s, '')} ({s})".strip()
     num = FuncFormatter(lambda y, _: f"{y:g}")
 
     for mode_name, th in THEMES.items():
