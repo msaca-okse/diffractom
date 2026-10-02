@@ -25,9 +25,9 @@ MAX_SIGMA = np.deg2rad(20.0)
 _LOCAL = 256  # local size of the one-dimensional kernels
 
 # scratch bytes per candidate (cand_j, cand_row, cand_val, flag, pos) and per non-zero (adjoint
-# CSR col_j, val_a, row_of; forward CSR col_k, val_f)
+# CSR col_j, val_a, row_of; forward CSR col_k, val_f and its unordered fill)
 CAND_BYTES = 2 + 4 + 4 + 4 + 4
-NNZ_BYTES = 2 + 4 + 4 + 2 + 4
+NNZ_BYTES = 2 + 4 + 4 + 2 + 4 + 2 + 4
 
 
 def _ceil(n, m=_LOCAL):
@@ -53,7 +53,7 @@ class SparsePFGenerator:
         src = Path(__file__).with_name("pf_generate.cl").read_text()
         prg = cl.Program(op.ctx, src).build(options=[f"-DMAXWC={maxwc}", f"-DPPW={self.ppw}", f"-DRPG={self.rpg}"])
         self.k = {n: cl.Kernel(prg, n) for n in ("pf_gen_candidates", "pf_gen_evaluate", "pf_gen_compact",
-                                                  "pf_gen_count_fwd", "pf_gen_fill_fwd", "pf_gen_sort_rows",
+                                                  "pf_gen_count_fwd", "pf_gen_fill_fwd", "pf_gen_rank_rows",
                                                   "pf_gen_row_of")}
         # the scan's temporary buffers come from a pool (a fresh allocation every call costs ms)
         self.pool = cltools.MemoryPool(cltools.ImmediateAllocator(q))
@@ -132,7 +132,8 @@ class SparsePFGenerator:
         if nnz_cap > 0:
             nf = self.op.N_Omega * self.CP
             bufs.update(row_of=e(nnz_cap, np.int32), cnt_f=e(nf + 1, np.int32), row_ptr_f=e(nf + 1, np.int32),
-                        cursor=e(nf, np.int32), col_k=e(nnz_cap, np.uint16), val_f=e(nnz_cap, np.float32))
+                        cursor=e(nf, np.int32), col_k=e(nnz_cap, np.uint16), val_f=e(nnz_cap, np.float32),
+                        col_tmp=e(nnz_cap, np.uint16), val_tmp=e(nnz_cap, np.float32))
         for n, a in bufs.items():
             setattr(self, n, a)
         self._names = list(bufs)
@@ -171,12 +172,12 @@ class SparsePFGenerator:
         """The forward CSR (row_ptr_f, col_k, val_f; scratch views) of a stored adjoint CSR of Kb
         orientations (row_ptr_a, col_j, val_a) with at most allocate()'s nnz_cap non-zeros."""
         n_rows = self.op.N_Omega * Kb
-        self.k["pf_gen_row_of"](self.q, (_ceil(n_rows),), (_LOCAL,), sb["row_ptr_a"].data, self.row_of.data,
+        self.k["pf_gen_row_of"](self.q, (_ceil(self.nnz_cap),), (_LOCAL,), sb["row_ptr_a"].data, self.row_of.data,
                                 np.int32(n_rows))
         return self._transpose(sb, Kb, self.nnz_cap)
 
     def _transpose(self, sb, Kb, cap):
-        """Forward CSR from the adjoint CSR sb, with row_of filled: count, scan, fill, sort by k."""
+        """Forward CSR from the adjoint CSR sb, with row_of filled: count, scan, fill, rank by k."""
         q, k, CP = self.q, self.k, self.CP
         n_rows = self.op.N_Omega * Kb
         nf = self.op.N_Omega * CP
@@ -187,9 +188,9 @@ class SparsePFGenerator:
         self.cursor.fill(0)
         k["pf_gen_fill_fwd"](q, (_ceil(cap),), (_LOCAL,), self.row_of.data, sb["col_j"].data,
                              sb["val_a"].data, sb["row_ptr_a"].data, self.row_ptr_f.data, self.cursor.data,
-                             self.col_k.data, self.val_f.data, *self._ints(n_rows, Kb, CP))
-        k["pf_gen_sort_rows"](q, (_ceil(nf),), (_LOCAL,), self.row_ptr_f.data, self.col_k.data,
-                              self.val_f.data, np.int32(nf))
+                             self.col_tmp.data, self.val_tmp.data, *self._ints(n_rows, Kb, CP))
+        k["pf_gen_rank_rows"](q, (_ceil(cap),), (_LOCAL,), self.row_ptr_f.data, self.col_tmp.data,
+                              self.val_tmp.data, self.col_k.data, self.val_f.data, np.int32(nf))
         return dict(row_ptr_f=self.row_ptr_f, col_k=self.col_k, val_f=self.val_f)
 
     def release_scratch(self):

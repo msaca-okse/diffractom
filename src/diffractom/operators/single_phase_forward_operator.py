@@ -19,6 +19,7 @@ from ..utils.arrays import as_host, check_device
 
 
 SPMM_TY = 24  # detector positions per work-group of the sparse products (pf_kernels.cl)
+SPARSE_BATCH_MAX = 1024  # largest batch of the sparse modes (sparse_batch_size)
 
 
 class SinglePhaseForwardOperator:
@@ -609,9 +610,11 @@ class SinglePhaseForwardOperator:
         # The per-batch buffers are indexed with 32-bit integers by some kernels (the full coefficient
         # and data arrays are not); a smaller max_gb gives smaller batches.
         Kmax = self.K_batch_max
-        for name, n in [("PF batch (N_Omega, K_batch, N_eta, N_rings)", R * Kmax * C * T),
-                        ("sinogram batch (N_Omega, My, K_batch)", R * self.My * Kmax),
-                        ("image batch (Nx, Ny, K_batch)", self.Nx * self.Ny * Kmax)]:
+        checks = [("sinogram batch (N_Omega, My, K_batch)", R * self.My * Kmax),
+                  ("image batch (Nx, Ny, K_batch)", self.Nx * self.Ny * Kmax)]
+        if K_batch is None:  # the dense PF batch (the sparse modes have none)
+            checks.append(("PF batch (N_Omega, K_batch, N_eta, N_rings)", R * Kmax * C * T))
+        for name, n in checks:
             if n >= 2**31:
                 raise ValueError(f"The {name} has {n} elements, more than 2^31 - 1; lower max_gb.")
     
@@ -842,17 +845,22 @@ class SinglePhaseForwardOperator:
 
     def sparse_batch_size(self, fill):
         """
-        Orientations per batch for the sparse modes: as many as the batch buffers fit in max_gb.
-        Per orientation: the sinogram (N_Omega, My) and image (Ny, Nx) batch buffers, room for 5
-        more image-sized buffers of a solver (staging, gradient batch), and the generator's scratch
-        buffers at this fill fraction. At least the dense batch size; at most 65535 (16-bit column
-        indices) and what keeps every batch array below 2^31 elements.
+        Orientations per batch for the sparse modes: as many as the batch buffers fit in max_gb,
+        at most SPARSE_BATCH_MAX. Per orientation: the sinogram (N_Omega, My) and image (Ny, Nx)
+        batch buffers, room for 5 more image-sized buffers of a solver (staging, gradient batch),
+        and the generator's scratch buffers at this fill fraction. At least the dense batch size;
+        at most what keeps every batch array below 2^31 elements.
+
+        Measured on an A40 (per orientation, both CSRs stored, 99 x 99 and 400 x 400 pixels): the
+        sparse products are ~1.5-3x slower with 128 orientations per batch than with 256 or more,
+        and nothing improves beyond ~1024 (the Radon transform runs in slices of 64-128 orientations
+        whatever the batch size; the transposition and generation cost per orientation is flat).
         """
         R, CP, npix = self.N_Omega, self.N_seg, self.Nx * self.Ny
         nnz_per_k = 1.1 * fill * R * CP
         bytes_per_k = 4 * (R * self.My + 6 * npix) + 8 * R + (CAND_BYTES + NNZ_BYTES) * nnz_per_k
         kb = int(self.pf_batch_max_gb * 1024**3 // bytes_per_k)
-        limit = min(65535, (2**31 - 1) // max(R * self.My, npix, int(nnz_per_k) + 1, R))
+        limit = min(SPARSE_BATCH_MAX, (2**31 - 1) // max(R * self.My, npix, int(nnz_per_k) + 1, R))
         return max(self.K_batch_max, min(kb, limit, self.K))
 
 

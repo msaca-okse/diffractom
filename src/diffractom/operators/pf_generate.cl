@@ -227,26 +227,38 @@ __kernel void pf_gen_fill_fwd(
     val_f[o] = val_a[i];
 }
 
-__kernel void pf_gen_sort_rows(
-    __global const int *row_ptr, __global ushort *col, __global float *val, const int n_rows)
+// The row of entry i of a CSR: the last row with row_ptr[row] <= i (binary search).
+inline int csr_row(__global const int *row_ptr, int n_rows, int i)
 {
-    int row = get_global_id(0);
-    if (row >= n_rows) return;
-    int b = row_ptr[row], e = row_ptr[row + 1];
-    for (int i = b + 1; i < e; ++i) {   // insertion sort: the rows are short
-        ushort ck = col[i];
-        float cv = val[i];
-        int j = i - 1;
-        while (j >= b && col[j] > ck) { col[j + 1] = col[j]; val[j + 1] = val[j]; --j; }
-        col[j + 1] = ck;
-        val[j + 1] = cv;
+    int lo = 0, hi = n_rows - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (row_ptr[mid] <= i) lo = mid; else hi = mid - 1;
     }
+    return lo;
 }
 
-// row_of[i] = the row of entry i (for transposing a stored adjoint CSR)
+// Sort every forward row by k: the fill wrote it unordered to col_tmp/val_tmp; every entry goes to
+// its rank among the k of its row (distinct within a row). One work-item per entry.
+__kernel void pf_gen_rank_rows(
+    __global const int *row_ptr, __global const ushort *col_tmp, __global const float *val_tmp,
+    __global ushort *col, __global float *val, const int n_rows)
+{
+    int i = get_global_id(0);
+    if (i >= row_ptr[n_rows]) return;
+    int row = csr_row(row_ptr, n_rows, i);
+    int b = row_ptr[row], e = row_ptr[row + 1];
+    ushort ki = col_tmp[i];
+    int rank = 0;
+    for (int m = b; m < e; ++m) rank += (col_tmp[m] < ki);
+    col[b + rank] = ki;
+    val[b + rank] = val_tmp[i];
+}
+
+// row_of[i] = the row of entry i (for transposing a stored adjoint CSR); one work-item per entry
 __kernel void pf_gen_row_of(__global const int *row_ptr, __global int *row_of, const int n_rows)
 {
-    int row = get_global_id(0);
-    if (row >= n_rows) return;
-    for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i) row_of[i] = row;
+    int i = get_global_id(0);
+    if (i >= row_ptr[n_rows]) return;
+    row_of[i] = csr_row(row_ptr, n_rows, i);
 }

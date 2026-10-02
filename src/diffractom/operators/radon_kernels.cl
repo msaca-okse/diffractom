@@ -18,6 +18,10 @@
 // Layouts (Kstride a multiple of 4, Kstride4 = Kstride / 4):
 //     img  (Npix, Kstride), C-order, pixel index p = x + Nx*y
 //     sino (R, Ns, Kstride), C-order
+//
+// The projections handle the channels k4_off .. k4_off + k4_n - 1 (in float4 units) of the
+// arrays: a launch per slice of channels. Slices of 64-128 channels keep the work items that run
+// together on the same image region, which is much faster than one launch over many channels.
 
 #ifndef NB
 #define NB 3
@@ -28,10 +32,11 @@ __kernel void radon_forward_k(
     __global const float4 *img,          // (Npix, Kstride4)
     __global float4 *sino,               // (R, Ns, Kstride4)
     __constant float4 *geo,
-    const int Nx, const int Ny, const int Ns, const int R, const int Kstride4,
+    const int Nx, const int Ny, const int Ns, const int R, const int Kstride4, const int k4_off, const int k4_n,
     const float scale
 ){
-    const int k = get_global_id(0);
+    if ((int)get_global_id(0) >= k4_n) return;
+    const int k = get_global_id(0) + k4_off;
     const int s0 = get_global_id(1) * NB;
     const int a = get_global_id(2);
     if (k >= Kstride4 || s0 >= Ns || a >= R) return;
@@ -77,9 +82,10 @@ __kernel void radon_backward_k(
     __global const float4 *sino,         // (R, Ns, Kstride4)
     __global float4 *out,                // (Npix, Kstride4)
     __constant float4 *geo,
-    const int Nx, const int Ny, const int Ns, const int R, const int Kstride4
+    const int Nx, const int Ny, const int Ns, const int R, const int Kstride4, const int k4_off, const int k4_n
 ){
-    const int k = get_global_id(0);
+    if ((int)get_global_id(0) >= k4_n) return;
+    const int k = get_global_id(0) + k4_off;
     const int x = get_global_id(1);
     const int y = get_global_id(2);
     if (k >= Kstride4 || x >= Nx || y >= Ny) return;
