@@ -12,6 +12,7 @@ from ..crystallography.material import Material
 from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
 from .pf_kernels import build_all_opencl
+from .pf_generate import SparsePFGenerator
 from .parallel_radon import ParallelRadon
 from ..utils.support import fov_support_mask
 from ..utils.arrays import as_host, check_device
@@ -61,19 +62,23 @@ class SinglePhaseForwardOperator:
             If True, skip intensity scaling of the PF matrix.
         ctx, queue : optional
             Existing OpenCL context/queue; created automatically if None.
-        pf_mode : {"auto", "sparse", "dense"}
+        pf_mode : {"auto", "sparse", "generated", "dense"}
             How the pole-figure (PF) matrix is applied.
 
             * ``"sparse"``: the PF matrix is evaluated once here, stored in a
               sparse (CSR) format, and applied with sparse kernels. Its entries
               are exactly zero away from the poles, so this is the same operator.
+            * ``"generated"``: the same sparse matrix, not stored: it is generated
+              again batch by batch in every call (pf_generate.py; only the entries
+              near the poles are evaluated). Identical results to ``"sparse"``,
+              little memory; for when the stored matrix would not fit.
             * ``"dense"``: the PF matrix is applied with a dense batched GEMM.
               If all orientations fit in one batch (``max_gb``), it is evaluated
               once and reused; otherwise it is re-evaluated batch by batch in
               every call.
             * ``"auto"`` (default): sparse, unless the fill fraction of the first
-              batch exceeds ``sparse_max_fill`` or the sparse matrix would not fit
-              in ``sparse_max_gb``; dense otherwise.
+              batch exceeds ``sparse_max_fill`` (then dense) or the sparse matrix
+              would not fit in ``sparse_max_gb`` (then generated).
 
             Measured on an A100 (simulated Al data, 360 omega x 180 eta x 8
             rings): sparse was 1.4-2.6x faster per FISTA iteration than dense for
@@ -87,8 +92,8 @@ class SinglePhaseForwardOperator:
             after reserving what a FISTA reconstruction needs besides the operator
             (reserve_coefficient_arrays coefficient-sized and 2 data-sized arrays), the operator's own
             buffers and a 1 GB margin. The solver's arrays take priority: a large
-            sparse matrix (e.g. a dense uniform grid) is not stored, and the dense
-            path re-evaluates the PF matrix batch by batch instead.
+            sparse matrix (e.g. a dense uniform grid) is not stored, but generated
+            batch by batch in every call (``pf_mode="generated"``).
         projector : {"native", "gratopy"}
             Parallel-beam Radon transform used for the tomographic part.
             ``"native"`` (default) is diffractom's ParallelRadon, vectorised over
@@ -204,19 +209,24 @@ class SinglePhaseForwardOperator:
         self.allocate_coefficient_buffer()
 
         # --- PF matrix mode ---
-        if pf_mode not in ("dense", "sparse", "auto"):
-            raise ValueError(f"pf_mode must be 'dense', 'sparse' or 'auto', not {pf_mode!r}")
+        if pf_mode not in ("dense", "sparse", "generated", "auto"):
+            raise ValueError(f"pf_mode must be 'dense', 'sparse', 'generated' or 'auto', not {pf_mode!r}")
         self.pf_mode = pf_mode
         self._pf_cached = False  # dense mode, single batch: PF matrix already in _basis_batch_kmax
         self.sparse_batches = None
+        self.pf_gen = None  # generated mode: the SparsePFGenerator
         if sparse_max_gb is None:
             sparse_max_gb = self.default_sparse_budget_gb()
-        if pf_mode in ("sparse", "auto"):
-            self.build_sparse_pf(auto=(pf_mode == "auto"), max_fill=sparse_max_fill, max_gb=sparse_max_gb)
+        if pf_mode != "dense":
+            self.build_sparse_pf(mode=pf_mode, max_fill=sparse_max_fill, max_gb=sparse_max_gb)
         if self.verbose:
-            cached = self.pf_mode == "sparse" or len(self.batches) == 1
-            print(f"PF matrix: {self.pf_mode}, "
-                  + ("evaluated once" if cached else f"re-evaluated in {len(self.batches)} batches per call"))
+            if self.pf_mode == "generated":
+                how = f"generated in {len(self.batches)} batches per call"
+            elif self.pf_mode == "sparse" or len(self.batches) == 1:
+                how = "evaluated once"
+            else:
+                how = f"re-evaluated in {len(self.batches)} batches per call"
+            print(f"PF matrix: {self.pf_mode}, {how}")
 
 
     def support_mask(self):
@@ -481,6 +491,9 @@ class SinglePhaseForwardOperator:
                 if isinstance(arr, clarray.Array) and arr.base_data is not None:
                     arr.base_data.release()
         self.sparse_batches = None
+        if getattr(self, "pf_gen", None) is not None:
+            self.pf_gen.release()
+            self.pf_gen = None
 
         # Release buffers if they exist
         for name in buffer_names:
@@ -692,16 +705,118 @@ class SinglePhaseForwardOperator:
 
 
 
-    def build_sparse_pf(self, auto=False, max_fill=0.1, max_gb=None):
+    def build_sparse_pf(self, mode="auto", max_fill=0.1, max_gb=None):
         """
-        Evaluate the PF matrix once and store it per K-batch in two CSR
-        structures: forward rows (r, j) listing orientations, and adjoint rows
-        (r, k) listing segments, j = c*P + p.
+        Set up the sparse PF matrix: per K-batch, two CSR structures, forward rows
+        (r, j) listing orientations and adjoint rows (r, k) listing segments,
+        j = c*P + p, generated directly (SparsePFGenerator).
 
         The size of the whole sparse matrix is estimated from the first batch.
-        With ``auto``, fall back to dense mode if the fill fraction of the first
-        batch exceeds ``max_fill`` or the estimate exceeds ``max_gb``; without,
-        raise MemoryError if it exceeds ``max_gb``.
+        mode "sparse": store it (MemoryError if the estimate exceeds ``max_gb``).
+        mode "generated": keep only the generator; every call generates the batches.
+        mode "auto": dense if the fill fraction of the first batch exceeds
+        ``max_fill``; otherwise stored, or generated if the estimate exceeds ``max_gb``.
+        """
+        t0 = time.perf_counter()
+        R = int(self.N_Omega)
+        CP = int(self.N_eta * self.N_peaks)
+        Kmax = self.K_batch_max
+        auto = mode == "auto"
+
+        # column indices are stored as 16 bit (orientation within a batch, segment)
+        if Kmax > 65535 or CP > 65535:
+            reason = f"K_batch_max = {Kmax} or N_eta * N_rings = {CP} exceeds the 16-bit index range"
+            if not auto:
+                raise ValueError(f"Sparse PF matrix: {reason}; use pf_mode='dense' or a smaller max_gb.")
+            self.pf_mode = "dense"
+            if self.verbose:
+                print(f"Sparse PF matrix: {reason}, using the dense PF path")
+            return
+        if not SparsePFGenerator.usable(self):
+            if mode == "generated":
+                raise ValueError("pf_mode='generated' needs sigma < 20 degrees for every orientation.")
+            return self._build_sparse_from_dense(auto=auto, max_fill=max_fill, max_gb=max_gb)
+
+        # the dense batch buffer is not needed (reallocated if the dense path is chosen)
+        self._basis_batch_kmax.base_data.release()
+        self._basis_batch_kmax = None
+        gen = SparsePFGenerator(self)
+        n_cand = gen.count_candidates()
+        gen.allocate(max(n_cand))
+
+        def nnz_of(sb, ib):
+            n_rows = R * self.batches[ib]["K_batch"]
+            return int(sb["row_ptr_a"][n_rows:n_rows + 1].get()[0])
+
+        sb0 = gen.generate(0)
+        nnz0 = nnz_of(sb0, 0)
+        fill = nnz0 / (R * self.batches[0]["K_batch"] * CP)
+        # two CSR copies (16-bit index + 32-bit value) plus the row pointers of all batches
+        est_gb = (12 * fill * R * self.K * CP + 4 * (len(self.batches) * R * CP + R * self.K)) / 1024**3
+        reason = None
+        if mode == "generated":
+            choice = "generated"
+        elif auto and fill > max_fill:
+            choice, reason = "dense", f"fill fraction {100 * fill:.2f} % > {100 * max_fill:.2f} %"
+        elif max_gb is not None and est_gb > max_gb:
+            reason = f"estimated size {est_gb:.1f} GB > {max_gb:.1f} GB"
+            if not auto:
+                gen.release()
+                raise MemoryError(f"Sparse PF matrix: {reason}; use pf_mode='generated' or 'dense', "
+                                  "or raise sparse_max_gb.")
+            choice = "generated"
+        else:
+            choice = "sparse"
+
+        if choice == "dense":
+            gen.release()
+            self._basis_batch_kmax = clarray.empty(
+                self.queue, (self.N_Omega, self.K_batch_max, self.N_eta, self.N_peaks), np.float32)
+            self.pf_mode = "dense"
+            if self.verbose:
+                print(f"Sparse PF matrix: {reason}, using the dense PF path")
+            return
+
+        if choice == "generated":
+            self.pf_gen = gen
+            self.pf_mode = "generated"
+            self.sparse_nnz = int(round(sum(n_cand) * nnz0 / max(n_cand[0], 1)))  # estimate
+            self.sparse_fill = self.sparse_nnz / (R * self.K * CP)
+            if self.verbose:
+                print(f"Sparse PF matrix: {'' if reason is None else reason + ', '}generated in every call "
+                      f"(about {self.sparse_nnz} non-zeros, fill {100 * self.sparse_fill:.3f} %; "
+                      f"{gen.nbytes() / 1024**2:.1f} MB of scratch buffers), set up in {time.perf_counter() - t0:.1f} s")
+            return
+
+        sparse_batches = []
+        nnz_total = 0
+        for ib in range(len(self.batches)):
+            sb = sb0 if ib == 0 else gen.generate(ib)
+            nnz = nnz0 if ib == 0 else nnz_of(sb, ib)
+            n = max(nnz, 1)
+            sparse_batches.append(dict(row_ptr_f=sb["row_ptr_f"].copy(), col_k=sb["col_k"][:n].copy(),
+                                       val_f=sb["val_f"][:n].copy(), row_ptr_a=sb["row_ptr_a"].copy(),
+                                       col_j=sb["col_j"][:n].copy(), val_a=sb["val_a"][:n].copy()))
+            nnz_total += nnz
+        self.queue.finish()
+        gen.release()
+
+        self.sparse_batches = sparse_batches
+        self.pf_mode = "sparse"
+        self.sparse_nnz = nnz_total
+        self.sparse_fill = nnz_total / (R * self.K * CP)
+        if self.verbose:
+            nbytes = sum(a.nbytes for sb in sparse_batches for a in sb.values())
+            print(f"Sparse PF matrix: {nnz_total} non-zeros (fill {100 * self.sparse_fill:.3f} %), "
+                  f"{nbytes / 1024**2:.1f} MB, built in {time.perf_counter() - t0:.1f} s")
+
+
+
+    def _build_sparse_from_dense(self, auto=False, max_fill=0.1, max_gb=None):
+        """
+        The sparse PF matrix from the dense batches (for widths the generator does not handle):
+        evaluate the PF matrix once and store it per K-batch in two CSR structures. Same
+        decisions as build_sparse_pf, except that the fallback is the dense path.
         """
         t0 = time.perf_counter()
         q = self.queue
@@ -814,8 +929,8 @@ class SinglePhaseForwardOperator:
             self._radon_gratopy_forward(src, k_src, Kb, K_src)
 
         # 2) PF matrix product, accumulated into data
-        if self.pf_mode == "sparse":
-            sb = self.sparse_batches[ib]
+        if self.pf_mode in ("sparse", "generated"):
+            sb = self.sparse_batches[ib] if self.pf_mode == "sparse" else self.pf_gen.generate(ib, forward=True)
             self.k.spmm_pf_forward_c(
                 self.queue,
                 (CP, My, R),
@@ -958,8 +1073,8 @@ class SinglePhaseForwardOperator:
         alpha = R / np.pi
 
         # 1) PF^T product -> coeffs_sino_C (R, My, Kmax)
-        if self.pf_mode == "sparse":
-            sb = self.sparse_batches[ib]
+        if self.pf_mode in ("sparse", "generated"):
+            sb = self.sparse_batches[ib] if self.pf_mode == "sparse" else self.pf_gen.generate(ib, forward=False)
             self.k.spmm_pf_adjoint_c(
                 self.queue,
                 (Kb, My, R),
