@@ -24,8 +24,8 @@ from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Milestones of the last week, newest first (see CLAUDE.md for what each one changed).
-DEFAULT_VERSIONS = ["main", "56fe181", "18a7a06", "cce2840", "2b2b9b5", "5a402f0", "bec0dc7"]
+# Milestones, newest first (see benchmarks/RESULTS.md for what each one changed).
+DEFAULT_VERSIONS = ["main", "fbc8934", "56fe181", "18a7a06", "cce2840", "2b2b9b5", "5a402f0", "bec0dc7"]
 
 BASE = {"K": 10000, "N": 120, "sigma_deg": 0.4, "N_Omega": 360, "N_eta": 360, "rings": 14}
 SUITES = {
@@ -34,6 +34,9 @@ SUITES = {
     "default": ([{"sweep": "K", "K": k} for k in (1000, 3000, 10000, 30000, 100000)]
                 + [{"sweep": "N", "N": n} for n in (64, 200, 400)]
                 + [{"sweep": "sigma", "sigma_deg": s} for s in (1.0, 2.0, 4.0)]),
+    # larger problems: a 600 x 600 grid, and a sparse PF matrix too large to store (K = 100000,
+    # sigma = 1 deg: both CSRs ~37 GB)
+    "large": [{"sweep": "large_N", "N": 600}, {"sweep": "large_K", "K": 100000, "sigma_deg": 1.0}],
     "quick": [{"sweep": "quick", "K": 1000, "N": 64}],
 }
 WARMUP = {"K": 200, "N": 32, "N_Omega": 36, "N_eta": 36}  # compiles and caches the kernels of a version
@@ -85,7 +88,7 @@ def main():
     ap.add_argument("--scratch", required=True, help="directory for exported versions and a copy of the results")
     ap.add_argument("--repo", default=os.path.dirname(HERE), help="git repository to take the versions from")
     ap.add_argument("--versions", default=",".join(DEFAULT_VERSIONS), help="comma-separated git revisions")
-    ap.add_argument("--suite", default="default", choices=sorted(SUITES))
+    ap.add_argument("--suite", default="default", help=f"comma-separated suites: {', '.join(SUITES)}")
     ap.add_argument("--modes", default="gpu,stream", help="gpu, stream (stream only runs on versions that have it)")
     ap.add_argument("--fista-iters", type=int, default=2)
     ap.add_argument("--timeout", type=float, default=300, help="seconds per case (more is recorded as timeout)")
@@ -108,7 +111,7 @@ def main():
     print(json.dumps(m), "->", outs[0], flush=True)
 
     versions = [v.strip() for v in args.versions.split(",") if v.strip()]
-    cases = [{**BASE, **c} for c in SUITES[args.suite]]
+    cases = [{**BASE, **c} for s in args.suite.split(",") for c in SUITES[s.strip()]]
     modes = [x.strip() for x in args.modes.split(",")]
     for rev in versions:
         sha, tree, vinfo = export_tree(args.repo, rev, args.scratch)

@@ -3,6 +3,9 @@
 #
 #   benchmarks/submit.sh [run.py options, e.g. --versions main --suite quick]
 #
+# Runs on host $BENCH_HOST (default n-62-18-4, where every result so far was measured, so that
+# numbers compare); BENCH_AFTER=<job id> starts it after that job has ended.
+#
 # The benchmark scripts are copied, and the versions resolved to commit hashes, now: the job
 # never reads the working copy, so it can be edited or switched to another branch meanwhile.
 # Results go to benchmarks/results/ in this repository (commit them) and to $SCRATCH.
@@ -26,11 +29,15 @@ else  # resolve the given versions now
   done
 fi
 printf '%q ' "${ARGS[@]}" > "$RUN/args"
+AFTER="#"
+[ -n "$BENCH_AFTER" ] && AFTER="#BSUB -w \"ended($BENCH_AFTER)\""
 
 bsub <<JOB
 #!/bin/bash
 #BSUB -J diffractom_bench
 #BSUB -q gpua40
+#BSUB -m ${BENCH_HOST:-n-62-18-4}
+$AFTER
 #BSUB -gpu "num=1:mode=exclusive_process"
 #BSUB -n 16
 #BSUB -R "span[hosts=1]"
