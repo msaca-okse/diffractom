@@ -20,6 +20,7 @@ from ..utils.arrays import as_host, check_device
 
 SPMM_TY = 24  # detector positions per work-group of the sparse products (pf_kernels.cl)
 SPARSE_BATCH_MAX = 1024  # largest batch of the sparse modes (sparse_batch_size)
+SPARSE_MIN_BATCHES = 4   # sparse modes: at least this many batches, if they hold at least the dense batch
 
 
 class SinglePhaseForwardOperator:
@@ -846,7 +847,9 @@ class SinglePhaseForwardOperator:
     def sparse_batch_size(self, fill):
         """
         Orientations per batch for the sparse modes: as many as the batch buffers fit in max_gb,
-        at most SPARSE_BATCH_MAX. Per orientation: the sinogram (N_Omega, My) and image (Ny, Nx)
+        at most SPARSE_BATCH_MAX, and few enough for SPARSE_MIN_BATCHES batches (a streamed solver
+        overlaps the transfers of one batch with the computation of another; with a single batch
+        it cannot: K = 1000 streamed took 0.37 s per FISTA iteration with one batch, 0.28 s with 4). Per orientation: the sinogram (N_Omega, My) and image (Ny, Nx)
         batch buffers, room for 5 more image-sized buffers of a solver (staging, gradient batch),
         and the generator's scratch buffers at this fill fraction. At least the dense batch size;
         at most what keeps every batch array below 2^31 elements.
@@ -861,7 +864,7 @@ class SinglePhaseForwardOperator:
         bytes_per_k = 4 * (R * self.My + 6 * npix) + 8 * R + (CAND_BYTES + NNZ_BYTES) * nnz_per_k
         kb = int(self.pf_batch_max_gb * 1024**3 // bytes_per_k)
         limit = min(SPARSE_BATCH_MAX, (2**31 - 1) // max(R * self.My, npix, int(nnz_per_k) + 1, R))
-        return max(self.K_batch_max, min(kb, limit, self.K))
+        return max(self.K_batch_max, min(kb, limit, -(-self.K // SPARSE_MIN_BATCHES)))
 
 
 
