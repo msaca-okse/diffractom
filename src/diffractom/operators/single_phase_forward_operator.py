@@ -14,10 +14,12 @@ from .create_pfo_matrix import build_pf_program
 from .pf_kernels import build_all_opencl
 from .pf_generate import CAND_BYTES, NNZ_BYTES, SparsePFGenerator
 from .parallel_radon import ParallelRadon
+from . import fourier_radon
 from ..utils.support import fov_support_mask
 from ..utils.arrays import as_host, check_device
 
 
+AUTO_FFT_PIXELS = 400 * 400  # projector="auto": the FFT projector for grids of more pixels
 SPMM_TY = 24  # detector positions per work-group of the sparse products (pf_kernels.cl)
 SPARSE_BATCH_MAX = 1024  # largest batch of the sparse modes (sparse_batch_size)
 SPARSE_MIN_BATCHES = 4   # sparse modes: at least this many batches, if they hold at least the dense batch
@@ -45,7 +47,8 @@ class SinglePhaseForwardOperator:
         sparse_max_fill: float = 0.3,
         sparse_max_fill_partial: float = 0.1,
         sparse_max_gb: float | None = None,
-        projector: str = "native",
+        projector: str = "auto",
+        fft_max_gb: float = 1.5,
         reserve_coefficient_arrays: int = 3,
         pf_cutoff_sigma: float | None = 3.0,
         **kwargs,
@@ -109,12 +112,21 @@ class SinglePhaseForwardOperator:
             buffers and a 1 GB margin. The solver's arrays take priority: a large
             sparse matrix (e.g. a dense uniform grid) is not stored, but generated
             batch by batch in every call (``pf_mode="generated"``).
-        projector : {"native", "gratopy"}
+        projector : {"auto", "native", "fft", "gratopy"}
             Parallel-beam Radon transform used for the tomographic part.
-            ``"native"`` (default) is diffractom's ParallelRadon, vectorised over
-            the orientations; ``"gratopy"`` uses gratopy. Both use the same
-            discretisation (they agree to float32 rounding); the native one is
-            2-8x faster for many orientations.
+            ``"native"`` is diffractom's ParallelRadon, vectorised over the orientations;
+            ``"gratopy"`` uses gratopy. Both use the same discretisation (pixel samples
+            spread onto the detector bins with a hat weight; they agree to float32
+            rounding); the native one is 2-8x faster for many orientations.
+            ``"fft"`` (FourierRadon) computes the projections through the Fourier slice
+            theorem (needs pyvkfft): the same geometry, a more accurate discretisation
+            (against exact line integrals about 1e-5 instead of 0.5-1.5 %, so results
+            differ from the native projector by about 1 %), and faster for large grids.
+            ``"auto"`` (default): "fft" for grids of more than 400 x 400 pixels (if pyvkfft
+            is installed), "native" otherwise.
+        fft_max_gb : float
+            GPU memory for the scratch buffers of the "fft" projector (they hold a slice of
+            the batch's orientations at a time).
         pf_cutoff_sigma : float, optional
             Where the Gaussian of each pole is cut to zero, in units of its width sigma: the PF
             matrix entries are exp(-(1 - |cos a|) / sigma^2) of the angle a between pole and probed
@@ -202,10 +214,26 @@ class SinglePhaseForwardOperator:
 
 
         # --- tomographic projector ---
-        if projector not in ("native", "gratopy"):
-            raise ValueError(f"projector must be 'native' or 'gratopy', not {projector!r}")
+        if projector not in ("auto", "native", "fft", "gratopy"):
+            raise ValueError(f"projector must be 'auto', 'native', 'fft' or 'gratopy', not {projector!r}")
+        if projector == "auto":
+            projector = "fft" if self.Nx * self.Ny > AUTO_FFT_PIXELS and fourier_radon.available() else "native"
         self.projector = projector
-        if projector == "native":
+        self.fradon = None
+        if projector == "fft":
+            self.fradon = fourier_radon.FourierRadon(
+                self.queue,
+                (self.Nx, self.Ny),
+                self.angles,
+                self.My,
+                image_width=self.Nx,
+                detector_width=self.My,
+                detector_shift=self.cor_offset,
+                angle_weights=delta,
+                max_gb=fft_max_gb,
+            )
+            self.PS = None
+        elif projector == "native":
             # angle weight = angular width of a projection (for a 180 degree range this
             # equals gratopy's default weights, so both projectors agree)
             self.radon = ParallelRadon(
@@ -456,7 +484,9 @@ class SinglePhaseForwardOperator:
             "C",
         )
 
-        if self.projector == "native":
+        if self.projector == "fft":
+            pass  # reads and writes the coefficients directly
+        elif self.projector == "native":
             # image batch, orientations fastest: (Nx*Ny, K_batch_max)
             self._img_k = _alloc(
                 "_img_k",
@@ -525,6 +555,9 @@ class SinglePhaseForwardOperator:
         Release OpenCL buffers created by allocate_coefficient_buffer() and
         remove the corresponding attributes from this object.
         """
+        if getattr(self, "fradon", None) is not None:
+            self.fradon.release()
+            self.fradon = None
         self.release_streamer()
         buffer_names = [
             "coeffs_sino_F",
@@ -1063,7 +1096,9 @@ class SinglePhaseForwardOperator:
         My = self.My
 
         # 1) Radon transform of this batch -> coeffs_sino_C (R, My, Kmax)
-        if self.projector == "native":
+        if self.projector == "fft":
+            self.fradon.forward(src, k_src, Kb, self.coeffs_sino_C, Kmax)
+        elif self.projector == "native":
             self.radon.gather(src, self._img_k, k_src, Kb, Kmax)
             self.radon.forward(self._img_k, self.coeffs_sino_C, Kmax)
         else:
@@ -1247,7 +1282,9 @@ class SinglePhaseForwardOperator:
                                      self.coeffs_sino_C, R, My, CP, Kmax, alpha)
 
         # 2) backprojection into the target
-        if self.projector == "native":
+        if self.projector == "fft":
+            self.fradon.backward(self.coeffs_sino_C, Kmax, target, k_target, Kb)
+        elif self.projector == "native":
             self.radon.backward(self.coeffs_sino_C, self._img_k, Kmax)
             self.radon.scatter(self._img_k, target, k_target, Kb, Kmax)
         else:
