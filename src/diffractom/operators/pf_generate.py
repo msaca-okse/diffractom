@@ -1,12 +1,13 @@
 """
 The sparse PF matrix of one orientation batch, generated directly on the GPU (pf_generate.cl).
 
-The CSR structures are the ones SinglePhaseForwardOperator.build_sparse_pf used to build from
-the dense PF batch, bitwise: forward rows (r, j) listing orientations k, adjoint rows (r, k)
-listing segments j = c*P + p. Instead of evaluating all R * Kb * C * P entries, only the entries
-near the Bragg condition of some pole are evaluated, so the cost scales with the number of
-non-zeros. Used to build the stored sparse matrix, and with pf_mode="generated" to generate every
-batch again in every forward and adjoint call, when the stored matrix would not fit.
+The CSR structures are the ones SinglePhaseForwardOperator used to build from the dense PF
+batch, bitwise: forward rows (r, j) listing orientations k, adjoint rows (r, k) listing segments
+j = c*P + p. Instead of evaluating all R * Kb * C * P entries, only the entries near the Bragg
+condition of some pole are evaluated, so the cost scales with the number of non-zeros.
+
+Used to build the stored sparse matrix, to generate the batches that are not stored in every
+forward and adjoint call, and to transpose a stored adjoint CSR into the forward one.
 """
 from pathlib import Path
 
@@ -23,20 +24,25 @@ MAX_SIGMA = np.deg2rad(20.0)
 
 _LOCAL = 256  # local size of the one-dimensional kernels
 
+# scratch bytes per candidate (cand_j, cand_row, cand_val, flag, pos) and per non-zero (adjoint
+# CSR col_j, val_a, row_of; forward CSR col_k, val_f)
+CAND_BYTES = 2 + 4 + 4 + 4 + 4
+NNZ_BYTES = 2 + 4 + 4 + 2 + 4
+
 
 def _ceil(n, m=_LOCAL):
     return -(-int(n) // m) * m
 
 
 class SparsePFGenerator:
-    """Generates the sparse PF matrix of an operator's orientation batches.
+    """Generates (and transposes) the sparse PF matrix of orientation batches of an operator.
 
-    generate(ib) enqueues everything on the operator's queue and reads nothing back, so it can
-    run in the middle of a streamed FISTA pass; the scratch buffers it returns are overwritten by
-    the next call. Call allocate() (sizes from the candidate counts of all batches) first.
+    generate() and transpose() enqueue everything on the operator's queue and read nothing back,
+    so they can run in the middle of a streamed FISTA pass; the scratch buffers they return are
+    overwritten by the next call. allocate() sizes the scratch buffers first.
     """
 
-    def __init__(self, op):
+    def __init__(self, op, k_batch_max):
         self.op = op
         q = self.q = op.queue
         R, C, P = op.N_Omega, op.N_eta, op.N_peaks
@@ -47,7 +53,8 @@ class SparsePFGenerator:
         src = Path(__file__).with_name("pf_generate.cl").read_text()
         prg = cl.Program(op.ctx, src).build(options=[f"-DMAXWC={maxwc}", f"-DPPW={self.ppw}", f"-DRPG={self.rpg}"])
         self.k = {n: cl.Kernel(prg, n) for n in ("pf_gen_candidates", "pf_gen_evaluate", "pf_gen_compact",
-                                                  "pf_gen_count_fwd", "pf_gen_fill_fwd", "pf_gen_sort_rows")}
+                                                  "pf_gen_count_fwd", "pf_gen_fill_fwd", "pf_gen_sort_rows",
+                                                  "pf_gen_row_of")}
         # the scan's temporary buffers come from a pool (a fresh allocation every call costs ms)
         self.pool = cltools.MemoryPool(cltools.ImmediateAllocator(q))
         self.scan = ExclusiveScanKernel(op.ctx, np.int32, "a+b", "0")
@@ -65,10 +72,11 @@ class SparsePFGenerator:
         self.eta0 = np.float32(e0)
         self.dsub = np.float32((e1 - e0) / (C * op.N_eta_subdivisions))
         self.full = np.int32(abs((e1 - e0) - 2 * np.pi) < 1e-6)
-        self.n_rows_max = R * op.K_batch_max
+        self.n_rows_max = R * int(k_batch_max)
         self.cnt = clarray.empty(q, (self.n_rows_max + 1,), np.int32)
         self.cand_ptr = clarray.empty(q, (self.n_rows_max + 1,), np.int32)
-        self.n_cap = None
+        self.n_cap = self.nnz_cap = 0
+        self._names = []
 
     @staticmethod
     def usable(op):
@@ -91,55 +99,55 @@ class SparsePFGenerator:
                         op.N_eta_subdivisions),
             self.eta0, self.dsub, self.full, np.int32(mode))
 
-    def _count(self, ib):
-        """Candidates of batch ib in cand_ptr (exclusive scan of the row counts)."""
-        b = self.op.batches[ib]
-        n_rows = self.op.N_Omega * b["K_batch"]
-        self._candidates(b["k_start"], b["K_batch"], 0)
+    def _count(self, k0, Kb):
+        """Candidates of orientations k0 .. k0+Kb-1 in cand_ptr (exclusive scan of the row counts)."""
+        n_rows = self.op.N_Omega * Kb
+        self._candidates(k0, Kb, 0)
         self.scan(self.cnt[:n_rows + 1], self.cand_ptr[:n_rows + 1], allocator=self.pool)
         return n_rows
 
-    def count_candidates(self):
+    def count_candidates(self, batches):
         """Number of candidates of every batch (reads them back; for sizing)."""
         out = []
-        for ib in range(len(self.op.batches)):
-            n_rows = self._count(ib)
+        for b in batches:
+            n_rows = self._count(b["k_start"], b["K_batch"])
             out.append(int(self.cand_ptr[n_rows:n_rows + 1].get()[0]))
         return out
 
-    def allocate(self, n_cap):
-        """Scratch buffers for batches of up to n_cap candidates (and as many non-zeros)."""
-        if n_cap >= 2**31 - 1:
-            raise ValueError("Too many PF candidates in one K-batch for int32 indices; lower max_gb.")
-        q, n = self.q, max(int(n_cap), 1)
+    def allocate(self, n_cap=0, nnz_cap=0):
+        """Scratch buffers: for generating batches of up to n_cap candidates (0: none), and for
+        the forward CSR of batches of up to nnz_cap non-zeros (at least n_cap)."""
+        nnz_cap = max(int(nnz_cap), int(n_cap))
+        if max(n_cap, nnz_cap) >= 2**31 - 1:
+            raise ValueError("Too many PF entries in one K-batch for int32 indices; lower max_gb.")
         self.release_scratch()
-        self.n_cap = n
-        e = lambda size, dt: clarray.empty(q, (size,), dt)
-        self.cand_j, self.cand_row, self.cand_val = e(n, np.uint16), e(n, np.int32), e(n, np.float32)
-        self.flag, self.pos = e(n + 1, np.int32), e(n + 1, np.int32)
-        self.row_ptr_a, self.col_j, self.val_a, self.row_of = (e(self.n_rows_max + 1, np.int32), e(n, np.uint16),
-                                                              e(n, np.float32), e(n, np.int32))
-        nf = self.op.N_Omega * self.CP
-        self.cnt_f, self.row_ptr_f, self.cursor = e(nf + 1, np.int32), e(nf + 1, np.int32), e(nf, np.int32)
-        self.col_k, self.val_f = e(n, np.uint16), e(n, np.float32)
+        q = self.q
+        e = lambda size, dt: clarray.empty(q, (max(int(size), 1),), dt)
+        bufs = {}
+        if n_cap > 0:
+            bufs.update(cand_j=e(n_cap, np.uint16), cand_row=e(n_cap, np.int32), cand_val=e(n_cap, np.float32),
+                        flag=e(n_cap + 1, np.int32), pos=e(n_cap + 1, np.int32),
+                        row_ptr_a=e(self.n_rows_max + 1, np.int32), col_j=e(n_cap, np.uint16),
+                        val_a=e(n_cap, np.float32))
+        if nnz_cap > 0:
+            nf = self.op.N_Omega * self.CP
+            bufs.update(row_of=e(nnz_cap, np.int32), cnt_f=e(nf + 1, np.int32), row_ptr_f=e(nf + 1, np.int32),
+                        cursor=e(nf, np.int32), col_k=e(nnz_cap, np.uint16), val_f=e(nnz_cap, np.float32))
+        for n, a in bufs.items():
+            setattr(self, n, a)
+        self._names = list(bufs)
+        self.n_cap, self.nnz_cap = int(n_cap), nnz_cap
 
     def nbytes(self):
-        return sum(a.nbytes for a in self._scratch())
+        return sum(getattr(self, n).nbytes for n in self._names)
 
-    def _scratch(self):
-        names = ("cand_j", "cand_row", "cand_val", "flag", "pos", "row_ptr_a", "col_j", "val_a", "row_of",
-                 "cnt_f", "row_ptr_f", "cursor", "col_k", "val_f")
-        return [getattr(self, n) for n in names if getattr(self, n, None) is not None]
-
-    def generate(self, ib, forward=True):
-        """Enqueue the sparse PF matrix of batch ib: a dict with the adjoint CSR (row_ptr_a, col_j,
-        val_a) and, if forward, the forward CSR (row_ptr_f, col_k, val_f); views of the scratch
-        buffers. The number of candidates must not exceed the capacity given to allocate()."""
+    def generate(self, k0, Kb, forward=True):
+        """Enqueue the sparse PF matrix of orientations k0 .. k0+Kb-1: a dict with the adjoint
+        CSR (row_ptr_a, col_j, val_a) and, if forward, the forward CSR (row_ptr_f, col_k, val_f);
+        views of the scratch buffers. Its candidates must not exceed allocate()'s n_cap."""
         op, q, k = self.op, self.q, self.k
-        b = op.batches[ib]
-        k0, Kb = b["k_start"], b["K_batch"]
-        R, C, P, CP = op.N_Omega, op.N_eta, op.N_peaks, self.CP
-        n_rows = self._count(ib)
+        C, P = op.N_eta, op.N_peaks
+        n_rows = self._count(k0, Kb)
         self._candidates(k0, Kb, 1, self.cand_j, self.cand_row)
         n_flags = self.n_cap + 1
         k["pf_gen_evaluate"](q, (_ceil(n_flags),), (_LOCAL,),
@@ -156,28 +164,42 @@ class SparsePFGenerator:
                             self.val_a.data, self.row_of.data, np.int32(n_rows))
         out = dict(row_ptr_a=self.row_ptr_a[:n_rows + 1], col_j=self.col_j, val_a=self.val_a)
         if forward:
-            nf = R * CP
-            self.cnt_f.fill(0)
-            k["pf_gen_count_fwd"](q, (_ceil(self.n_cap),), (_LOCAL,), self.row_of.data, self.col_j.data,
-                                  self.row_ptr_a.data, self.cnt_f.data, *self._ints(n_rows, Kb, CP))
-            self.scan(self.cnt_f, self.row_ptr_f, allocator=self.pool)
-            self.cursor.fill(0)
-            k["pf_gen_fill_fwd"](q, (_ceil(self.n_cap),), (_LOCAL,), self.row_of.data, self.col_j.data,
-                                 self.val_a.data, self.row_ptr_a.data, self.row_ptr_f.data, self.cursor.data,
-                                 self.col_k.data, self.val_f.data, *self._ints(n_rows, Kb, CP))
-            k["pf_gen_sort_rows"](q, (_ceil(nf),), (_LOCAL,), self.row_ptr_f.data, self.col_k.data,
-                                  self.val_f.data, np.int32(nf))
-            out.update(row_ptr_f=self.row_ptr_f, col_k=self.col_k, val_f=self.val_f)
+            out.update(self._transpose(out, Kb, self.n_cap))
         return out
 
+    def transpose(self, sb, Kb):
+        """The forward CSR (row_ptr_f, col_k, val_f; scratch views) of a stored adjoint CSR of Kb
+        orientations (row_ptr_a, col_j, val_a) with at most allocate()'s nnz_cap non-zeros."""
+        n_rows = self.op.N_Omega * Kb
+        self.k["pf_gen_row_of"](self.q, (_ceil(n_rows),), (_LOCAL,), sb["row_ptr_a"].data, self.row_of.data,
+                                np.int32(n_rows))
+        return self._transpose(sb, Kb, self.nnz_cap)
+
+    def _transpose(self, sb, Kb, cap):
+        """Forward CSR from the adjoint CSR sb, with row_of filled: count, scan, fill, sort by k."""
+        q, k, CP = self.q, self.k, self.CP
+        n_rows = self.op.N_Omega * Kb
+        nf = self.op.N_Omega * CP
+        self.cnt_f.fill(0)
+        k["pf_gen_count_fwd"](q, (_ceil(cap),), (_LOCAL,), self.row_of.data, sb["col_j"].data,
+                              sb["row_ptr_a"].data, self.cnt_f.data, *self._ints(n_rows, Kb, CP))
+        self.scan(self.cnt_f, self.row_ptr_f, allocator=self.pool)
+        self.cursor.fill(0)
+        k["pf_gen_fill_fwd"](q, (_ceil(cap),), (_LOCAL,), self.row_of.data, sb["col_j"].data,
+                             sb["val_a"].data, sb["row_ptr_a"].data, self.row_ptr_f.data, self.cursor.data,
+                             self.col_k.data, self.val_f.data, *self._ints(n_rows, Kb, CP))
+        k["pf_gen_sort_rows"](q, (_ceil(nf),), (_LOCAL,), self.row_ptr_f.data, self.col_k.data,
+                              self.val_f.data, np.int32(nf))
+        return dict(row_ptr_f=self.row_ptr_f, col_k=self.col_k, val_f=self.val_f)
+
     def release_scratch(self):
-        for a in self._scratch():
-            if a.base_data is not None:
+        for n in self._names:
+            a = getattr(self, n)
+            if a is not None and a.base_data is not None:
                 a.base_data.release()
-        for n in ("cand_j", "cand_row", "cand_val", "flag", "pos", "row_ptr_a", "col_j", "val_a", "row_of",
-                  "cnt_f", "row_ptr_f", "cursor", "col_k", "val_f"):
             setattr(self, n, None)
-        self.n_cap = None
+        self._names = []
+        self.n_cap = self.nnz_cap = 0
 
     def release(self):
         self.release_scratch()

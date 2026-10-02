@@ -11,13 +11,13 @@ from .create_pfo_matrix import build_pf_program
 # ----------------------------
 # Program build
 # ----------------------------
-def build_pfo_program(ctx: cl.Context, *, ts: int = 16) -> cl.Program:
+def build_pfo_program(ctx: cl.Context, *, ts: int = 16, spmm_ty: int = 24) -> cl.Program:
     """
     Build the main PFO OpenCL program from pf_kernels.cl.
     """
     cl_path = Path(__file__).with_name("pf_kernels.cl")
     src = cl_path.read_text()
-    return cl.Program(ctx, src).build(options=[f"-DTS={ts}"])
+    return cl.Program(ctx, src).build(options=[f"-DTS={ts}", f"-DSPMM_TY={spmm_ty}"])
 
 
 # ----------------------------

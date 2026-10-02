@@ -581,50 +581,106 @@ __kernel void scatter_k_batch_c(
 // ---------------------------------------------------------------------------
 // Sparse PF products for the channel-fastest sinogram layout (R, My, Kstride)
 // C-order, used with diffractom's own projector (ParallelRadon).
+//
+// A work-group handles one omega r and SPMM_TY detector positions y (a tile) for get_local_size
+// rows: every matrix entry is read once per tile, not once per y. The dense operand (the tile's
+// lines of the sinogram or of the data) goes through local memory a chunk at a time; the rows
+// are sorted by column, so every work-item keeps its position in its row from chunk to chunk.
+// Each output is summed in row order, as a plain row-by-row product would.
+// Range (round_up(rows, ls), ceil(My / SPMM_TY), R); array offsets are 64 bit.
 // ---------------------------------------------------------------------------
+#ifndef SPMM_TY
+#define SPMM_TY 24
+#endif
 
-// data[r, y, j] += sum_k pf[r, k, j] * sino[r, y, k]
-// Range (CP, My, R); array offsets are 64 bit, so the data array may exceed 2^31 elements.
+// data[r, y, j] += sum_k pf[r, k, j] * sino[r, y, k]   (forward rows (r, j), sorted by k)
 __kernel void spmm_pf_forward_c(
     __global const float *sino,         // (R, My, Kstride)
     __global const int *row_ptr,        // (R*CP + 1,)
     __global const ushort *col_k,
     __global const float *val,
     __global float *data,               // (R, My, CP)
-    const int R, const int My, const int CP, const int Kstride
+    const int R, const int My, const int CP, const int Kstride, const int Kb,
+    const int KC, __local float *lsino  // SPMM_TY * KC floats
 ){
-    const int j = get_global_id(0);
-    const int y = get_global_id(1);
-    const int r = get_global_id(2);
-    if (j >= CP || y >= My || r >= R) return;
-    const int row = r * CP + j;
-    const size_t line = (size_t)r * My + y;
-    __global const float *sino_line = sino + line * Kstride;
-    float acc = 0.0f;
-    for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i)
-        acc += val[i] * sino_line[col_k[i]];
-    data[line * CP + j] += acc;
+    const int lid = get_local_id(0), ls = get_local_size(0);
+    const int j = get_group_id(0) * ls + lid;
+    const int y0 = get_group_id(1) * SPMM_TY;
+    const int r = get_group_id(2);
+    const int ny = min(SPMM_TY, My - y0);
+    const size_t line0 = (size_t)r * My + y0;
+    int i = 0, e = 0;
+    if (j < CP) { i = row_ptr[r * CP + j]; e = row_ptr[r * CP + j + 1]; }
+    float acc[SPMM_TY];
+    #pragma unroll
+    for (int t = 0; t < SPMM_TY; ++t) acc[t] = 0.0f;
+    for (int k0 = 0; k0 < Kb; k0 += KC) {
+        const int kn = min(KC, Kb - k0);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int t = 0; t < ny; ++t) {
+            __global const float *src = sino + (line0 + t) * Kstride + k0;
+            for (int kk = lid; kk < kn; kk += ls) lsino[t * KC + kk] = src[kk];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const int k1 = k0 + kn;
+        for (; i < e; ++i) {
+            const int k = col_k[i];
+            if (k >= k1) break;
+            const float v = val[i];
+            #pragma unroll
+            for (int t = 0; t < SPMM_TY; ++t)
+                if (t < ny) acc[t] += v * lsino[t * KC + (k - k0)];
+        }
+    }
+    if (j < CP) {
+        #pragma unroll
+        for (int t = 0; t < SPMM_TY; ++t)
+            if (t < ny) data[(line0 + t) * CP + j] += acc[t];
+    }
 }
 
-// sino[r, y, k] = alpha * sum_j pf[r, k, j] * data[r, y, j]   for k < Kb
-// Range (Kb, My, R); array offsets are 64 bit.
+// sino[r, y, k] = alpha * sum_j pf[r, k, j] * data[r, y, j]   for k < Kb   (adjoint rows (r, k), sorted by j)
 __kernel void spmm_pf_adjoint_c(
     __global const float *data,         // (R, My, CP)
     __global const int *row_ptr,        // (R*Kb + 1,)
     __global const ushort *col_j,
     __global const float *val,
     __global float *sino,               // (R, My, Kstride)
-    const int R, const int My, const int Kb, const int CP, const int Kstride, const float alpha
+    const int R, const int My, const int Kb, const int CP, const int Kstride, const float alpha,
+    const int JC, __local float *ldata  // SPMM_TY * JC floats
 ){
-    const int k = get_global_id(0);
-    const int y = get_global_id(1);
-    const int r = get_global_id(2);
-    if (k >= Kb || y >= My || r >= R) return;
-    const int row = r * Kb + k;
-    const size_t line = (size_t)r * My + y;
-    __global const float *data_line = data + line * CP;
-    float acc = 0.0f;
-    for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i)
-        acc += val[i] * data_line[col_j[i]];
-    sino[line * Kstride + k] = alpha * acc;
+    const int lid = get_local_id(0), ls = get_local_size(0);
+    const int k = get_group_id(0) * ls + lid;
+    const int y0 = get_group_id(1) * SPMM_TY;
+    const int r = get_group_id(2);
+    const int ny = min(SPMM_TY, My - y0);
+    const size_t line0 = (size_t)r * My + y0;
+    int i = 0, e = 0;
+    if (k < Kb) { i = row_ptr[r * Kb + k]; e = row_ptr[r * Kb + k + 1]; }
+    float acc[SPMM_TY];
+    #pragma unroll
+    for (int t = 0; t < SPMM_TY; ++t) acc[t] = 0.0f;
+    for (int j0 = 0; j0 < CP; j0 += JC) {
+        const int jn = min(JC, CP - j0);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int t = 0; t < ny; ++t) {
+            __global const float *src = data + (line0 + t) * CP + j0;
+            for (int jj = lid; jj < jn; jj += ls) ldata[t * JC + jj] = src[jj];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const int j1 = j0 + jn;
+        for (; i < e; ++i) {
+            const int j = col_j[i];
+            if (j >= j1) break;
+            const float v = val[i];
+            #pragma unroll
+            for (int t = 0; t < SPMM_TY; ++t)
+                if (t < ny) acc[t] += v * ldata[t * JC + (j - j0)];
+        }
+    }
+    if (k < Kb) {
+        #pragma unroll
+        for (int t = 0; t < SPMM_TY; ++t)
+            if (t < ny) sino[(line0 + t) * Kstride + k] = alpha * acc[t];
+    }
 }

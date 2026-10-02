@@ -242,3 +242,11 @@ __kernel void pf_gen_sort_rows(
         val[j + 1] = cv;
     }
 }
+
+// row_of[i] = the row of entry i (for transposing a stored adjoint CSR)
+__kernel void pf_gen_row_of(__global const int *row_ptr, __global int *row_of, const int n_rows)
+{
+    int row = get_global_id(0);
+    if (row >= n_rows) return;
+    for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i) row_of[i] = row;
+}
