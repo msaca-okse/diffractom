@@ -37,6 +37,9 @@ SUITES = {
     # larger problems: a 600 x 600 grid, and a sparse PF matrix too large to store (K = 100000,
     # sigma = 1 deg: both CSRs ~37 GB)
     "large": [{"sweep": "large_N", "N": 600}, {"sweep": "large_K", "K": 100000, "sigma_deg": 1.0}],
+    # wide basis functions on large grids
+    "large_sigma": ([{"sweep": "large_sigma_400", "N": 400, "sigma_deg": s} for s in (2.0, 4.0)]
+                    + [{"sweep": "large_sigma_600", "N": 600, "sigma_deg": s} for s in (2.0, 4.0)]),
     "quick": [{"sweep": "quick", "K": 1000, "N": 64}],
 }
 WARMUP = {"K": 200, "N": 32, "N_Omega": 36, "N_eta": 36}  # compiles and caches the kernels of a version
