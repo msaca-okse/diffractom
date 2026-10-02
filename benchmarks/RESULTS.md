@@ -60,6 +60,24 @@ Seconds per FISTA iteration; speed-up = previous / newest (below 1: slower).
   <img alt="Seconds per FISTA iteration of every version on the base case" src="figures/versions_light.png">
 </picture>
 
+## Every version on other cases
+
+The larger cases (600 x 600; K = 100000 at sigma = 1 deg) are in the suite `large`, run only for the newest versions.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="figures/versions_cases_dark.png">
+  <img alt="Seconds per FISTA iteration of every version on six other cases" src="figures/versions_cases_light.png">
+</picture>
+
+### GPU or streamed?
+
+With the arrays on the GPU, FISTA keeps about three coefficient arrays (4 K N^2 bytes each) and two data arrays on the device; streamed, the coefficients stay in host memory and only batch-sized buffers are on the GPU. When everything fits, the GPU mode is faster (the streamed mode adds the transfers, partly overlapped with the computation). It stops fitting at two limits:
+
+- the largest single GPU buffer, about a quarter of the device memory (about 12 GB on a 48 GB A40): a coefficient array of more than 3 * 10^9 values, e.g. K = 10000 orientations on a 600 x 600 grid (14.4 GB), cannot be allocated at all;
+- the device memory: three coefficient arrays, the data, the sparse PF matrix and the batch buffers. The sparse PF matrix gets what the solver leaves, so a large problem in GPU mode may have to generate its PF matrix in every call (K = 100000 at sigma = 1 deg: generated in the GPU mode, stored when streamed).
+
+So for large grids or many orientations, streaming is not a fallback but the only option; its limit is host memory (the coefficients, twice).
+
 ## Arrays on the GPU
 
 <picture>

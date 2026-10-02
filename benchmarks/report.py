@@ -48,6 +48,17 @@ THEMES = {
                  series=["#3987e5", "#d95926", "#199e70"]),
 }
 MARKERS = ["o", "s", "^"]
+MODES = [("gpu", "arrays on the GPU"), ("stream", "coefficients streamed from host")]
+# the cases of the per-case version charts: (title, K, N, sigma)
+CASES = [
+    ("many orientations", 100000, 120, 0.4),
+    ("wide basis (sparse PF)", 10000, 120, 2.0),
+    ("wider basis (dense PF)", 10000, 120, 4.0),
+    ("large grid", 10000, 400, 0.4),
+    ("larger grid", 10000, 600, 0.4),
+    ("PF matrix too large to store", 100000, 120, 1.0),
+]
+FAILED = {"oom": "out of memory", "timeout": "> 5 min", "skipped": "skipped", "crashed": "crashed"}
 
 
 def load(files):
@@ -148,6 +159,7 @@ def style(ax, th):
 
 
 def figures(rows, idx, versions):
+    import math
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -180,7 +192,6 @@ def figures(rows, idx, versions):
                     markeredgecolor=th["bg"], markeredgewidth=1.2, label=label, zorder=3)
             ax.annotate(f"{pts[-1][1]:.2f} s", pts[-1], xytext=(7, 0), textcoords="offset points",
                         va="center", fontsize=8, color=th["text"])
-        import math
         ax.set_ylim(10 ** math.floor(math.log10(min(allys))), 10 ** math.ceil(math.log10(max(allys))))
         ax.grid(False, axis="x")
         ax.set_xlim(-0.5, len(shas) - 0.2)
@@ -198,6 +209,71 @@ def figures(rows, idx, versions):
             t.set_color(th["text"])
         fig.tight_layout()
         fig.savefig(os.path.join(FIG, f"versions_{mode_name}.png"), facecolor=th["bg"])
+        plt.close(fig)
+
+        # 1b. every version on other cases; runs that did not finish as x at the top of the panel
+        cases = [c for c in CASES if any(r["case"]["K"] == c[1] and r["case"]["N"] == c[2]
+                                         and r["case"]["sigma_deg"] == c[3] for r in rows)]
+        ncol = 3
+        nrow = -(-len(cases) // ncol)
+        fig, axes = plt.subplots(nrow, ncol, figsize=(11.0, 3.3 * nrow + 0.7), dpi=150, facecolor=th["bg"],
+                                 squeeze=False)
+        for ax in axes.flat[len(cases):]:
+            ax.set_visible(False)
+        for ax, (title, K, N, sig) in zip(axes.flat, cases):
+            style(ax, th)
+            ax.grid(False, axis="x")
+            ok_y, failed, ends = [], [], []
+            for j, (mode, label) in enumerate(MODES):
+                pts = []
+                for i, s in enumerate(shas):
+                    r = idx.get((s, mode, K, N, sig))
+                    if r is None:
+                        continue
+                    y = fista(r)
+                    if y is not None:
+                        pts.append((i, y))
+                    elif r["status"] in FAILED or "INVALID_BUFFER_SIZE" in (r.get("error") or ""):
+                        failed.append((i, j))
+                if pts:
+                    ok_y += [y for _, y in pts]
+                    ax.plot(*zip(*pts), color=th["series"][j], linewidth=1.6, marker=MARKERS[j], markersize=6,
+                            markeredgecolor=th["bg"], markeredgewidth=1.2, zorder=3, label=label)
+                    ends.append(pts[-1])
+            # end labels; two close ones (same version, within 30 %) go above and below
+            close = len(ends) == 2 and ends[0][0] == ends[1][0] and max(e[1] for e in ends) / min(e[1] for e in ends) < 1.3
+            for e in ends:
+                dy = 0 if not close else (6 if e[1] == max(f[1] for f in ends) else -6)
+                ax.annotate(f"{e[1]:.3g} s", e, xytext=(6, dy), textcoords="offset points",
+                            va="bottom" if dy > 0 else ("top" if dy < 0 else "center"), fontsize=8, color=th["text"])
+            lo = 10 ** math.floor(math.log10(min(ok_y))) if ok_y else 0.1
+            hi = 10 ** math.ceil(math.log10(max(ok_y) * 1.3)) if ok_y else 10
+            ax.set_yscale("log")
+            ax.set_ylim(lo, hi)
+            for i, j in failed:
+                ax.plot([i + (j - 0.5) * 0.25], [hi], marker="x", markersize=7, markeredgewidth=2,
+                        color=th["series"][j], clip_on=False, zorder=4)
+            ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 3.0)))
+            ax.yaxis.set_major_formatter(num)
+            ax.yaxis.set_minor_formatter(FuncFormatter(lambda *a: ""))
+            ax.set_xlim(-0.5, len(shas) - 0.3)
+            ax.set_xticks(range(len(shas)))
+            ax.set_xticklabels(shas, fontsize=7, rotation=45, ha="right", color=th["muted"])
+            ax.set_title(f"{title}\nK = {K}, {N} x {N}, sigma = {sig:g} deg", loc="left", fontsize=9.5,
+                         color=th["text"])
+        for row in axes:
+            row[0].set_ylabel("s per FISTA iteration (log)", color=th["muted"], fontsize=9)
+        from matplotlib.lines import Line2D
+        handles = [Line2D([], [], color=th["series"][j], linewidth=1.6, marker=MARKERS[j], markersize=6,
+                          markeredgecolor=th["bg"], label=label) for j, (_, label) in enumerate(MODES)]
+        handles.append(Line2D([], [], linestyle="none", marker="x", markersize=7, markeredgewidth=2,
+                              color=th["muted"], label="did not run: out of memory, > 5 min, or skipped"))
+        leg = fig.legend(handles=handles, frameon=False, fontsize=9, loc="upper left", ncol=3,
+                         bbox_to_anchor=(0.0, 0.995))
+        for t in leg.get_texts():
+            t.set_color(th["text"])
+        fig.tight_layout(rect=(0, 0, 1, 1 - 0.45 / fig.get_figheight()))
+        fig.savefig(os.path.join(FIG, f"versions_cases_{mode_name}.png"), facecolor=th["bg"])
         plt.close(fig)
 
         # 2. the sweeps, three versions; 3. GPU memory along K
@@ -313,7 +389,25 @@ def markdown(rows, idx, versions, files):
     for v in versions[::-1]:
         out.append(f"| `{v['sha']}` | {v['date'][:10]} | {LABELS.get(v['sha'], v['subject'])} |")
     out += summary(rows, idx, versions)
-    out += ["", "## Every version on the base case", "", picture("versions", "Seconds per FISTA iteration of every version on the base case"), ""]
+    out += ["", "## Every version on the base case", "", picture("versions", "Seconds per FISTA iteration of every version on the base case"), "",
+            "## Every version on other cases", "",
+            "The larger cases (600 x 600; K = 100000 at sigma = 1 deg) are in the suite `large`, run only for "
+            "the newest versions.", "",
+            picture("versions_cases", "Seconds per FISTA iteration of every version on six other cases"), "",
+            "### GPU or streamed?", "",
+            "With the arrays on the GPU, FISTA keeps about three coefficient arrays (4 K N^2 bytes each) and two "
+            "data arrays on the device; streamed, the coefficients stay in host memory and only batch-sized "
+            "buffers are on the GPU. When everything fits, the GPU mode is faster (the streamed mode adds the "
+            "transfers, partly overlapped with the computation). It stops fitting at two limits:", "",
+            "- the largest single GPU buffer, about a quarter of the device memory (about 12 GB on a 48 GB A40): "
+            "a coefficient array of more than 3 * 10^9 values, e.g. K = 10000 orientations on a 600 x 600 grid "
+            "(14.4 GB), cannot be allocated at all;",
+            "- the device memory: three coefficient arrays, the data, the sparse PF matrix and the batch buffers. "
+            "The sparse PF matrix gets what the solver leaves, so a large problem in GPU mode may have to "
+            "generate its PF matrix in every call (K = 100000 at sigma = 1 deg: generated in the GPU mode, "
+            "stored when streamed).", "",
+            "So for large grids or many orientations, streaming is not a fallback but the only option; its "
+            "limit is host memory (the coefficients, twice).", ""]
 
     for mode, title in [("gpu", "Arrays on the GPU"), ("stream", "Coefficients streamed from host memory")]:
         out += [f"## {title}", "", picture(f"sweeps_{mode}", f"Seconds per FISTA iteration along each sweep, {title.lower()}"), "",
