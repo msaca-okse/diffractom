@@ -19,8 +19,8 @@ from pyopencl.scan import ExclusiveScanKernel
 from scipy.spatial.transform import Rotation
 
 # the candidate test assumes the second term of the PF kernel, exp(-(1 + |n.v|) / sigma^2), is
-# cut off (it is for sigma below 23 degrees)
-MAX_SIGMA = np.deg2rad(20.0)
+# cut off, i.e. 1 / sigma^2 >= the threshold (6 by default: sigma below 23 degrees); with a margin
+MAX_SIGMA = np.deg2rad(20.0)  # for the default threshold
 
 _LOCAL = 256  # local size of the one-dimensional kernels
 
@@ -51,7 +51,8 @@ class SparsePFGenerator:
         self.ppw = max(1 << (P - 1).bit_length(), maxwc)
         self.rpg = max(1, 128 // self.ppw)
         src = Path(__file__).with_name("pf_generate.cl").read_text()
-        prg = cl.Program(op.ctx, src).build(options=[f"-DMAXWC={maxwc}", f"-DPPW={self.ppw}", f"-DRPG={self.rpg}"])
+        prg = cl.Program(op.ctx, src).build(options=[f"-DMAXWC={maxwc}", f"-DPPW={self.ppw}", f"-DRPG={self.rpg}",
+                                                     *op.pf_cut_options])
         self.k = {n: cl.Kernel(prg, n) for n in ("pf_gen_candidates", "pf_gen_evaluate", "pf_gen_compact",
                                                   "pf_gen_count_fwd", "pf_gen_fill_fwd", "pf_gen_rank_rows",
                                                   "pf_gen_row_of")}
@@ -80,7 +81,8 @@ class SparsePFGenerator:
 
     @staticmethod
     def usable(op):
-        return float(np.max(op.sigma_cpu)) < MAX_SIGMA
+        cut = 6.0 if op.pf_cutoff_sigma is None else float(op.pf_cutoff_sigma) ** 2 / 2
+        return float(np.max(op.sigma_cpu)) < MAX_SIGMA * np.sqrt(6.0 / cut)
 
     def _ints(self, *v):
         return [np.int32(x) for x in v]

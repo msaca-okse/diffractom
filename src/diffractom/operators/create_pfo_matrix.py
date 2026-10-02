@@ -1,4 +1,9 @@
 PF_KERNEL_SRC = r"""
+// PF_CUT: the Gaussian of a pole is cut where (1 - |cos angle|) / sigma^2 reaches PF_CUT, i.e. at an
+// angle of about sqrt(2 PF_CUT) sigma (default 6: 3.46 sigma, exp(-6) = 0.25 % of the peak).
+#ifndef PF_CUT
+#define PF_CUT 6.0f
+#endif
 __kernel void pfmatrix_eval(
     __global const float *coords,      // (R, S_omega, C, S_eta, P, 3) flattened
     __global const float *grid_inv,    // (K, 9) flattened row-major (3x3)
@@ -70,10 +75,10 @@ __kernel void pfmatrix_eval(
                 float dot = hx*qx + hy*qy + hz*qz;
 
                 float arg1 = -(1.0f - dot) * inv_sig2;
-                if (arg1 > -6.0f) w += exp(arg1);
+                if (arg1 > -PF_CUT) w += exp(arg1);
 
                 float arg2 = -(1.0f + dot) * inv_sig2;
-                if (arg2 > -6.0f) w += exp(arg2);
+                if (arg2 > -PF_CUT) w += exp(arg2);
             }
 
             w_total += w;
@@ -146,9 +151,9 @@ __kernel void pfmatrix_eval_poles(
                 float d = fabs(poles[b + 0]*vx + poles[b + 1]*vy + poles[b + 2]*vz);
                 float t = 0.0f;
                 float e1 = (1.0f - d) * inv_sig2;
-                if (e1 < 6.0f) t += exp(-e1);
+                if (e1 < PF_CUT) t += exp(-e1);
                 float e2 = (1.0f + d) * inv_sig2;
-                if (e2 < 6.0f) t += exp(-e2);
+                if (e2 < PF_CUT) t += exp(-e2);
                 w_total += axis_count[a] * t;
             }
         }
@@ -159,6 +164,11 @@ __kernel void pfmatrix_eval_poles(
 """
 
 PFSPARSE_KERNEL_SRC = r"""
+// PF_CUT: the Gaussian of a pole is cut where (1 - |cos angle|) / sigma^2 reaches PF_CUT, i.e. at an
+// angle of about sqrt(2 PF_CUT) sigma (default 6: 3.46 sigma, exp(-6) = 0.25 % of the peak).
+#ifndef PF_CUT
+#define PF_CUT 6.0f
+#endif
 __kernel void pfmatrix_count_sparse(
     __global const float *coords,
     __global const float *grid_inv,
@@ -215,10 +225,10 @@ __kernel void pfmatrix_count_sparse(
         float dot = hx*qx + hy*qy + hz*qz;
 
         float arg1 = -(1.0f - dot) * inv_sigma2;
-        if (arg1 > -6.0f) w += exp(arg1);
+        if (arg1 > -PF_CUT) w += exp(arg1);
 
         float arg2 = -(1.0f + dot) * inv_sigma2;
-        if (arg2 > -6.0f) w += exp(arg2);
+        if (arg2 > -PF_CUT) w += exp(arg2);
     }
 
     w *= norm_factor;
@@ -295,10 +305,10 @@ __kernel void pfmatrix_write_sparse(
         float dot = hx*qx + hy*qy + hz*qz;
 
         float arg1 = -(1.0f - dot) * inv_sigma2;
-        if (arg1 > -6.0f) w += exp(arg1);
+        if (arg1 > -PF_CUT) w += exp(arg1);
 
         float arg2 = -(1.0f + dot) * inv_sigma2;
-        if (arg2 > -6.0f) w += exp(arg2);
+        if (arg2 > -PF_CUT) w += exp(arg2);
     }
 
     w *= norm_factor;
@@ -489,9 +499,9 @@ import numpy as np
 import pyopencl as cl
 import pyopencl.array as clarray
 
-def build_pf_program(ctx: cl.Context) -> cl.Program:
-    """Build the dense PF-matrix evaluation OpenCL program."""
-    return cl.Program(ctx, PF_KERNEL_SRC).build()
+def build_pf_program(ctx: cl.Context, options=()) -> cl.Program:
+    """Build the dense PF-matrix evaluation OpenCL program (options: e.g. -DPF_CUT=4.5f)."""
+    return cl.Program(ctx, PF_KERNEL_SRC).build(options=list(options))
 
 def build_pfsparse_program(ctx: cl.Context) -> cl.Program:
     """Build the sparse PF-matrix evaluation OpenCL program."""

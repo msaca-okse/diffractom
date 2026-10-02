@@ -18,6 +18,12 @@
 // Compile-time constants: MAXWC = ceil(C / 32) words of eta bits per ring, PPW >= max(P, MAXWC)
 // work-items per row, RPG rows per work-group (local size RPG * PPW).
 
+// PF_CUT: the Gaussian of a pole is cut where (1 - |cos angle|) / sigma^2 reaches PF_CUT, i.e. at an
+// angle of about sqrt(2 PF_CUT) sigma (default 6: 3.46 sigma, exp(-6) = 0.25 % of the peak).
+#ifndef PF_CUT
+#define PF_CUT 6.0f
+#endif
+
 #define MARK(c) { int _c = (c); _Pragma("unroll") for (int _w = 0; _w < MAXWC; ++_w) if (_w == (_c >> 5)) mask[_w] |= 1u << (_c & 31); }
 
 inline float pf_entry(__global const float *coords, __global const float *poles, __global const int *axis_start,
@@ -39,9 +45,9 @@ inline float pf_entry(__global const float *coords, __global const float *poles,
                 float d = fabs(poles[b + 0]*vx + poles[b + 1]*vy + poles[b + 2]*vz);
                 float t = 0.0f;
                 float e1 = (1.0f - d) * inv_sig2;
-                if (e1 < 6.0f) t += exp(-e1);
+                if (e1 < PF_CUT) t += exp(-e1);
                 float e2 = (1.0f + d) * inv_sig2;
-                if (e2 < 6.0f) t += exp(-e2);
+                if (e2 < PF_CUT) t += exp(-e2);
                 w_total += axis_count[a] * t;
             }
         }
@@ -81,8 +87,8 @@ __kernel void pf_gen_candidates(
     for (int w = 0; w < MAXWC; ++w) mask[w] = 0u;
 
     if (active) {
-        // relaxed threshold: candidates are a superset of the entries with (1 - |n.v|) * inv_sig2 < 6
-        float tau = 1.0f - 6.0f / inv_sigma2[kg] - 1e-4f;
+        // relaxed threshold: candidates are a superset of the entries with (1 - |n.v|) * inv_sig2 < PF_CUT
+        float tau = 1.0f - PF_CUT / inv_sigma2[kg] - 1e-4f;
         float st = sin_th[p], ct = cos_th[p];
         for (int a = axis_start[p]; a < axis_start[p + 1]; ++a) {
             int b = (kg * A + a) * 3;
