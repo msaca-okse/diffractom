@@ -47,7 +47,7 @@ class SinglePhaseForwardOperator:
         sparse_max_gb: float | None = None,
         projector: str = "native",
         reserve_coefficient_arrays: int = 3,
-        pf_cutoff_sigma: float | None = None,
+        pf_cutoff_sigma: float | None = 3.0,
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -119,12 +119,13 @@ class SinglePhaseForwardOperator:
             Where the Gaussian of each pole is cut to zero, in units of its width sigma: the PF
             matrix entries are exp(-(1 - |cos a|) / sigma^2) of the angle a between pole and probed
             direction, set to zero where (1 - |cos a|) / sigma^2 >= pf_cutoff_sigma^2 / 2, i.e.
-            for a >= pf_cutoff_sigma * sigma (small angles). Default (None): the threshold 6, a cut
-            at sqrt(12) = 3.46 sigma, where the Gaussian has fallen to exp(-6) = 0.25 % of its peak
-            and about 0.25 % of its mass lies beyond. A smaller value gives fewer non-zeros (about
-            (pf_cutoff_sigma / 3.46)^2 as many: faster, and more of the sparse matrix fits) and a
-            slightly different operator: e.g. 3 sigma cuts at 1.1 % of the peak (1.1 % of the
-            mass), 2.5 sigma at 4.4 %, 2 sigma at 13.5 %. The kept entries are not rescaled.
+            for a >= pf_cutoff_sigma * sigma (small angles). Default 3: the Gaussian is cut at
+            exp(-4.5) = 1.1 % of its peak, and 1.1 % of its mass lies beyond (the kept entries are
+            not rescaled). None: the threshold 6 of versions before 2026-10-02, a cut at
+            sqrt(12) = 3.46 sigma (0.25 %). Fewer non-zeros for smaller values, about
+            (pf_cutoff_sigma / 3.46)^2 as many (3 sigma: 0.75): faster, and more of the sparse
+            matrix fits. Measured change of the forward projection and a FISTA result against None:
+            3 sigma 0.9 %, 2.5 sigma 4.2 %, 2 sigma 13 %.
         reserve_coefficient_arrays : int
             Coefficient-sized (K, Ny, Nx) arrays the default sparse-PF budget leaves room for
             on the GPU: 3 (default) for FISTA with the fused update (2 arrays and a margin),

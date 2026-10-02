@@ -304,15 +304,16 @@ def _random_start(x3, rng, pool, seed, parallel):
         pending.result()
 
 
-def estimate_L_power_streamed(op, niter=20, seed=0, eps=1e-30, verbose=1, parallel_start=False):
+def estimate_L_power_streamed(op, niter=20, seed=0, eps=1e-30, verbose=1, parallel_start=True):
     """estimate_L_power with the two coefficient-sized vectors in host memory, streamed batch by
     batch (for problems whose coefficient arrays do not fit on the GPU).
 
     The host work (the random start, dot products, scaling) runs on the operator's thread pool;
-    the result is the same as with one thread. With the default start, drawing the random numbers
-    is sequential (the same numbers as estimate_L_power: about 7 minutes for 1200 x 1200 pixels and
-    K = 20000); parallel_start=True draws them in parallel from independent streams, which gives a
-    slightly different estimate."""
+    the result is the same as with one thread. By default (parallel_start=True) the random start is
+    drawn in parallel, a column from its own stream (default_rng([seed, ix])): a few seconds.
+    parallel_start=False draws the same numbers as estimate_L_power (the GPU version), from one
+    stream, which cannot be parallelised: about 7 minutes for 1200 x 1200 pixels and K = 20000.
+    The two starts give slightly different estimates (and so slightly different FISTA steps)."""
     st = streamer_for(op)
     pool = st.pool
     rng = np.random.default_rng(seed)
