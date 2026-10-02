@@ -31,6 +31,10 @@ LABELS = {
                "at least 4 batches in the sparse modes",
 }
 
+# results of a version listed here count as results of the version it maps to: the same code for
+# what is measured (versions with an identical src/ tree are merged automatically)
+SAME_CODE = {"81d313a": "9be35fb"}  # 81d313a only adds iteration times to the FISTA stats
+
 SWEEPS = [  # sweep, varied parameter, label, unit
     ("K", "K", "orientations K", ""),
     ("N", "N", "grid N x N (N translations)", ""),
@@ -57,12 +61,42 @@ CASES = [
     ("large grid", 10000, 400, 0.4),
     ("larger grid", 10000, 600, 0.4),
     ("PF matrix too large to store", 100000, 120, 1.0),
+    ("large grid, wide basis", 10000, 400, 2.0),
+    ("large grid, wider basis", 10000, 400, 4.0),
+    ("larger grid, wide basis", 10000, 600, 2.0),
+    ("larger grid, wider basis", 10000, 600, 4.0),
+    ("1200 x 1200 grid (streamed only)", 20000, 1200, 0.4),
 ]
 FAILED = {"oom": "out of memory", "timeout": "> 5 min", "skipped": "skipped", "crashed": "crashed"}
 
 
+def canonical(rows):
+    """Map every version to the oldest one with the same code (identical src/ tree, or SAME_CODE)."""
+    import subprocess
+    repo = os.path.dirname(HERE)
+    info = {}
+    for r in rows:
+        info.setdefault(r["version"]["sha"], r["version"])
+    def tree(sha):
+        try:
+            return subprocess.run(["git", "-C", repo, "rev-parse", f"{sha}:src"], capture_output=True, text=True,
+                                  check=True).stdout.strip()
+        except Exception:
+            return sha
+    first = {}
+    for v in sorted(info.values(), key=lambda v: v["date"]):
+        sha = SAME_CODE.get(v["sha"], v["sha"])
+        key = tree(sha)
+        first.setdefault(key, info.get(sha, v))
+        info[v["sha"]] = first[key]
+    for r in rows:
+        r["measured_with"] = r["version"]["sha"]
+        r["version"] = info[r["version"]["sha"]]
+    return rows
+
+
 def load(files):
-    rows = [json.loads(l) for f in files for l in open(f) if l.strip()]
+    rows = canonical([json.loads(l) for f in files for l in open(f) if l.strip()])
     latest = {}
     for r in rows:
         c = r["case"]
@@ -334,6 +368,23 @@ def figures(rows, idx, versions):
 
 
 # ------------------------------------------------------------------------------------------ markdown
+def steady_table(rows):
+    """Steady-state seconds per iteration (without the first, which includes the setup), where recorded."""
+    have = [r for r in rows if r["status"] == "ok" and r.get("phases", {}).get("fista", {}).get("steady_per_iteration")]
+    if not have:
+        return []
+    out = ["The time per iteration above includes a one-time setup in the first of the two FISTA iterations "
+           "(streamed: allocating the pinned transfer buffers and copying the start into the second array), "
+           "which a long reconstruction does not see. Where recorded (from `81d313a`), the steady state:", "",
+           "| version | case | mode | first iteration (s) | steady iteration (s) |", "|---|---|---|---:|---:|"]
+    for r in sorted(have, key=lambda r: (r["version"]["date"], r["case"]["N"], r["case"]["K"], r["case"]["sigma_deg"], r["case"]["mode"])):
+        f, c = r["phases"]["fista"], r["case"]
+        out.append(f"| `{r['version']['sha']}` | K = {c['K']}, {c['N']} x {c['N']}, sigma = {c['sigma_deg']:g} | {c['mode']} | "
+                   f"{fmt_s(f['iterations'][0])} | {fmt_s(f['steady_per_iteration'])} |")
+    return out + [""]
+
+
+
 def summary(rows, idx, versions):
     """The newest version against the one before it, case by case."""
     if len(versions) < 2:
@@ -407,7 +458,7 @@ def markdown(rows, idx, versions, files):
             "generate its PF matrix in every call (K = 100000 at sigma = 1 deg: generated in the GPU mode, "
             "stored when streamed).", "",
             "So for large grids or many orientations, streaming is not a fallback but the only option; its "
-            "limit is host memory (the coefficients, twice).", ""]
+            "limit is host memory (the coefficients, twice).", ""] + steady_table(rows)
 
     for mode, title in [("gpu", "Arrays on the GPU"), ("stream", "Coefficients streamed from host memory")]:
         out += [f"## {title}", "", picture(f"sweeps_{mode}", f"Seconds per FISTA iteration along each sweep, {title.lower()}"), "",
@@ -424,7 +475,7 @@ def markdown(rows, idx, versions, files):
                     table(rows, idx, versions, mode, "K", "", val, fmt=lambda u: f"{u:.1f}"), ""]
 
     large = sorted({(r["case"]["K"], r["case"]["N"], r["case"]["sigma_deg"]) for r in rows
-                    if str(r["case"].get("sweep", "")).startswith("large")})
+                    if str(r["case"].get("sweep", "")).startswith(("large", "huge"))})
     if large:
         out += ["## Larger problems", "",
                 "Seconds per FISTA iteration (and how the PF matrix was applied: dense; sparse with both CSR "

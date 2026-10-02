@@ -78,6 +78,12 @@ With the arrays on the GPU, FISTA keeps about three coefficient arrays (4 K N^2 
 
 So for large grids or many orientations, streaming is not a fallback but the only option; its limit is host memory (the coefficients, twice).
 
+The time per iteration above includes a one-time setup in the first of the two FISTA iterations (streamed: allocating the pinned transfer buffers and copying the start into the second array), which a long reconstruction does not see. Where recorded (from `81d313a`), the steady state:
+
+| version | case | mode | first iteration (s) | steady iteration (s) |
+|---|---|---|---:|---:|
+| `9be35fb` | K = 20000, 1200 x 1200, sigma = 0.4 | stream | 119.4 | 81.8 |
+
 ## Arrays on the GPU
 
 <picture>
@@ -217,11 +223,11 @@ Seconds per FISTA iteration; the fastest version per column in bold; * the base 
 
 Seconds per FISTA iteration (and how the PF matrix was applied: dense; sparse with both CSR copies stored; only the adjoint copy stored; some or all batches generated in every call).
 
-| version | K = 10000, 600 x 600, sigma = 0.4, gpu | K = 10000, 600 x 600, sigma = 0.4, stream | K = 100000, 120 x 120, sigma = 1, gpu | K = 100000, 120 x 120, sigma = 1, stream |
-|---|---:|---:|---:|---:|
-| `9be35fb` | *array > largest GPU buffer* | 10.9 (sparse, both) | 6.94 (generated, adjoint, 69 of 98 batches) | 7.2 (sparse, adjoint) |
-| `2c38f65` | *array > largest GPU buffer* | 24.9 (sparse, both) | 7.32 (generated, adjoint, 69 of 98 batches) | 7.58 (sparse, adjoint) |
-| `fbc8934` | *array > largest GPU buffer* | 26.4 (sparse) | 47.3 (dense) | 48.7 (dense) |
+| version | K = 10000, 400 x 400, sigma = 2, gpu | K = 10000, 400 x 400, sigma = 2, stream | K = 10000, 400 x 400, sigma = 4, gpu | K = 10000, 400 x 400, sigma = 4, stream | K = 10000, 600 x 600, sigma = 0.4, gpu | K = 10000, 600 x 600, sigma = 0.4, stream | K = 10000, 600 x 600, sigma = 2, gpu | K = 10000, 600 x 600, sigma = 2, stream | K = 10000, 600 x 600, sigma = 4, gpu | K = 10000, 600 x 600, sigma = 4, stream | K = 20000, 1200 x 1200, sigma = 0.4, gpu | K = 20000, 1200 x 1200, sigma = 0.4, stream | K = 100000, 120 x 120, sigma = 1, gpu | K = 100000, 120 x 120, sigma = 1, stream |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `9be35fb` | 5.15 (sparse, adjoint) | 6.71 (sparse, both) | 11.0 (dense) | 12.5 (dense) | *array > largest GPU buffer* | 10.9 (sparse, both) | *array > largest GPU buffer* | 13.5 (sparse, both) | *skipped* | 20.9 (dense) |  | 102.1 (sparse, both) | 6.94 (generated, adjoint, 69 of 98 batches) | 7.2 (sparse, adjoint) |
+| `2c38f65` |  |  |  |  | *array > largest GPU buffer* | 24.9 (sparse, both) |  |  |  |  |  |  | 7.32 (generated, adjoint, 69 of 98 batches) | 7.58 (sparse, adjoint) |
+| `fbc8934` |  |  |  |  | *array > largest GPU buffer* | 26.4 (sparse) |  |  |  |  |  |  | 47.3 (dense) | 48.7 (dense) |
 
 ## All results
 
@@ -238,7 +244,11 @@ Seconds per FISTA iteration (and how the PF matrix was applied: dense; sparse wi
 | `9be35fb` | gpu | 10000 | 120 | 4 | ok | dense | 1.34 | 2.18 | 2.2 | 4.43 | 5.6 | 2.84 |
 | `9be35fb` | gpu | 10000 | 200 | 0.4 | ok | sparse, both | 1.55 | 0.57 | 0.452 | 1.07 | 8.57 | 6.24 |
 | `9be35fb` | gpu | 10000 | 400 | 0.4 | ok | sparse, both | 1.71 | 1.9 | 1.28 | 3.36 | 25.0 | 21.0 |
+| `9be35fb` | gpu | 10000 | 400 | 2 | ok | sparse, adjoint | 2.39 | 2.72 | 2.24 | 5.15 | 31.3 | 21.0 |
+| `9be35fb` | gpu | 10000 | 400 | 4 | ok | dense | 1.37 | 5.48 | 5.24 | 11.0 | 25.9 | 21.0 |
 | `9be35fb` | gpu | 10000 | 600 | 0.4 | oom | generated, none | 1.98 |  |  |  | 0.297 | 4.53 |
+| `9be35fb` | gpu | 10000 | 600 | 2 | oom | generated, none | 1.74 |  |  |  | 0.297 | 4.48 |
+| `9be35fb` | gpu | 10000 | 600 | 4 | skipped |  |  |  |  |  |  |  |
 | `9be35fb` | gpu | 30000 | 120 | 0.4 | ok | sparse, both | 2.59 | 0.744 | 0.581 | 1.36 | 9.01 | 6.15 |
 | `9be35fb` | gpu | 100000 | 120 | 0.4 | ok | sparse, both | 5.68 | 2.35 | 1.9 | 4.44 | 25.1 | 17.8 |
 | `9be35fb` | gpu | 100000 | 120 | 1 | ok | generated, adjoint, 69 of 98 batches | 6.52 | 3.81 | 2.94 | 6.94 | 31.6 | 17.8 |
@@ -251,7 +261,12 @@ Seconds per FISTA iteration (and how the PF matrix was applied: dense; sparse wi
 | `9be35fb` | stream | 10000 | 120 | 4 | ok | dense | 1.36 | 2.58 | 2.4 | 4.64 | 4.38 | 2.69 |
 | `9be35fb` | stream | 10000 | 200 | 0.4 | ok | sparse, both | 1.55 | 2.15 | 1.44 | 1.94 | 6.11 | 6.24 |
 | `9be35fb` | stream | 10000 | 400 | 0.4 | ok | sparse, both | 1.82 | 3.83 | 2.8 | 5.31 | 10.7 | 17.5 |
+| `9be35fb` | stream | 10000 | 400 | 2 | ok | sparse, both | 2.45 | 4.07 | 3.32 | 6.71 | 22.0 | 16.8 |
+| `9be35fb` | stream | 10000 | 400 | 4 | ok | dense | 1.65 | 7.09 | 6.32 | 12.5 | 10.4 | 16.8 |
 | `9be35fb` | stream | 10000 | 600 | 0.4 | ok | sparse, both | 2.01 | 8.09 | 5.14 | 10.9 | 15.2 | 34.7 |
+| `9be35fb` | stream | 10000 | 600 | 2 | ok | sparse, both | 2.49 | 8.23 | 6.16 | 13.5 | 27.9 | 34.7 |
+| `9be35fb` | stream | 10000 | 600 | 4 | ok | dense | 1.63 | 12.1 | 10.1 | 20.9 | 16.2 | 34.8 |
+| `9be35fb` | stream | 20000 | 1200 | 0.4 | ok | sparse, both | 2.83 | 62.0 | 28.3 | 102.1 | 41.1 | 236.2 |
 | `9be35fb` | stream | 30000 | 120 | 0.4 | ok | sparse, both | 3.13 | 1.38 | 0.992 | 1.97 | 4.92 | 5.28 |
 | `9be35fb` | stream | 100000 | 120 | 0.4 | ok | sparse, both | 5.78 | 2.92 | 2.3 | 5.72 | 9.69 | 13.1 |
 | `9be35fb` | stream | 100000 | 120 | 1 | ok | sparse, adjoint | 7.2 | 3.92 | 2.79 | 7.2 | 20.4 | 13.1 |
@@ -387,4 +402,4 @@ Seconds per FISTA iteration (and how the PF matrix was applied: dense; sparse wi
 
 </details>
 
-Results files: `2026-10-02_1026_A40_n-62-18-4.jsonl`, `2026-10-02_1251_A40_n-62-18-4.jsonl`, `2026-10-02_1310_A40_n-62-18-4.jsonl`, `2026-10-02_1344_A40_n-62-18-4.jsonl`
+Results files: `2026-10-02_1026_A40_n-62-18-4.jsonl`, `2026-10-02_1251_A40_n-62-18-4.jsonl`, `2026-10-02_1310_A40_n-62-18-4.jsonl`, `2026-10-02_1344_A40_n-62-18-4.jsonl`, `2026-10-02_1420_A40_n-62-18-4.jsonl`, `2026-10-02_1503_A40_n-62-18-4.jsonl`
