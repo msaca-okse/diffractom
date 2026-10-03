@@ -76,6 +76,36 @@ __kernel void huber_clip_inplace(
 }
 """
 
+RESIDUAL_SUMSQ_KERNEL = r"""
+// The data-space steps of an iteration in one pass: r = Ax - b (or w * (Ax - b) with one weight per
+// segment), the work-group's partial sum of r^2 (the diagnostic objective), and (clip) r clipped to
+// [-delta, delta], written in place. r and its clipping as residual_inplace / weighted_residual_inplace
+// and huber_clip_inplace.
+__kernel void residual_sumsq(
+    __global float *Ax, __global const float *b, __global const float *w, const ulong nseg, const int weighted,
+    const int clip, const float delta, const ulong n, __global float *partial, __local float *scratch)
+{
+    float s = 0.0f;
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        float v = weighted ? w[i % nseg] * (Ax[i] - b[i]) : Ax[i] - b[i];
+        s += v * v;
+        if (clip) {
+            if (v >  delta) v =  delta;
+            if (v < -delta) v = -delta;
+        }
+        Ax[i] = v;
+    }
+    const int lid = get_local_id(0);
+    scratch[lid] = s;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int h = get_local_size(0) / 2; h > 0; h >>= 1) {
+        if (lid < h) scratch[lid] += scratch[lid + h];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) partial[get_group_id(0)] = scratch[0];
+}
+"""
+
 HUBER_DIAG_KERNEL = r"""
 __kernel void huber_loss(
     __global const float *r,
@@ -98,9 +128,9 @@ import pyopencl as cl
 import pyopencl.array as clarray
 import pyopencl.clmath as clmath
 from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels, apply_support, support_mask_to_gpu
-from .launch import elementwise, pixel_orientation
+from .launch import elementwise, pixel_orientation, reduction
 from .fused_update import FusedUpdate, fused_available
-from .streaming import streamer_for
+from .streaming import fits_next_forward, streamer_for
 from ..utils.arrays import prepare_inputs
 
 from .prox_tv import (
@@ -114,7 +144,7 @@ from .prox_tv import (
 
 def build_fista_program(ctx: cl.Context) -> cl.Program:
     """Compile FISTA + Huber helper OpenCL kernels."""
-    return cl.Program(ctx, FISTA_KERNELS + HUBER_KERNELS + HUBER_DIAG_KERNEL).build()
+    return cl.Program(ctx, FISTA_KERNELS + HUBER_KERNELS + RESIDUAL_SUMSQ_KERNEL + HUBER_DIAG_KERNEL).build()
 
 
 # -------------------- FISTA implementation --------------------
@@ -129,7 +159,7 @@ class FISTAHuber:
     """
 
     def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50, huber_delta=1e-2,
-                 support="fov", fused=True, stream_threads=None):
+                 support="fov", fused=True, stream_threads=None, fuse_next_forward=True):
         """Set up FISTA-Huber solver.
 
         Parameters
@@ -158,12 +188,20 @@ class FISTAHuber:
             coefficient-sized arrays (x, y) instead of four (x, y, x_old, grad). Used when the
             prox is element-wise ('nonneg', 'l1', 'nonneg_l1') and the operator provides
             adjoint_batches_cl; otherwise, or with fused=False, the unfused update runs.
+        fuse_next_forward : bool
+            With the fused update: project each batch's new y forward right after its update in the
+            adjoint pass, into a second data-sized buffer, instead of a separate forward pass in the
+            next iteration (the same results; streamed, y is uploaded once less per iteration).
+            Measured on a V100 (K = 6000, 120 x 120, streamed): 0.36 s per iteration instead of 0.55,
+            and on the GPU 0.46 s before. Used only if the buffer fits (an estimate of the GPU memory
+            in use, with a margin).
         stream_threads : int, optional
             CPU threads for the host-side copies when the coefficients are streamed (x0 given
             as a NumPy array to run()); default min(8, number of CPUs).
         """
         self.op = operator
         self.stream_threads = stream_threads
+        self.fuse_next_forward = bool(fuse_next_forward)
         self.ctx = operator.ctx
         self.queue = operator.queue
         self.huber_delta = float(huber_delta)
@@ -175,6 +213,7 @@ class FISTAHuber:
         self.k_grad_step      = cl.Kernel(self.fista_prg, "grad_step")
         self.k_extrapolate    = cl.Kernel(self.fista_prg, "extrapolate")
         self.k_huber_clip_inplace = cl.Kernel(self.fista_prg, "huber_clip_inplace")
+        self.k_residual_sumsq = cl.Kernel(self.fista_prg, "residual_sumsq")
         self.k_huber_loss = cl.Kernel(self.fista_prg, "huber_loss")
 
         self.prox_kernels = ProxKernels(self.ctx)
@@ -335,8 +374,19 @@ class FISTAHuber:
             if x_old is not None:
                 self.k_copy_buf(q, gws_x, None, x.data, x_old.data, n_x)
         gws_Ax, n_Ax = elementwise(out_gpu.size)
+        red_g, red_l, red_n, n_partial = reduction(out_gpu.size)
+        partial = clarray.empty(q, (n_partial,), np.float32)
 
-        Ax = None  # the prediction A(y), overwritten in place by the (weighted, clipped) residual
+        Ax = None
+        # streamed: the next iteration's forward pass inside the adjoint pass, into a second prediction
+        # buffer, if it fits (saves uploading y once per iteration; the same result)
+        Ax_next = None
+        if self.fused and self.fuse_next_forward and niter > 1:
+            solver_bytes = 2 * out_gpu.nbytes + g_batch.nbytes + (weights.nbytes if weights is not None else 0)
+            if not streamed:
+                solver_bytes += x.nbytes + y.nbytes  # (x0 is on the GPU)
+            if fits_next_forward(self.op, streamer, solver_bytes):
+                Ax_next = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")  # the prediction A(y), overwritten in place by the (weighted, clipped) residual
         t = 1.0
 
         # ---- diagnostics storage (always collected) ----
@@ -349,31 +399,25 @@ class FISTAHuber:
                 Ax = clarray.empty(q, out_gpu.shape, dtype=np.float32, order="C")
 
             if streamed:
-                streamer.forward(y_host if it > 0 else x_host, Ax)
+                if Ax_next is not None and it > 0:  # A(y) of this iteration, projected in the last adjoint pass
+                    Ax, Ax_next = Ax_next, Ax
+                else:
+                    streamer.forward(y_host if it > 0 else x_host, Ax)
+            elif Ax_next is not None and it > 0:  # A(y), projected in the last adjoint pass
+                Ax, Ax_next = Ax_next, Ax
             else:
                 self.op.direct_cl(y, Ax)
 
-            # ---- r = w * (Ax - b), in place in Ax ----
+            # ---- r = w * (Ax - b), its squared norm (f, a diagnostic), then r <- clip(r, -delta, +delta):
+            #      one pass over the data, in place in Ax
+            # NOTE: with weights, the gradient is A*( clip( w*(Ax-b) ) )
             r = Ax
-            if use_weights:
-                self.k_weighted_residual_inplace(q, gws_Ax, None, Ax.data, out_gpu.data, weights.data,
-                                                 np.uint64(out_gpu.shape[-1]), n_Ax)
-            else:
-                self.k_residual_inplace(q, gws_Ax, None, Ax.data, out_gpu.data, n_Ax)
-
-            # ---- L2 data term (diagnostic only) ----
-            # f = 0.5 * || (w*(Ax-b)) ||^2   if weights is provided
-            # f = 0.5 * || (Ax-b) ||^2       otherwise
-            r2 = float(clarray.vdot(r, r).get())  # on the GPU (copying r to the host dominated the iteration time)
-            fval = 0.5 * float(r2)
-
-            # ---- huber: r <- clip(r, -delta, +delta) ----
-            self.k_huber_clip_inplace(
-                q, gws_Ax, None,
-                r.data,
-                np.float32(self.huber_delta),
-                n_Ax
-            )
+            self.k_residual_sumsq(q, red_g, red_l, Ax.data, out_gpu.data,
+                                  (weights if use_weights else out_gpu).data, np.uint64(out_gpu.shape[-1]),
+                                  np.int32(use_weights), np.int32(1), np.float32(self.huber_delta), red_n,
+                                  partial.data, cl.LocalMemory(4 * red_l[0]))
+            r2 = float(partial.get().astype(np.float64).sum())
+            fval = 0.5 * r2
 
             # ---- momentum coefficient ----
             t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
@@ -384,13 +428,15 @@ class FISTAHuber:
                 # ---- as below, with x and y streamed from and to host memory ----
                 gsq, xsq, xabs = streamer.adjoint_update(x_host, y_host, r, g_batch, self.tau, beta,
                                                          self.prox_kind, self.lam, self.support_gpu,
-                                                         y_src=None if it > 0 else x_host)
+                                                         y_src=None if it > 0 else x_host,
+                                                         forward_into=Ax_next if it + 1 < niter else None)
                 gnorm = float(np.sqrt(gsq))
             elif self.fused:
                 # ---- grad = A*(r) batch by batch, each batch consumed by
                 #      x <- prox(y - tau*grad), y <- x + beta*(x - x_old) ----
                 gnorm = float(np.sqrt(self.fused_update.step(
-                    self.op, r, x, y, g_batch, self.tau, beta, self.prox_kind, self.lam, self.support_gpu)))
+                    self.op, r, x, y, g_batch, self.tau, beta, self.prox_kind, self.lam, self.support_gpu,
+                    forward_into=Ax_next if it + 1 < niter else None)))
             else:
                 # ---- grad = A*(r) ----
                 self.op.adjoint_cl(r, grad)  # (K, Ny, Nx)
@@ -492,6 +538,7 @@ class FISTAHuber:
 
         # ---- final summary stats ----
         self.final_stats = {
+            "next_forward_fused": Ax_next is not None,
             "niter": niter,
             "final_f": self.iter_stats[-1]["f"],
             "final_g": self.iter_stats[-1]["g"],
@@ -514,6 +561,9 @@ class FISTAHuber:
 
         if Ax is not None:
             Ax.base_data.release()
+        for arr in (Ax_next, partial):
+            if arr is not None and arr.base_data is not None:
+                arr.base_data.release()
         for arr in uploaded:  # data and weights uploaded from NumPy arrays
             arr.base_data.release()
 

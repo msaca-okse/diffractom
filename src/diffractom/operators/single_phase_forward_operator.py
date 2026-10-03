@@ -541,6 +541,23 @@ class SinglePhaseForwardOperator:
 
 
 
+    def device_bytes(self):
+        """An estimate of the GPU memory held by the operator: batch buffers, the stored sparse PF
+        matrix, the generator's and the FFT projector's scratch buffers, the geometry."""
+        n = 0
+        for name in ("coeffs_sino_C", "_img_k", "coeffs_sino_F", "_coeffs_batch_F", "_basis_batch_kmax",
+                     "coords_gpu", "poles_gpu"):
+            a = getattr(self, name, None)
+            if a is not None:
+                n += a.nbytes
+        for sb in (self.sparse_batches or []):
+            n += sum(a.nbytes for a in (sb or {}).values())
+        if self.pf_gen is not None:
+            n += self.pf_gen.nbytes()
+        if self.fradon is not None:
+            n += self.fradon.nbytes()
+        return n
+
     def release_streamer(self):
         """Release the buffers of streaming NumPy coefficients through the GPU (pinned host
         buffers, 4 image batches on the GPU), kept between calls; the next streamed call makes

@@ -27,6 +27,10 @@ LABELS = {
     "fbc8934": "NumPy API, (K, Ny, Nx) layout",
     "2c38f65": "sparse PF matrix generated directly, faster sparse products, store what fits, "
                "Radon in slices, larger batches",
+    "868c372": "FISTA (GPU arrays and streamed): next forward pass inside the adjoint pass; fused residual/norm/clip; "
+               "PF forward skips empty rows (iterates unchanged)",
+    "43e744c": "streamed FISTA: next forward pass inside the adjoint pass; fused residual/norm/clip; PF forward "
+               "skips empty rows (iterates unchanged)",
     "2c5f3f3": "Fourier-slice projector (projector=\"fft\"), the default above 400 x 400 pixels (results differ by ~1 %)",
     "8540fc1": "defaults: PF Gaussians cut at 3 sigma (was 3.46; results change by ~1 %), parallel random start of "
                "the streamed power iteration",
@@ -38,7 +42,7 @@ LABELS = {
 
 # results of a version listed here count as results of the version it maps to: the same code for
 # what is measured (versions with an identical src/ tree are merged automatically)
-SAME_CODE = {"81d313a": "9be35fb"}  # 81d313a only adds iteration times to the FISTA stats
+SAME_CODE = {"81d313a": "9be35fb", "3e32127": "868c372"}  # 81d313a only adds iteration times to the FISTA stats
 
 SWEEPS = [  # sweep, varied parameter, label, unit
     ("K", "K", "orientations K", ""),

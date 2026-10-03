@@ -20,6 +20,17 @@ def elementwise(n):
     return (max(min(n, MAX_WORK_ITEMS), 1),), np.uint64(n)
 
 
+REDUCE_LOCAL = 256
+
+
+def reduction(n):
+    """Global and local size, element count and number of partial sums of a grid-stride kernel that
+    also reduces (local size REDUCE_LOCAL, one partial sum per work-group)."""
+    n = int(n)
+    g = max(min(-(-n // REDUCE_LOCAL) * REDUCE_LOCAL, MAX_WORK_ITEMS), REDUCE_LOCAL)
+    return (g,), (REDUCE_LOCAL,), np.uint64(n), g // REDUCE_LOCAL
+
+
 def pixel_orientation(npix, K):
     """Global size of a kernel over a (K, Ny, Nx) C-order array: pixels on axis 0,
     orientations strided over axis 1."""

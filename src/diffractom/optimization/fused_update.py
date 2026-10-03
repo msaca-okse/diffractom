@@ -136,10 +136,14 @@ class FusedUpdate:
         """The gradient buffer of one orientation batch."""
         return clarray.empty(self.queue, (operator.Nx * operator.Ny * operator.K_batch_max,), np.float32)
 
-    def step(self, operator, r, x, y, g_batch, tau, beta, prox_kind, lam, support_gpu):
+    def step(self, operator, r, x, y, g_batch, tau, beta, prox_kind, lam, support_gpu, forward_into=None):
         """
         grad = A^T r, batch by batch, and with it x <- prox(y - tau * grad) (support applied),
         y <- x_new + beta * (x_new - x_old), in place. Returns ||grad||^2.
+
+        forward_into (a data-sized array): also forward_into = A(y) of the new y, each batch projected
+        right after its update (the next iteration's forward pass; the same sum over the batches, in
+        the same order, as operator.direct_cl).
         """
         q = self.queue
         npix = operator.Nx * operator.Ny
@@ -150,6 +154,9 @@ class FusedUpdate:
         if getattr(self, "_gsq", None) is None or self._gsq.capacity < len(operator.batches):
             self._gsq = PartialSums(self, len(operator.batches))
         sq = self._gsq.reset()
+        batch_of = {b["k_start"]: ib for ib, b in enumerate(operator.batches)}
+        if forward_into is not None:
+            forward_into.fill(0.0)
 
         def update(k0, Kb):
             n = npix * Kb
@@ -158,6 +165,8 @@ class FusedUpdate:
             self.k_update(q, gws, None, g_batch.data, x.data, y.data, mask.data, use_mask,
                           np.uint64(npix * k0), np.uint64(npix), n64,
                           np.float32(tau), np.float32(beta), lt, code)
+            if forward_into is not None:
+                operator._direct_batch(y, k0, operator.K, batch_of[k0], forward_into)
 
         operator.adjoint_batches_cl(r, g_batch, update)
         return sq.total()
