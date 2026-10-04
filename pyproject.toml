@@ -26,6 +26,8 @@ dependencies = [
 [project.optional-dependencies]
 # the Fourier-slice projector (projector="fft", the default for grids of more than 400 x 400 pixels)
 fft = ["pyvkfft"]
+# the cubochoric orientation grid of odf_basis.uniform_fundamental_zone (method="random" needs nothing)
+odf = ["orix"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

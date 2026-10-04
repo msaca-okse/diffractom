@@ -276,6 +276,21 @@ class Grid:
 
         return tree
 
+    @staticmethod
+    def _point_group(symmetry: str):
+        point_group_map = {
+            "triclinic": point_groups.trivial,
+            "monoclinic": point_groups.cyclic_2,
+            "orthorhombic": point_groups.orthorhombic,
+            "tetragonal": point_groups.tetragonal,
+            "trigonal": point_groups.trigonal,
+            "hexagonal": point_groups.hexagonal,
+            "cubic": point_groups.cubic,
+        }
+        if symmetry not in point_group_map:
+            raise ValueError(f"Unknown symmetry '{symmetry}'. Must be one of {list(point_group_map)}")
+        return point_group_map[symmetry]
+
     @classmethod
     def from_random_fundamental_zone(
         cls,
@@ -485,6 +500,7 @@ class Grid:
         self,
         theta_deg: float,
         target: Optional[int] = None,
+        symmetry: Optional[str] = None,
     ):
         """
         Remove nodes whose orientations are too close to an already-kept
@@ -502,6 +518,12 @@ class Grid:
             orientations.  Pairs closer than this are pruned.
         target : int, optional
             If given, stop once this many nodes have been kept.
+        symmetry : str, optional
+            Crystal system ("cubic", ...): distances are misorientations under
+            this symmetry (the crystal symmetry acts from the right, R and R S
+            are the same orientation), so symmetric equivalents across the
+            fundamental-zone boundary are pruned too. Default None: plain
+            rotation distances (as before).
 
         Returns
         -------
@@ -517,8 +539,13 @@ class Grid:
         q /= np.linalg.norm(q, axis=1, keepdims=True)
 
         # Antipodal equivalence: q and -q represent the same rotation,
-        # so we include both copies and query against a single copy.
-        q_full = np.vstack([q, -q])                   # (2N, 4)
+        # so we include both copies and query against a single copy;
+        # with a symmetry, every equivalent R * s too. Row j belongs to node j % N.
+        if symmetry is not None:
+            q_full = np.concatenate([(R_all * g).as_quat() for g in self._point_group(symmetry)])
+        else:
+            q_full = q
+        q_full = np.vstack([q_full, -q_full])
 
         # Quaternion Euclidean distance for misorientation angle θ:
         #   d = 2 sin(θ / 4)
@@ -527,7 +554,10 @@ class Grid:
         kd = KDTree(q_full)
 
         N = len(q)
-        used = np.zeros(2 * N, dtype=bool)
+        # symmetry None: as before, neighbours mark their row of q_full (an antipodal
+        # copy marks row j + N, which is never visited, so q ~ -q duplicates survive);
+        # with a symmetry every equivalent marks its node (row j -> node j % N)
+        used = np.zeros(N if symmetry is not None else 2 * N, dtype=bool)
         keep_mask = np.zeros(N, dtype=bool)
 
         kept_count = 0
@@ -539,8 +569,8 @@ class Grid:
             kept_count += 1
 
             # Mark all neighbours (including antipodal copies) as used
-            nbrs = kd.query_ball_point(q[i], r=radius)
-            used[nbrs] = True
+            nbrs = np.asarray(kd.query_ball_point(q[i], r=radius), dtype=np.int64)
+            used[nbrs % N if symmetry is not None else nbrs] = True
 
             if target is not None and kept_count >= target:
                 break
