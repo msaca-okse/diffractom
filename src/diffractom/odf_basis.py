@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
+import pyopencl.array as clarray
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
@@ -132,15 +133,16 @@ def bulk_data(data):
     return np.ascontiguousarray(np.asarray(data, dtype=np.float32).sum(axis=1, keepdims=True))
 
 
-def bulk_operator(cfg, material, orientations, sigma_deg, max_gb=4.0, **kwargs):
+def bulk_operator(cfg, material, orientations, sigma_deg, max_gb=4.0, sparse_batch_max=65536, **kwargs):
     """The texture operator on one pixel and one translation (bulk data = PF @ w) for the given
     orientations (rotation matrices (K, 3, 3) or quaternions (K, 4)); kwargs go to
-    SinglePhaseForwardOperator (normalized=..., ctx=..., queue=...)."""
+    SinglePhaseForwardOperator (normalized=..., ctx=..., queue=...). With one pixel a batch of
+    orientations is tiny, so the sparse batches are made much larger than for TT (sparse_batch_max)."""
     o = np.asarray(orientations)
     mats = Rotation.from_quat(o).as_matrix() if o.shape[-1] == 4 else o
     grid = Grid.from_rotation_matrices(mats, np.deg2rad(sigma_deg))
     return SinglePhaseForwardOperator(cfg={**cfg, "Nx": 1, "Ny": 1, "My": 1}, material=material, grid=grid,
-                                      max_gb=max_gb, **kwargs)
+                                      max_gb=max_gb, sparse_batch_max=sparse_batch_max, **kwargs)
 
 
 @dataclass
@@ -177,7 +179,7 @@ def _children(q, spacing_deg, n_sub, sym):
     return to_fundamental_zone(kids, sym)
 
 
-def reconstruct_odf(cfg, material, data, weights=None, spacing_deg=2.0, levels=4, sigma_factor=0.6,
+def reconstruct_odf(cfg, material, data, weights=None, spacing_deg=4.0, levels=5, sigma_factor=0.6,
                     niter=200, niter_first=50, keep_rel=1e-3, n_sub=4, grid_method="cubochoric",
                     huber_delta=1e30, max_gb=4.0, normalized=True, ctx=None, queue=None, verbose=1):
     """
@@ -208,8 +210,11 @@ def reconstruct_odf(cfg, material, data, weights=None, spacing_deg=2.0, levels=4
         ctx, queue = op.ctx, op.queue
         L = 1.1 * estimate_L_power_streamed(op, niter=6, seed=0, verbose=0)
         solver = FISTAHuber(op, prox_kind="nonneg", L=L, huber_delta=huber_delta)
-        x = solver.run(np.zeros(op.coeff_shape, np.float32), b, niter=niter_first if lev == 0 else niter,
-                       weights=weights)
+        # the coefficients (K floats) and the bulk data are small: both stay on the GPU
+        x = clarray.zeros(queue, op.coeff_shape, np.float32)
+        solver.run(x, clarray.to_device(queue, b), niter=niter_first if lev == 0 else niter,
+                   weights=None if wseg is None else clarray.to_device(queue, wseg))
+        x = x.get()
         r = op.direct(x)[:, 0] - b[:, 0]
         if wseg is not None:
             r *= wseg

@@ -51,6 +51,7 @@ class SinglePhaseForwardOperator:
         fft_max_gb: float = 1.5,
         reserve_coefficient_arrays: int = 3,
         pf_cutoff_sigma: float | None = 3.0,
+        sparse_batch_max: int = SPARSE_BATCH_MAX,
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -104,6 +105,11 @@ class SinglePhaseForwardOperator:
             Largest fill fraction for which ``pf_mode="auto"`` chooses sparse when only part of it
             fits (the adjoint copy, the rest generated in every call): generating or transposing
             at high fill costs more than the dense path. Default 10 %.
+        sparse_batch_max : int
+            Largest number of orientations per batch in the sparse modes (sparse_batch_size).
+            Default SPARSE_BATCH_MAX (1024): for grids of ~100 x 100 pixels and more nothing
+            improves beyond it. With very few pixels (the bulk operator of odf_basis, 1 x 1) a
+            batch is tiny and per-batch overheads dominate: there larger batches pay.
         sparse_max_gb : float, optional
             GPU memory budget (GB) for the sparse matrix, estimated from the first
             batch. Default (``default_sparse_budget_gb``): half of the memory left
@@ -148,6 +154,7 @@ class SinglePhaseForwardOperator:
 
         self.reserve_coefficient_arrays = int(reserve_coefficient_arrays)
         self.pf_cutoff_sigma = pf_cutoff_sigma
+        self.sparse_batch_max = int(sparse_batch_max)
         # compile option of the PF kernels (none by default: their built-in threshold 6.0f)
         self.pf_cut_options = [] if pf_cutoff_sigma is None else [f"-DPF_CUT={float(pf_cutoff_sigma) ** 2 / 2!r}f"]
 
@@ -940,7 +947,7 @@ class SinglePhaseForwardOperator:
     def sparse_batch_size(self, fill):
         """
         Orientations per batch for the sparse modes: as many as the batch buffers fit in max_gb,
-        at most SPARSE_BATCH_MAX, and few enough for SPARSE_MIN_BATCHES batches (a streamed solver
+        at most sparse_batch_max (SPARSE_BATCH_MAX by default), and few enough for SPARSE_MIN_BATCHES batches (a streamed solver
         overlaps the transfers of one batch with the computation of another; with a single batch
         it cannot: K = 1000 streamed took 0.37 s per FISTA iteration with one batch, 0.28 s with 4). Per orientation: the sinogram (N_Omega, My) and image (Ny, Nx)
         batch buffers, room for 5 more image-sized buffers of a solver (staging, gradient batch),
@@ -956,7 +963,7 @@ class SinglePhaseForwardOperator:
         nnz_per_k = 1.1 * fill * R * CP
         bytes_per_k = 4 * (R * self.My + 6 * npix) + 8 * R + (CAND_BYTES + NNZ_BYTES) * nnz_per_k
         kb = int(self.pf_batch_max_gb * 1024**3 // bytes_per_k)
-        limit = min(SPARSE_BATCH_MAX, (2**31 - 1) // max(R * self.My, npix, int(nnz_per_k) + 1, R))
+        limit = min(self.sparse_batch_max, (2**31 - 1) // max(R * self.My, npix, int(nnz_per_k) + 1, R))
         return max(self.K_batch_max, min(kb, limit, -(-self.K // SPARSE_MIN_BATCHES)))
 
 
