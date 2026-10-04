@@ -1,7 +1,7 @@
 """diffractom — GPU-accelerated texture tomography reconstruction for diffraction data."""
 
 from .crystallography.material import Material
-from .utils.grid import Grid
+from .utils.grid import Grid, MatrixGrid
 from .utils.support import fov_support_mask
 from .operators.single_phase_forward_operator import SinglePhaseForwardOperator
 from .operators.multi_phase_forward_operator import MultiPhaseForwardOperator
@@ -26,6 +26,7 @@ from .utils.reinterpolation.reinterpolationS2 import (
 __all__ = [
     "Material",
     "Grid",
+    "MatrixGrid",
     "fov_support_mask",
     "SinglePhaseForwardOperator",
     "MultiPhaseForwardOperator",

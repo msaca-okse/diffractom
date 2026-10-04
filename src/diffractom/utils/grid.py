@@ -605,3 +605,41 @@ class Grid:
 
         return len(self.nodes)
 
+
+
+class MatrixGrid:
+    """
+    A single-level grid held as arrays: K rotation matrices and their kernel widths, without one
+    Python node per orientation (Grid builds a GridNode with a scipy Rotation for each, which costs
+    seconds and GBs at millions of orientations). Provides what the forward operators and the
+    notebooks use: leaf_arrays(), nodes_at_level(0), rotations_at_level(0), active_leaf_nodes().
+    """
+
+    def __init__(self, R_mats: np.ndarray, sigma):
+        R_mats = np.asarray(R_mats, dtype=np.float64)
+        if R_mats.ndim != 3 or R_mats.shape[1:] != (3, 3):
+            raise ValueError("R_mats must have shape (N, 3, 3)")
+        self.matrices = R_mats
+        self.sigmas = np.broadcast_to(np.asarray(sigma, dtype=np.float64), (len(R_mats),)).copy()
+        self.sigma_levels = [float(self.sigmas[0])] if len(R_mats) else []
+        self.levels = {0: None}
+
+    def __len__(self):
+        return len(self.matrices)
+
+    def leaf_arrays(self):
+        """(K, 3, 3) rotation matrices and (K,) sigmas of the active leaves (all of them)."""
+        return self.matrices, self.sigmas
+
+    def active_leaf_nodes(self):
+        return range(len(self.matrices))
+
+    def nodes_at_level(self, level):
+        if level != 0:
+            raise ValueError("MatrixGrid has a single level (0)")
+        return range(len(self.matrices))
+
+    def rotations_at_level(self, level, active_only=True):
+        if level != 0:
+            raise ValueError("MatrixGrid has a single level (0)")
+        return [Rotation.from_matrix(self.matrices)]

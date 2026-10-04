@@ -26,7 +26,7 @@ from .crystallography import point_groups
 from .operators.single_phase_forward_operator import SinglePhaseForwardOperator
 from .optimization.fista_huber import FISTAHuber
 from .optimization.streaming import estimate_L_power_streamed
-from .utils.grid import Grid
+from .utils.grid import MatrixGrid
 
 POINT_GROUPS = {
     "triclinic": point_groups.trivial,
@@ -70,11 +70,13 @@ def equivalents(q, sym: Rotation):
     return np.concatenate([out, -out])
 
 
-def to_fundamental_zone(q, sym: Rotation):
+def to_fundamental_zone(q, sym: Rotation, chunk=500_000):
     """The equivalent of each orientation with the smallest rotation angle (largest |w|), w >= 0."""
-    R = Rotation.from_quat(q)
-    eq = np.stack([(R * s).as_quat() for s in sym], axis=1)  # (N, G, 4)
-    out = eq[np.arange(len(q)), np.argmax(np.abs(eq[..., 3]), axis=1)]
+    out = np.empty((len(q), 4))
+    for a in range(0, len(q), chunk):
+        R = Rotation.from_quat(q[a:a + chunk])
+        eq = np.stack([(R * s).as_quat() for s in sym], axis=1)  # (n, G, 4)
+        out[a:a + chunk] = eq[np.arange(len(eq)), np.argmax(np.abs(eq[..., 3]), axis=1)]
     return out * np.where(out[:, 3:4] < 0, -1.0, 1.0)
 
 
@@ -93,6 +95,17 @@ def thin(q, min_distance_deg, sym: Rotation, order=None):
         keep.append(i)
         used[np.asarray(tree.query_ball_point(q[i], r), dtype=np.int64) % N] = True
     return np.asarray(keep, dtype=np.int64)
+
+
+def thin_cells(q, cell_deg, order=None):
+    """Approximate thinning for large sets (memory linear in N): bin the rotation vectors (q in the
+    fundamental zone) into cubic cells of size cell_deg and keep the first orientation of every cell
+    in `order`. Kept orientations average one per cell; neighbours across a cell face can be close,
+    and equivalents across the zone boundary are not merged (both harmless for a basis)."""
+    order = np.arange(len(q)) if order is None else np.asarray(order)
+    keys = np.floor(Rotation.from_quat(q[order]).as_rotvec() / np.deg2rad(cell_deg)).astype(np.int64)
+    _, first = np.unique(keys, axis=0, return_index=True)
+    return order[np.sort(first)]
 
 
 def nearest_misorientation_deg(q_query, q_set, sym: Rotation):
@@ -140,8 +153,10 @@ def bulk_operator(cfg, material, orientations, sigma_deg, max_gb=4.0, sparse_bat
     orientations is tiny, so the sparse batches are made much larger than for TT (sparse_batch_max)."""
     o = np.asarray(orientations)
     mats = Rotation.from_quat(o).as_matrix() if o.shape[-1] == 4 else o
-    grid = Grid.from_rotation_matrices(mats, np.deg2rad(sigma_deg))
-    return SinglePhaseForwardOperator(cfg={**cfg, "Nx": 1, "Ny": 1, "My": 1}, material=material, grid=grid,
+    grid = MatrixGrid(mats, np.deg2rad(sigma_deg))
+    # one pixel on one detector bin: no centre-of-rotation offset (the sum over translations removes it)
+    return SinglePhaseForwardOperator(cfg={**cfg, "Nx": 1, "Ny": 1, "My": 1, "cor_offset": 0}, material=material,
+                                      grid=grid,
                                       max_gb=max_gb, sparse_batch_max=sparse_batch_max, **kwargs)
 
 
@@ -181,7 +196,8 @@ def _children(q, spacing_deg, n_sub, sym):
 
 def reconstruct_odf(cfg, material, data, weights=None, spacing_deg=4.0, levels=5, sigma_factor=0.6,
                     niter=200, niter_first=50, keep_rel=1e-3, n_sub=4, grid_method="cubochoric",
-                    huber_delta=1e30, max_gb=4.0, normalized=True, ctx=None, queue=None, verbose=1):
+                    huber_delta=1e30, max_gb=4.0, normalized=True, ctx=None, queue=None, verbose=1,
+                    niter_between=None, keep_mass=None, exact_thinning_max=1_000_000, callback=None):
     """
     Coarse-to-fine ODF from the data summed over translations.
 
@@ -190,7 +206,12 @@ def reconstruct_odf(cfg, material, data, weights=None, spacing_deg=4.0, levels=5
     (children of the strongest parents first, thinned to 0.7 x the new spacing). Each level is a
     nonnegative FISTA fit (least squares with the default huber_delta) of the bulk data with kernels
     of width sigma_factor x spacing; the first level runs niter_first iterations (it only has to
-    locate the support), the others niter.
+    locate the support), the last niter, the ones between niter_between (default niter).
+
+    Broad ODFs (deformed samples): keep_mass (e.g. 0.99) refines only around the strongest
+    orientations holding that fraction of the weight (and above keep_rel x max); children are thinned
+    exactly (with symmetry) up to exact_thinning_max of them, beyond that by cell hashing (thin_cells,
+    cell 0.8 x the new spacing). callback(level_index, ODFLevel) is called after every level.
 
     data: (N_Omega, My, N_seg) as for SinglePhaseForwardOperator (or already summed, My = 1);
     weights: one per segment, as FISTAHuber.run. Returns a list of ODFLevel, coarse to fine.
@@ -212,7 +233,8 @@ def reconstruct_odf(cfg, material, data, weights=None, spacing_deg=4.0, levels=5
         solver = FISTAHuber(op, prox_kind="nonneg", L=L, huber_delta=huber_delta)
         # the coefficients (K floats) and the bulk data are small: both stay on the GPU
         x = clarray.zeros(queue, op.coeff_shape, np.float32)
-        solver.run(x, clarray.to_device(queue, b), niter=niter_first if lev == 0 else niter,
+        n_it = niter_first if lev == 0 else niter if lev == levels - 1 or niter_between is None else niter_between
+        solver.run(x, clarray.to_device(queue, b), niter=n_it,
                    weights=None if wseg is None else clarray.to_device(queue, wseg))
         x = x.get()
         r = op.direct(x)[:, 0] - b[:, 0]
@@ -223,15 +245,21 @@ def reconstruct_odf(cfg, material, data, weights=None, spacing_deg=4.0, levels=5
                          objective=[s["f"] for s in solver.iter_stats])
         op.free_memory()
         out.append(level)
+        if callback is not None:
+            callback(lev, level)
         if verbose:
             print(f"ODF level {lev}: spacing {h:.3f} deg, sigma {sigma:.3f} deg, K {len(q)}, PF {op.pf_mode}, "
                   f"{level.seconds:.0f} s, relative residual {level.residual:.4f}", flush=True)
         if lev == levels - 1:
             break
         keep = level.support(keep_rel)  # by decreasing weight
+        if keep_mass is not None:
+            cum = np.cumsum(level.w[keep], dtype=np.float64)
+            keep = keep[:int(np.searchsorted(cum, keep_mass * level.w.sum())) + 1]
         n3 = n_sub ** 3
         kids = _children(q[keep], h, n_sub, sym)
-        sel = thin(kids, 0.7 * h / 2, sym)  # rows are parent-major: strong parents' children first
+        # rows are parent-major: strong parents' children first
+        sel = thin(kids, 0.7 * h / 2, sym) if len(kids) <= exact_thinning_max else thin_cells(kids, 0.8 * h / 2)
         if verbose:
             print(f"  {len(keep)} orientations above {keep_rel:g} x max ({level.w[keep].sum() / level.w.sum():.4f} "
                   f"of the weight) -> {len(keep) * n3} children -> {len(sel)} after thinning", flush=True)

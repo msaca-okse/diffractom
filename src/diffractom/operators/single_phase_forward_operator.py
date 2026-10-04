@@ -383,6 +383,15 @@ class SinglePhaseForwardOperator:
         from Grid objects to GPU.
         """
 
+        if hasattr(self.grid, "leaf_arrays"):  # MatrixGrid: arrays, no per-node objects
+            mats, sigmas = self.grid.leaf_arrays()
+            self.K = len(mats)
+            self.grid_inv_cpu = np.ascontiguousarray(mats.transpose(0, 2, 1).reshape(self.K, 9), dtype=np.float32)
+            self.grid_inv_gpu = clarray.to_device(self.queue, self.grid_inv_cpu)
+            self.grid_rot_cpu = np.asarray(mats, dtype=np.float64)
+            self.sigma_cpu = np.asarray(sigmas, dtype=np.float32)
+            return
+
             # --- extract active leaf nodes ---
         active_indices = self.grid.active_leaf_nodes()
         nodes = [self.grid.nodes[i] for i in active_indices]
