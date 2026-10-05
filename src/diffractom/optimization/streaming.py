@@ -15,6 +15,7 @@ next batch is uploaded and the previous one downloaded while the current batch i
 device memory of the same size, and migrates USE_HOST_PTR buffers to the device on first use.)
 """
 import os
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -44,7 +45,9 @@ class Streamer:
     coefficient passes of a fused FISTA iteration."""
 
     def __init__(self, op, fused_update=None, n_threads=None):
-        self.op = op
+        # weak: the operator keeps its Streamer (op._streamer), so a strong reference back would make a
+        # cycle, and `del op` would leave the operator's GPU buffers allocated until the next cyclic GC
+        self.op = weakref.proxy(op)
         self.q = op.queue
         self.tq_up = cl.CommandQueue(op.ctx, op.queue.device)
         self.tq_dn = cl.CommandQueue(op.ctx, op.queue.device)

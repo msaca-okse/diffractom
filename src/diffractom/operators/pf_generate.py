@@ -9,6 +9,7 @@ condition of some pole are evaluated, so the cost scales with the number of non-
 Used to build the stored sparse matrix, to generate the batches that are not stored in every
 forward and adjoint call, and to transpose a stored adjoint CSR into the forward one.
 """
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -43,7 +44,7 @@ class SparsePFGenerator:
     """
 
     def __init__(self, op, k_batch_max):
-        self.op = op
+        self.op = weakref.proxy(op)  # weak: the operator keeps its generator (op.pf_gen), see Streamer
         q = self.q = op.queue
         R, C, P = op.N_Omega, op.N_eta, op.N_peaks
         self.CP = op.N_seg
