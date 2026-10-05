@@ -12,6 +12,7 @@ from ..crystallography.material import Material
 from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
 from .pf_kernels import build_all_opencl
+from ..utils.device_memory import free_device_bytes
 from .pf_generate import CAND_BYTES, NNZ_BYTES, SparsePFGenerator
 from .parallel_radon import ParallelRadon
 from . import fourier_radon
@@ -791,8 +792,9 @@ class SinglePhaseForwardOperator:
         default, for FISTA with the fused update, 0 when the coefficients are streamed
         from host memory; and 2 of the data size (N_Omega, My, N_seg): the data and
         the prediction/residual), the operator's
-        buffers and a 1 GB margin. Conservative on purpose: the GPU may be
-        shared, and the solver's arrays take priority.
+        buffers and a 1 GB margin. Device memory means what is free now where the
+        driver reports it (NVIDIA through NVML, AMD), else the total. Conservative on
+        purpose: the GPU may be shared, and the solver's arrays take priority.
         """
         coeff_bytes = 4 * self.Nx * self.Ny * self.K
         data_bytes = 4 * self.N_Omega * self.My * self.N_seg
@@ -800,8 +802,11 @@ class SinglePhaseForwardOperator:
         if buffers is None:  # (only computed with verbose=True)
             buffers = 4 * self.K_batch_max * (self.N_Omega * self.My + self.Nx * self.Ny
                                               + self.N_Omega * self.N_eta * self.N_peaks)
-        free = (self.queue.device.global_mem_size - self.reserve_coefficient_arrays * coeff_bytes
-                - 2 * data_bytes - buffers - 1024**3)
+        available = self.queue.device.global_mem_size
+        free_now = free_device_bytes(self.queue.device)  # other processes' use (a shared GPU), where known
+        if free_now is not None:
+            available = min(available, free_now)
+        free = (available - self.reserve_coefficient_arrays * coeff_bytes - 2 * data_bytes - buffers - 1024**3)
         return 0.5 * max(free, 0) / 1024**3
 
 
@@ -899,14 +904,38 @@ class SinglePhaseForwardOperator:
             for ib, b in enumerate(self.batches):
                 if n_store is None and used + 6 * nnz_est[ib] + ptr_a[ib] > budget:
                     break
-                g = gen.generate(b["k_start"], b["K_batch"], forward=(store == "both"))
-                n_rows = R * b["K_batch"]
-                nnz = int(g["row_ptr_a"][n_rows:n_rows + 1].get()[0])
-                n = max(nnz, 1)
-                keep = dict(row_ptr_a=g["row_ptr_a"].copy(), col_j=g["col_j"][:n].copy(), val_a=g["val_a"][:n].copy())
-                if store == "both":
-                    keep.update(row_ptr_f=g["row_ptr_f"].copy(), col_k=g["col_k"][:n].copy(),
-                                val_f=g["val_f"][:n].copy())
+                try:
+                    g = gen.generate(b["k_start"], b["K_batch"], forward=(store == "both"))
+                    n_rows = R * b["K_batch"]
+                    nnz = int(g["row_ptr_a"][n_rows:n_rows + 1].get()[0])
+                    n = max(nnz, 1)
+                    keep = dict(row_ptr_a=g["row_ptr_a"].copy(), col_j=g["col_j"][:n].copy(),
+                                val_a=g["val_a"][:n].copy())
+                    if store == "both":
+                        keep.update(row_ptr_f=g["row_ptr_f"].copy(), col_k=g["col_k"][:n].copy(),
+                                    val_f=g["val_f"][:n].copy())
+                    self.queue.finish()  # NVIDIA allocates on first use: an allocation failure shows here
+                except cl.MemoryError:
+                    # less memory than the budget assumed (e.g. a GPU shared with other processes): auto
+                    # keeps half of what fitted, as the default budget does with the free memory, so that
+                    # the generator's scratch, the streaming buffers and the solver's arrays still fit; the
+                    # other batches are generated in every call
+                    if not auto:
+                        raise
+                    keep = None
+                    fitted = used
+                    stored = [i for i in range(ib) if sparse_batches[i] is not None]
+                    while stored and used > fitted / 2:
+                        i = stored.pop()
+                        used -= sum(a.nbytes for a in sparse_batches[i].values())
+                        nnz_stored.pop()
+                        sparse_batches[i] = None
+                    self.queue.finish()
+                    if self.verbose:
+                        print(f"Sparse PF matrix: device memory ran out at batch {ib} of {nb} "
+                              f"({fitted / 1024**3:.1f} GB stored); keeping {len(stored)} batches "
+                              f"({used / 1024**3:.1f} GB), generating the rest")
+                    break
                 sparse_batches[ib] = keep
                 nnz_stored.append(nnz)
                 used += sum(a.nbytes for a in keep.values())
