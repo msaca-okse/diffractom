@@ -4,21 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diffractom"
-version = "0.1.0"
-description = "GPU-based texture tomography reconstruction framework"
+version = "0.2.0"
+description = "GPU-accelerated texture tomography of scanning diffraction (s3DXRD) data"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
   { name = "Martin Sæbye Carøe" }
 ]
 license = {text = "Apache-2.0"}
+keywords = ["texture tomography", "s3DXRD", "scanning 3DXRD", "X-ray diffraction", "orientation distribution function", "OpenCL", "GPU"]
 
+# the versions that were tested are pinned in environment.yml
 dependencies = [
   "numpy",
   "scipy",
   "pyopencl",
-  "ase",
-  "pymatgen",
   "gratopy",
   "pyclblast"
 ]
@@ -26,6 +26,12 @@ dependencies = [
 [project.optional-dependencies]
 # the Fourier-slice projector (projector="fft", the default for grids of more than 400 x 400 pixels)
 fft = ["pyvkfft"]
+# the example notebook (examples/example_diffractom_pipeline.ipynb)
+examples = ["h5py", "matplotlib", "orix", "notebook"]
+
+[project.urls]
+Repository = "https://github.com/msaca-okse/diffractom"
+Documentation = "https://github.com/msaca-okse/diffractom/blob/main/docs/DOCUMENTATION.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -365,5 +365,9 @@ t, mem_mb = logger.as_arrays()
 - **pyopencl**: GPU computation.
 - **pyclblast** (CLBlast): batched GEMM.
 - **gratopy**: the alternative Radon projector.
-- **pymatgen** and **ase**: crystal structures and CIF files.
+- **pyvkfft** (optional, `pip install ".[fft]"`): the Fourier-slice projector.
 - **matplotlib** (optional): `Grid.plot_stereographic`.
+- **h5py**, **orix**, **notebook** (optional, `pip install ".[examples]"`): the example notebook.
+
+CIF files are read by the package's own parser (`cif_parser.py`); no crystallography
+package is needed. `environment.yml` pins the versions that were tested.

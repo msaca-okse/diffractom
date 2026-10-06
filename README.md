@@ -48,32 +48,35 @@ git clone https://github.com/msaca-okse/diffractom.git
 cd diffractom
 ```
 
-Create and activate the conda environment. It installs numpy, scipy, pymatgen,
-ase, gratopy, pyopencl, pyvkfft, CLBlast and pyclblast:
+Create and activate the conda environment. It installs numpy, scipy, pyopencl,
+pyvkfft, gratopy, CLBlast and pyclblast, at the versions diffractom was tested
+with:
 
 ```bash
 conda env create -f environment.yml
 conda activate diffractom
 ```
 
-Install the package in editable mode:
+Install the package in editable mode, with the packages the example notebook
+needs (h5py, matplotlib, orix, notebook):
 
 ```bash
-pip install -e .
+pip install -e ".[examples]"
 ```
 
-The example notebook needs a few more packages:
-
-```bash
-conda install -c conda-forge orix notebook
-pip install h5py matplotlib
-```
+Without the extras (`pip install -e .`) only the core dependencies are
+installed; `.[fft]` adds pyvkfft for the Fourier-slice projector if it is not
+in the environment already.
 
 Conda and pip are mixed on purpose: CLBlast comes from conda-forge, while
 pyopencl, pyclblast and gratopy are installed with pip. If pyopencl finds no
 platform, or CLBlast fails to load, check the system's OpenCL drivers first.
 When several OpenCL devices are available, set `PYOPENCL_CTX` (for example
 `PYOPENCL_CTX=0:1`) to choose one.
+
+Tested with Python 3.11, numpy 2.3.5, scipy 1.17.1, pyopencl 2026.1.2,
+pyclblast 1.4.0 with CLBlast 1.5.2, gratopy 0.1.0 and pyvkfft 2025.1.1, on
+Linux with NVIDIA GPUs (V100, A40, L40S, A100).
 
 ## Example
 
