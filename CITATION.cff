@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use diffractom, please cite it using the metadata from this file."
+type: software
+title: "diffractom: GPU-accelerated texture tomography of scanning diffraction data"
+version: 0.2.0
+authors:
+  - family-names: "Carøe"
+    given-names: "Martin Sæbye"
+    affiliation: "Technical University of Denmark"
+    orcid: "https://orcid.org/0009-0008-3739-7562"
+license: Apache-2.0
+repository-code: "https://github.com/msaca-okse/diffractom"
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.20431766
+    description: "Concept DOI on Zenodo: all versions of diffractom (resolves to the latest)"
+abstract: >-
+  diffractom is a GPU-accelerated (OpenCL) Python library for texture tomography of scanning
+  diffraction data, in particular scanning three-dimensional X-ray diffraction (s3DXRD). From
+  azimuthally integrated ring intensities, indexed by rotation angle, translation, azimuth and ring,
+  it reconstructs the orientation distribution function of every pixel in a sample slice, expanded
+  in Gaussian kernels on an orientation grid. The forward operator combines a pole-figure transform
+  with a parallel-beam Radon transform, and FISTA solves for non-negative coefficients.
+keywords:
+  - texture tomography
+  - s3DXRD
+  - scanning 3DXRD
+  - X-ray diffraction
+  - orientation distribution function
+  - OpenCL
+  - GPU

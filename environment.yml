@@ -1,3 +1,5 @@
+# The environment diffractom 0.2.0 was tested with (Linux, NVIDIA GPUs through OpenCL).
+# conda env create -f environment.yml; conda activate diffractom; pip install -e ".[examples]"
 name: diffractom
 
 channels:
@@ -5,13 +7,12 @@ channels:
 
 dependencies:
   - python=3.11
-  - numpy
-  - clblast
-  - pymatgen
+  - numpy=2.3.5
+  - scipy=1.17.1
+  - clblast=1.5.2
   - pip
   - pip:
-      - gratopy
-      - ase
-      - pyclblast
-      - pyopencl
-      - pyvkfft
+      - pyopencl==2026.1.2
+      - pyclblast==1.4.0
+      - gratopy==0.1.0
+      - pyvkfft==2025.1.1

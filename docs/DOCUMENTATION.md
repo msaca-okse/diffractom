@@ -22,8 +22,8 @@ diffractom/
 The top-level package exports `Material`, `Grid`, `fov_support_mask`,
 `SinglePhaseForwardOperator`, `MultiPhaseForwardOperator`,
 `BulkTextureForwardOperator`, `MatrixTomographicOperator`,
-`BraggEdgeTomographicOperator`, `FISTAHuber`, `FISTAL2` and the
-reinterpolation functions (`build_interpolation_kernelSO3`, `interpolateSO3`,
+`BraggEdgeTomographicOperator`, `FISTAHuber`, `FISTAL2`,
+`estimate_L_power_streamed` and the reinterpolation functions (`build_interpolation_kernelSO3`, `interpolateSO3`,
 `build_interpolation_kernelS2`, `interpolateS2`, `project_rotations_to_s2`).
 
 ## Array conventions
@@ -47,9 +47,12 @@ otherwise a `ValueError` or `TypeError` says what is wrong.
 
 ## Configuration (`cfg`)
 
-The operators take a configuration dictionary, usually loaded from YAML (see
-`examples/config.yaml`). Any key can be overridden as a keyword argument of
-the operator, e.g. `SinglePhaseForwardOperator(cfg, mat, grid, max_gb=2.0, N_Omega=100)`.
+The operators take the scan geometry as a plain dictionary, set in the script or
+notebook (see `examples/example_diffractom_pipeline.ipynb`). Any key can be
+overridden as a keyword argument of the operator, e.g.
+`SinglePhaseForwardOperator(cfg, mat, grid, max_gb=2.0, N_Omega=100)`. Keys with a
+default may be left out; `SinglePhaseForwardOperator` reads no other keys (an
+older `j_direction_0` entry, for instance, is ignored).
 
 | Key | Type | Description |
 |-----|------|-------------|
@@ -362,5 +365,9 @@ t, mem_mb = logger.as_arrays()
 - **pyopencl**: GPU computation.
 - **pyclblast** (CLBlast): batched GEMM.
 - **gratopy**: the alternative Radon projector.
-- **pymatgen** and **ase**: crystal structures and CIF files.
+- **pyvkfft** (optional, `pip install ".[fft]"`): the Fourier-slice projector.
 - **matplotlib** (optional): `Grid.plot_stereographic`.
+- **h5py**, **orix**, **notebook** (optional, `pip install ".[examples]"`): the example notebook.
+
+CIF files are read by the package's own parser (`cif_parser.py`); no crystallography
+package is needed. `environment.yml` pins the versions that were tested.
