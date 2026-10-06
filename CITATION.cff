@@ -7,6 +7,7 @@ authors:
   - family-names: "Carøe"
     given-names: "Martin Sæbye"
     affiliation: "Technical University of Denmark"
+    orcid: "https://orcid.org/0009-0008-3739-7562"
 license: Apache-2.0
 repository-code: "https://github.com/msaca-okse/diffractom"
 identifiers:
