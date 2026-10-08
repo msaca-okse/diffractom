@@ -312,14 +312,17 @@ class FISTAHuber:
         weights:  OPTIONAL, N_seg = N_eta * N_rings elements, e.g. shaped (N_eta, N_rings): one weight
                 per segment (eta bin, ring), shared by all rotations and translations; the residual
                 of a data point in segment j is multiplied by weights[j], zero weight excludes the
-                segment. A NumPy array or a C-contiguous float32 pyopencl array.
-        returns the solution: the NumPy array (streamed) or x0_gpu (on the GPU)
+                segment. Or the data shape (N_Omega, My, N_seg): one weight per data point.
+                A NumPy array or a C-contiguous float32 pyopencl array.
+        returns the solution: the NumPy array (streamed, or copied back from the GPU for operators
+                that cannot stream, e.g. MatrixTomographicOperator) or x0_gpu (on the GPU)
         """
         t_start = time.perf_counter()  # iteration times in iter_stats count from here (setup in the first)
         q = self.queue
 
         # ---- inputs: shapes, dtype, layout; NumPy data and weights are uploaded ----
-        streamed, x0_gpu, out_gpu, weights, uploaded = prepare_inputs(self.op, q, x0_gpu, out_gpu, weights)
+        streamed, x0_gpu, out_gpu, weights, uploaded, host_x0, w_period = prepare_inputs(
+            self.op, q, x0_gpu, out_gpu, weights)
         if streamed and not self.fused:
             raise ValueError("streaming the coefficients (x0 as a NumPy array) needs the fused update: an "
                              "element-wise prox ('nonneg', 'l1', 'nonneg_l1') and fused=True")
@@ -413,7 +416,7 @@ class FISTAHuber:
             # NOTE: with weights, the gradient is A*( clip( w*(Ax-b) ) )
             r = Ax
             self.k_residual_sumsq(q, red_g, red_l, Ax.data, out_gpu.data,
-                                  (weights if use_weights else out_gpu).data, np.uint64(out_gpu.shape[-1]),
+                                  (weights if use_weights else out_gpu).data, np.uint64(w_period),
                                   np.int32(use_weights), np.int32(1), np.float32(self.huber_delta), red_n,
                                   partial.data, cl.LocalMemory(4 * red_l[0]))
             r2 = float(partial.get().astype(np.float64).sum())
@@ -578,4 +581,8 @@ class FISTAHuber:
         q.finish()
         # --------------------------------------------
 
+        if host_x0 is not None:  # a NumPy start for an operator that cannot stream: the result back in it
+            x.get(ary=host_x0)
+            x.base_data.release()
+            x = host_x0
         return x

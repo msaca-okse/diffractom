@@ -6,15 +6,29 @@ import pyopencl.array as clarray
 import gratopy
 from pyclblast import gemmStridedBatched
 from .pf_kernels import build_pfo_program
-from ..utils.arrays import check_device
+from .parallel_radon import ParallelRadon
+from ..utils.arrays import as_host, check_device
+from ..utils.support import fov_support_mask
+
+
+def gratopy_angle_weights(queue, angles, Nx, Ny, My):
+    """The angle weights gratopy uses for these parallel-beam angles (half the angular gap to the
+    neighbours, modulo pi), so that the native projector's backward projection equals gratopy's."""
+    ps = gratopy.ProjectionSettings(queue, gratopy.PARALLEL, (Nx, Ny), np.asarray(angles, dtype=np.float64),
+                                    n_detectors=My)
+    return np.asarray(ps.angle_weights, dtype=np.float64)
 
 
 class MatrixTomographicOperator:
     """Generic matrix-tomographic forward operator on GPU.
 
-    Computes  Ax = B @ P(x)  and its adjoint, where P is parallel-beam
-    tomographic projection and B is a user-supplied matrix of shape
-    (N_Omega, K, N_seg).
+    Computes  Ax = B @ P(x)  and its adjoint, where P is the parallel-beam tomographic projection and
+    B is a user-supplied matrix of shape (N_Omega, K, N_seg): for every projection angle, a map from
+    the K channels (basis functions) to the N_seg data values of a detector position.
+
+    Arrays: coefficients (K, Ny, Nx), C order (coeffs[k] is the image of channel k); data
+    (N_Omega, My, N_seg), C order. direct and adjoint take and return NumPy arrays, or pyopencl arrays;
+    the FISTA solvers accept NumPy arrays (uploaded; the result is copied back) or pyopencl arrays.
     """
 
     def __init__(
@@ -32,6 +46,8 @@ class MatrixTomographicOperator:
         verbose: bool = False,
         ctx: cl.Context | None = None,
         queue: cl.CommandQueue | None = None,
+        projector: str = "gratopy",
+        angle_weights=None,
     ):
         """Initialise the matrix-tomographic operator.
 
@@ -40,7 +56,8 @@ class MatrixTomographicOperator:
         B : ndarray, shape (N_Omega, K, N_seg)
             User-supplied matrix applied after tomographic projection.
         angles : ndarray, shape (N_Omega,)
-            Projection angles in radians.
+            Projection angles in radians (the convention of gratopy and ParallelRadon: at angle a the
+            projection integrates along (cos a, sin a) in (column, row) image coordinates).
         N_Omega : int
             Number of projection angles.
         My : int
@@ -52,18 +69,31 @@ class MatrixTomographicOperator:
         N_seg : int
             Number of data points per rotation/translation step.
         cor_offset : float
-            Centre-of-rotation offset (default 0).
+            Centre-of-rotation offset in detector pixels (default 0).
+        image_width_factor : float
+            Width of the image in detector pixels, relative to Nx (default 1: pixel = detector pixel).
         verbose : bool
-            Print buffer allocation summary.
+            Print the buffer allocation summary.
         ctx, queue : optional
             Existing OpenCL context/queue; created automatically if None.
+        projector : "gratopy" (default) or "native"
+            The tomographic projector: gratopy, or diffractom's ParallelRadon (the same
+            discretisation, results equal to 2e-7; faster for large images and many angles, slower
+            for small ones: 123 x 123 pixels, 24 angles, K = 9400 on a V100: 62 vs 41 ms per forward).
+        angle_weights : None (default), "uniform" or an array of N_Omega weights
+            Weights of the angles in the backward projection, i.e. in the adjoint (the solvers then
+            minimise the angle-weighted residual). None: gratopy's (half the angular gap to the
+            neighbouring angles), the same as with projector="gratopy". "uniform": pi / N_Omega each,
+            so that the backward projection is the adjoint up to one constant.
         """
-        assert B.shape == (N_Omega, K, N_seg), (
-            f"B must have shape ({N_Omega}, {K}, {N_seg}), got {B.shape}"
-        )
-        assert angles.shape == (N_Omega,), (
-            f"angles must have shape ({N_Omega},), got {angles.shape}"
-        )
+        B = np.asarray(B)
+        if B.shape != (N_Omega, K, N_seg):
+            raise ValueError(f"B must have shape ({N_Omega}, {K}, {N_seg}), got {B.shape}")
+        angles = np.asarray(angles, dtype=np.float64)
+        if angles.shape != (N_Omega,):
+            raise ValueError(f"angles must have shape ({N_Omega},), got {angles.shape}")
+        if projector not in ("native", "gratopy"):
+            raise ValueError(f"projector must be 'native' or 'gratopy', not {projector!r}")
 
         self.N_Omega = N_Omega
         self.My = My
@@ -74,6 +104,8 @@ class MatrixTomographicOperator:
         self.cor_offset = cor_offset
         self.verbose = verbose
         self.image_width_factor = image_width_factor
+        self.projector = projector
+        self.angles = angles
 
         # --- context / queue ---
         if ctx is not None and queue is not None:
@@ -83,78 +115,72 @@ class MatrixTomographicOperator:
             self.ctx = cl.create_some_context(interactive=False)
             self.queue = cl.CommandQueue(self.ctx)
 
-        # --- build transpose kernels ---
-        self.prg = build_pfo_program(self.ctx)
-        self.transpose_f_to_c = cl.Kernel(self.prg, "transpose_d_omega_k_f_to_c")
-        self.transpose_c_to_f = cl.Kernel(self.prg, "transpose_omega_d_k_c_to_d_omega_k_f")
+        if isinstance(angle_weights, str):
+            if angle_weights != "uniform":
+                raise ValueError("angle_weights must be None, 'uniform' or an array")
+            w = np.full(N_Omega, np.pi / N_Omega)
+        elif angle_weights is None:
+            w = gratopy_angle_weights(self.queue, angles, Nx, Ny, My)
+        else:
+            w = np.broadcast_to(np.asarray(angle_weights, dtype=np.float64), (N_Omega,)).copy()
+        self.angle_weights = w
 
-        # --- angles ---
-        self.angles = np.asarray(angles, dtype=np.float64)
+        image_width = self.Nx * self.image_width_factor
+        if projector == "native":
+            # channels fastest, padded to a multiple of 4 (zero rows of B for the padding)
+            self.Kstride = -(-K // 4) * 4
+            self.radon = ParallelRadon(self.queue, (Nx, Ny), angles, My, image_width=image_width,
+                                       detector_width=My, detector_shift=cor_offset, angle_weights=w)
+            self.PS = None
+        else:
+            self.Kstride = K
+            self.radon = None
+            self.PS = gratopy.ProjectionSettings(
+                self.queue, gratopy.PARALLEL, (self.Nx, self.Ny, self.K), angles, angle_weights=w,
+                n_detectors=self.My, image_width=image_width, detector_width=self.My,
+                detector_shift=self.cor_offset)
+            self.prg = build_pfo_program(self.ctx)
+            self.transpose_f_to_c = cl.Kernel(self.prg, "transpose_d_omega_k_f_to_c")
+            self.transpose_c_to_f = cl.Kernel(self.prg, "transpose_omega_d_k_c_to_d_omega_k_f")
 
-        # --- projection settings ---
-        self.PS = gratopy.ProjectionSettings(
-            self.queue,
-            gratopy.PARALLEL,
-            (self.Nx, self.Ny, self.K),
-            self.angles,
-            n_detectors=self.My,
-            image_width=self.Nx*self.image_width_factor,
-            detector_width=self.My,
-            detector_shift=self.cor_offset,
-        )
+        # --- B and B^T on the GPU (rows K .. Kstride-1 zero) ---
+        Bp = np.zeros((N_Omega, self.Kstride, N_seg), dtype=np.float32)
+        Bp[:, :K] = B
+        self.B_cpu = np.ascontiguousarray(B, dtype=np.float32)
+        self.B_gpu = clarray.to_device(self.queue, Bp)
+        self.BT_gpu = clarray.to_device(self.queue, np.ascontiguousarray(Bp.transpose(0, 2, 1)))
 
-        # --- transfer B and B^T to GPU ---
-        self.B_cpu = np.asarray(B, dtype=np.float32, order="C")
-        self.B_gpu = clarray.to_device(self.queue, self.B_cpu)
-
-        self.BT_cpu = np.ascontiguousarray(self.B_cpu.transpose(0, 2, 1))
-        self.BT_gpu = clarray.to_device(self.queue, self.BT_cpu)
-
-        # --- allocate working buffers ---
         self.allocate_buffers()
 
     def allocate_buffers(self):
         """Pre-allocate reusable GPU buffers for forward/adjoint computation."""
         buffers = []
 
-        def _alloc(name, shape, dtype, order):
+        def _alloc(name, shape, dtype, order="C"):
             arr = clarray.empty(self.queue, shape, dtype=dtype, order=order)
+            setattr(self, name, arr)
             buffers.append((name, arr))
             return arr
 
-        # Sinogram F-order from gratopy: (My, N_Omega, K)
-        self.sino_F = _alloc(
-            "sino_F", (self.My, self.N_Omega, self.K), np.float32, "F"
-        )
+        # sinogram, channels fastest: (N_Omega, My, Kstride), C order
+        _alloc("sino_C", (self.N_Omega, self.My, self.Kstride), np.float32)
+        if self.projector == "native":
+            # images, channels fastest: (Ny * Nx, Kstride)
+            _alloc("img_k", (self.Nx * self.Ny * self.Kstride,), np.float32)
+        else:
+            # gratopy's sinogram, F order: (My, N_Omega, K)
+            _alloc("sino_F", (self.My, self.N_Omega, self.K), np.float32, "F")
 
-        # Sinogram C-order after transpose: (N_Omega, My, K)
-        self.sino_C = _alloc(
-            "sino_C", (self.N_Omega, self.My, self.K), np.float32, "C"
-        )
-
-        # --- memory summary ---
-        print("\n=== OpenCL buffer allocation summary ===")
-        total_bytes = 0
-
-        for name, arr in buffers:
-            nbytes = arr.size * arr.dtype.itemsize
-            total_bytes += nbytes
-            shape_str = "x".join(str(s) for s in arr.shape)
-            print(f"  {name:30s}: shape=({shape_str}), {nbytes / 1024**2:8.2f} MB")
-
-        b_bytes = self.B_gpu.size * self.B_gpu.dtype.itemsize
-        bt_bytes = self.BT_gpu.size * self.BT_gpu.dtype.itemsize
-        total_bytes += b_bytes + bt_bytes
-
-        b_shape = "x".join(str(s) for s in self.B_gpu.shape)
-        bt_shape = "x".join(str(s) for s in self.BT_gpu.shape)
-        print(f"  {'B_gpu':30s}: shape=({b_shape}), {b_bytes / 1024**2:8.2f} MB")
-        print(f"  {'BT_gpu':30s}: shape=({bt_shape}), {bt_bytes / 1024**2:8.2f} MB")
-
-        print("---------------------------------------")
-        print(f"  TOTAL GPU buffer memory: {total_bytes / 1024**2:8.2f} MB")
-        print("=======================================\n")
+        total_bytes = sum(a.nbytes for _, a in buffers) + self.B_gpu.nbytes + self.BT_gpu.nbytes
         self.total_bytes = total_bytes
+        if self.verbose:
+            print("\n=== OpenCL buffer allocation summary ===")
+            for name, arr in buffers + [("B_gpu", self.B_gpu), ("BT_gpu", self.BT_gpu)]:
+                shape_str = "x".join(str(s) for s in arr.shape)
+                print(f"  {name:30s}: shape=({shape_str}), {arr.nbytes / 1024**2:8.2f} MB")
+            print("---------------------------------------")
+            print(f"  TOTAL GPU buffer memory: {total_bytes / 1024**2:8.2f} MB")
+            print("=======================================\n")
 
     @property
     def coeff_shape(self):
@@ -165,25 +191,31 @@ class MatrixTomographicOperator:
     def data_shape(self):
         return (self.N_Omega, self.My, self.N_seg)
 
+    def support_mask(self):
+        """(Ny, Nx) bool mask of the pixels inside the field of view at every projection angle."""
+        return fov_support_mask(self.Nx, self.Ny, self.My, angles=self.angles,
+                                image_width=self.Nx * self.image_width_factor, detector_width=self.My,
+                                detector_shift=self.cor_offset)
+
+    def device_bytes(self):
+        return int(self.total_bytes)
+
     def direct(self, coeffs):
         """Forward operator: data = B @ P(coeffs).
 
-        Parameters
-        ----------
-        coeffs : clarray, shape (K, Ny, Nx), C-contiguous float32
-
-        Returns
-        -------
-        data : clarray, shape (N_Omega, My, N_seg), C-order
+        coeffs : NumPy array (K, Ny, Nx) -> NumPy array (N_Omega, My, N_seg); or a C-contiguous
+            float32 pyopencl array -> pyopencl array.
         """
-        data = clarray.zeros(
-            self.queue,
-            (self.N_Omega, self.My, self.N_seg),
-            dtype=np.float32,
-            order="C",
-        )
-        self.direct_cl(coeffs, data)
-        return data
+        host = not isinstance(coeffs, clarray.Array)
+        x = clarray.to_device(self.queue, as_host(coeffs, self.coeff_shape, "coeffs")) if host else coeffs
+        data = clarray.empty(self.queue, self.data_shape, dtype=np.float32)
+        self.direct_cl(x, data)
+        if not host:
+            return data
+        out = data.get()
+        for a in (x, data):
+            a.base_data.release()
+        return out
 
     def direct_cl(self, coeffs, data):
         """In-place forward: data = B @ P(coeffs).
@@ -195,55 +227,38 @@ class MatrixTomographicOperator:
         """
         check_device(coeffs, self.coeff_shape, "coeffs")
         check_device(data, self.data_shape, "data")
-        self.sino_F.fill(0.0)
-        self.sino_C.fill(0.0)
 
-        # 1) Tomographic projection: (Nx, Ny, K) F (the same memory as (K, Ny, Nx) C) -> (My, N_Omega, K) F
-        gratopy.forwardprojection(coeffs.transpose((2, 1, 0)), self.PS, sino=self.sino_F)
+        # 1) tomographic projection -> sino_C (N_Omega, My, Kstride)
+        if self.projector == "native":
+            self.radon.gather(coeffs, self.img_k, 0, self.K, self.Kstride)
+            self.radon.forward(self.img_k, self.sino_C, self.Kstride)
+        else:
+            # (Nx, Ny, K) F (the same memory as (K, Ny, Nx) C) -> (My, N_Omega, K) F -> (N_Omega, My, K) C
+            gratopy.forwardprojection(coeffs.transpose((2, 1, 0)), self.PS, sino=self.sino_F)
+            total = self.N_Omega * self.My * self.K
+            self.transpose_f_to_c(self.queue, (total,), None, self.sino_F.data, self.sino_C.data,
+                                  np.int32(self.My), np.int32(self.N_Omega), np.int32(self.K), np.int32(total))
 
-        # 2) Transpose: (My, N_Omega, K) F -> (N_Omega, My, K) C
-        total = self.N_Omega * self.My * self.K
-        self.transpose_f_to_c(
-            self.queue,
-            (total,),
-            None,
-            self.sino_F.data,
-            self.sino_C.data,
-            np.int32(self.My),
-            np.int32(self.N_Omega),
-            np.int32(self.K),
-            np.int32(total),
-        )
-
-        # 3) Batched GEMM: data[o] = sino_C[o] @ B[o]
-        #    sino_C[o]: (My, K),  B[o]: (K, N_seg)  ->  data[o]: (My, N_seg)
-        _batched_gemm(
-            self.queue,
-            self.sino_C,
-            self.B_gpu,
-            data,
-            R=self.N_Omega,
-            M=self.My,
-            K_inner=self.K,
-            N=self.N_seg,
-            alpha=1.0,
-            beta=0.0,
-        )
+        # 2) batched GEMM: data[o] = sino_C[o] @ B[o], (My, Kstride) @ (Kstride, N_seg)
+        _batched_gemm(self.queue, self.sino_C, self.B_gpu, data, R=self.N_Omega, M=self.My,
+                      K_inner=self.Kstride, N=self.N_seg, alpha=1.0, beta=0.0)
 
     def adjoint(self, data):
         """Adjoint operator: coeffs = P^T(B^T @ data).
 
-        Parameters
-        ----------
-        data : clarray, shape (N_Omega, My, N_seg), C-order
-
-        Returns
-        -------
-        coeffs : clarray, shape (K, Ny, Nx), C order
+        data : NumPy array (N_Omega, My, N_seg) -> NumPy array (K, Ny, Nx); or a C-contiguous
+            float32 pyopencl array -> pyopencl array.
         """
-        coeffs = clarray.zeros(self.queue, self.coeff_shape, dtype=np.float32)
-        self.adjoint_cl(data, coeffs)
-        return coeffs
+        host = not isinstance(data, clarray.Array)
+        d = clarray.to_device(self.queue, as_host(data, self.data_shape, "data")) if host else data
+        coeffs = clarray.empty(self.queue, self.coeff_shape, dtype=np.float32)
+        self.adjoint_cl(d, coeffs)
+        if not host:
+            return coeffs
+        out = coeffs.get()
+        for a in (d, coeffs):
+            a.base_data.release()
+        return out
 
     def adjoint_cl(self, data, coeffs):
         """In-place adjoint: coeffs = P^T(B^T @ data).
@@ -255,41 +270,21 @@ class MatrixTomographicOperator:
         """
         check_device(data, self.data_shape, "data")
         check_device(coeffs, self.coeff_shape, "coeffs")
-        coeffs.fill(0.0)
-        self.sino_C.fill(0.0)
-        self.sino_F.fill(0.0)
 
-        # 1) Batched GEMM: sino_C[o] = data[o] @ BT[o]
-        #    data[o]: (My, N_seg),  BT[o]: (N_seg, K)  ->  sino_C[o]: (My, K)
-        _batched_gemm(
-            self.queue,
-            data,
-            self.BT_gpu,
-            self.sino_C,
-            R=self.N_Omega,
-            M=self.My,
-            K_inner=self.N_seg,
-            N=self.K,
-            alpha=1.0,
-            beta=0.0,
-        )
+        # 1) batched GEMM: sino_C[o] = data[o] @ BT[o], (My, N_seg) @ (N_seg, Kstride)
+        _batched_gemm(self.queue, data, self.BT_gpu, self.sino_C, R=self.N_Omega, M=self.My,
+                      K_inner=self.N_seg, N=self.Kstride, alpha=1.0, beta=0.0)
 
-        # 2) Transpose: (N_Omega, My, K) C -> (My, N_Omega, K) F
-        total = self.N_Omega * self.My * self.K
-        self.transpose_c_to_f(
-            self.queue,
-            (total,),
-            None,
-            self.sino_C.data,
-            self.sino_F.data,
-            np.int32(self.N_Omega),
-            np.int32(self.My),
-            np.int32(self.K),
-            np.int32(total),
-        )
-
-        # 3) Backprojection: (My, N_Omega, K) F -> (Nx, Ny, K) F, the same memory as (K, Ny, Nx) C
-        gratopy.backprojection(self.sino_F, self.PS, img=coeffs.transpose((2, 1, 0)))
+        # 2) backprojection
+        if self.projector == "native":
+            self.radon.backward(self.sino_C, self.img_k, self.Kstride)
+            self.radon.scatter(self.img_k, coeffs, 0, self.K, self.Kstride)
+        else:
+            total = self.N_Omega * self.My * self.K
+            self.transpose_c_to_f(self.queue, (total,), None, self.sino_C.data, self.sino_F.data,
+                                  np.int32(self.N_Omega), np.int32(self.My), np.int32(self.K), np.int32(total))
+            # (My, N_Omega, K) F -> (Nx, Ny, K) F, the same memory as (K, Ny, Nx) C
+            gratopy.backprojection(self.sino_F, self.PS, img=coeffs.transpose((2, 1, 0)))
 
     def estimate_L_power(self, niter=20, seed=0, eps=1e-30, verbose=1):
         """Estimate the Lipschitz constant L = ||A^T A|| via power iteration.
@@ -358,9 +353,7 @@ class MatrixTomographicOperator:
 
     def free_memory(self):
         """Release OpenCL buffers and remove corresponding attributes."""
-        buffer_names = ["sino_F", "sino_C", "B_gpu", "BT_gpu"]
-
-        for name in buffer_names:
+        for name in ("sino_F", "sino_C", "img_k", "B_gpu", "BT_gpu"):
             arr = getattr(self, name, None)
             if arr is None:
                 continue
