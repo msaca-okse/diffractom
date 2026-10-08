@@ -692,6 +692,61 @@ def build_bragg_matrix_quadrature(
     return B_integrated
 
 
+def bragg_edge_matrix(
+    material: Material,
+    rotations: Rotation,
+    beam_angles_deg,
+    lam: np.ndarray,
+    sigma: float,
+    e0: float = 1e-4,
+    pulse_tail_fn=raden_pulse_tail,
+    edge_blur_scale: float = 1.0,
+    h_max: int = 10,
+    threshold: float = 1e-3,
+    use_gpu: bool = True,
+    ctx: cl.Context | None = None,
+    queue: cl.CommandQueue | None = None,
+    N_quad: int | None = None,
+    sigma_distance: float | None = None,
+    quadrature_memory_gb: float = 1.0,
+) -> np.ndarray:
+    """The Bragg-edge matrix B (N_Omega, K, N_lam) of one material for the orientations `rotations`.
+
+    What BraggEdgeTomographicOperator builds, without the operator: matrices of several materials (phases)
+    can be stacked along K and used with MatrixTomographicOperator (with projector angles
+    deg2rad(beam_angles) + pi/2, the convention of BraggEdgeTomographicOperator).
+
+    sigma : orientation spread of every orientation (radians). With N_quad, B is averaged over N_quad
+    orientations in a ball of radius sigma_distance around every orientation (and the profile width of every
+    quadrature point is 1.2 sigma_distance / N_quad^(1/3)).
+    """
+    beam_angles_deg = np.asarray(beam_angles_deg, dtype=np.float64)
+    lam = np.asarray(lam, dtype=np.float64)
+    bragg_table = material.neutron_bragg_table(lam_min=float(lam.min()), lam_max=float(lam.max()), h_max=h_max,
+                                               threshold=threshold)
+    if N_quad is None:
+        if use_gpu:
+            return build_bragg_matrix_gpu(bragg_table=bragg_table, rotations=rotations,
+                                          beam_angles_deg=beam_angles_deg, lam=lam, sig=sigma, e0=e0,
+                                          pulse_tail_fn=pulse_tail_fn, edge_blur_scale=edge_blur_scale,
+                                          ctx=ctx, queue=queue)
+        return build_bragg_matrix_cpu(bragg_table=bragg_table, rotations=rotations, beam_angles_deg=beam_angles_deg,
+                                      lam=lam, sig=sigma, e0=e0, pulse_tail_fn=pulse_tail_fn,
+                                      edge_blur_scale=edge_blur_scale).astype(np.float32)
+    if N_quad <= 0:
+        raise ValueError("N_quad must be positive.")
+    if sigma_distance is None or sigma_distance <= 0:
+        raise ValueError("sigma_distance must be given and positive when N_quad is specified.")
+    quad_rots, weights = sample_so3_ball_quadrature(rotations=rotations.as_matrix(), radius=sigma_distance,
+                                                    n_samples=N_quad, normalize_weights=True)
+    return build_bragg_matrix_quadrature(bragg_table=bragg_table, quad_rots=quad_rots, weights=weights,
+                                         K=len(rotations), beam_angles_deg=beam_angles_deg, lam=lam,
+                                         sig=1.2 * sigma_distance / N_quad ** (1 / 3), e0=e0,
+                                         pulse_tail_fn=pulse_tail_fn, edge_blur_scale=edge_blur_scale,
+                                         use_gpu=use_gpu, ctx=ctx, queue=queue,
+                                         quadrature_memory_gb=quadrature_memory_gb)
+
+
 # ---------------------------------------------------------------------------
 # Operator class
 # ---------------------------------------------------------------------------
@@ -834,116 +889,10 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         # --- build neutron Bragg table from material ---
         # Material handles reflection enumeration, d-spacings, and |F|²;
         # the operator is not aware of lattice parameters or atom positions.
-        bragg_table = material.neutron_bragg_table(
-            lam_min   = float(lam.min()),
-            lam_max   = float(lam.max()),
-            h_max     = h_max,
-            threshold = threshold,
-        )
-
-
-        # --- build B ---
-        #
-        # If N_quad is None, retain the original behavior exactly:
-        #
-        #     one orientation -> one column of B
-        #
-        # If N_quad is provided, evaluate B at N_quad orientations
-        # around every grid orientation and integrate over the local
-        # SO(3) ball.
-
-        if N_quad is None:
-
-            # --------------------------------------------------------------
-            # Original implementation.
-            # --------------------------------------------------------------
-
-            if use_gpu:
-
-                B = build_bragg_matrix_gpu(
-                    bragg_table=bragg_table,
-                    rotations=rotations,
-                    beam_angles_deg=beam_angles,
-                    lam=lam,
-                    sig=sigma_grid,
-                    e0=e0,
-                    pulse_tail_fn=pulse_tail_fn,
-                    edge_blur_scale=edge_blur_scale,
-                    ctx=ctx,
-                    queue=queue,
-                )
-
-            else:
-
-                B = build_bragg_matrix_cpu(
-                    bragg_table=bragg_table,
-                    rotations=rotations,
-                    beam_angles_deg=beam_angles,
-                    lam=lam,
-                    sig=sigma_grid,
-                    e0=e0,
-                    pulse_tail_fn=pulse_tail_fn,
-                    edge_blur_scale=edge_blur_scale,
-                ).astype(np.float32)
-
-        else:
-
-            # --------------------------------------------------------------
-            # Quadrature implementation.
-            # --------------------------------------------------------------
-
-            if N_quad <= 0:
-                raise ValueError(
-                    "N_quad must be positive."
-                )
-
-            if sigma_distance is None:
-                raise ValueError(
-                    "sigma_distance must be provided when "
-                    "N_quad is specified."
-                )
-
-            if sigma_distance <= 0:
-                raise ValueError(
-                    "sigma_distance must be positive."
-                )
-
-            # --------------------------------------------------------------
-            # Generate quadrature orientations around every grid point.
-            #
-            # Normalized weights are used so that the result is an average
-            # over each local SO(3) ball and therefore remains on the same
-            # scale as the original B matrix.
-            # --------------------------------------------------------------
-
-            grid_mats = rotations.as_matrix()
-
-            quad_rots, weights = sample_so3_ball_quadrature(
-                rotations=grid_mats,
-                radius=sigma_distance,
-                n_samples=N_quad,
-                normalize_weights=True,
-            )
-
-            B = build_bragg_matrix_quadrature(
-                bragg_table=bragg_table,
-                quad_rots=quad_rots,
-                weights=weights,
-                K=N_orient,
-                beam_angles_deg=beam_angles,
-                lam=lam,
-                sig=1.2*sigma_distance/N_quad**(1/3),
-                e0=e0,
-                pulse_tail_fn=pulse_tail_fn,
-                edge_blur_scale=edge_blur_scale,
-                use_gpu=use_gpu,
-                ctx=ctx,
-                queue=queue,
-                quadrature_memory_gb=quadrature_memory_gb,
-            )
-
-            del quad_rots
-            del weights
+        B = bragg_edge_matrix(material, rotations, beam_angles, lam, sigma_grid, e0=e0,
+                              pulse_tail_fn=pulse_tail_fn, edge_blur_scale=edge_blur_scale, h_max=h_max,
+                              threshold=threshold, use_gpu=use_gpu, ctx=ctx, queue=queue, N_quad=N_quad,
+                              sigma_distance=sigma_distance, quadrature_memory_gb=quadrature_memory_gb)
 
         # --- powder (texture-free) column ---
         K = N_orient
