@@ -39,6 +39,42 @@ So with the companion repositories' integration, a ring scales as m |F|^2 / sin^
 The factors are relative: one global scale (beam intensity, exposure, detector efficiency, voxel volume) remains
 and is absorbed in the reconstructed coefficients. The lambda^3 / V_cell^2 factor makes the coefficients of
 different phases comparable (volume fractions).
+
+Fitting
+-------
+Two ways to use the prediction, both after the preprocessing below:
+
+* One phase: multiply the data of every ring by ring_scale_factors(material, wavelength_A, model) (1 / predicted
+  ring intensity) and reconstruct with the ring-normalised operator (normalized=True). Every ring then weighs about
+  equally in the fit, as with the usual normalisation by the measured ring totals, but the ratios between the rings are
+  the physical ones. Dividing by the measured totals instead removes from every ring its texture factor (how much of
+  that ring's pole figure the rotation sweeps through the detector), which the texture model then cannot reproduce.
+  Al1050 (15 % deformed), same basis, weights and solver; per-ring scale between data and fitted model (rms) and
+  relative residual: background-subtracted data, structure factors 0.96-1.03 (2 %), 0.255; measured totals 0.76-2.3
+  (29 %), 0.354. Data with background: structure factors 0.92-1.17 (7 %), 0.276; totals 0.61-1.30 (21 %), 0.329.
+  Simulated data: +-2-5 % vs +-7-13 %. The orientation maps hardly change (dominant orientation equal in > 94 % of
+  the voxels, density correlation > 0.94): the support of the peaks decides the orientations.
+* Several phases, or coefficients in absolute units: normalized=False with this intensity_model; the operator
+  multiplies ring r by ring_intensities(...) and the coefficients of different phases share one scale. Rings then
+  weigh by their intensity in a least-squares fit; per-segment weights can compensate.
+
+Preprocessing that unnormalised intensities need (with normalised rings the errors mostly cancel; here they do not):
+
+* Background. Under the rings lies the incoherent (Compton) and thermal diffuse scattering of the sample itself, plus
+  air scattering. Its share of a ring window grows steeply with q, because the diffuse scattering grows with q while
+  Bragg intensity falls (form factor, Debye-Waller, Lorentz). On Al1050 at 35 keV it was 4 % of the 111 window and
+  70 % of the outermost window, 70-88 % of it from the sample, and its level matched Compton + thermal diffuse
+  scattering of Al without a free parameter (within 0.9-1.9x). Subtract it per data point in the reduction, e.g.
+  linearly in 2theta between narrow bands at the two edges of each ring window. Left in, it inflates the outer rings
+  (+12-16 % on Al1050), biases a fitted Debye-Waller factor low and acts as a uniform orientation component in the
+  reconstruction (per-voxel texture 20 % less sharp).
+* Detector coverage. Segments (eta bin x ring window) partly off the detector or in module gaps hold only part of
+  their intensity: give them zero weight (diffractom.utils.segment_coverage).
+* Debye-Waller factor: set it (Material.set_displacement) if the CIF has no displacement parameters; the outer rings
+  depend on it (Al at room temperature: B = 0.85 A^2).
+* Form factors: the simulated data of the companion repository were rendered with xfab's form factor table, whose
+  constant term is one electron low for Al (and wrong for several other elements); Material.anomalous = {"Al": (-1, 0)}
+  reproduces it.
 """
 from __future__ import annotations
 
@@ -117,7 +153,38 @@ def reflection_intensities(material, wavelength_A: float, model=None) -> np.ndar
     return out
 
 
+def group_reflections_into_rings(material, rtol=1e-6):
+    """
+    Group the reflections of a material into rings of equal two-theta, sorted
+    by increasing two-theta. Returns a list with, per ring, the indices of its
+    reflections, e.g. [[0], [1], ..., [9, 10], ...] when (333) and (511) share a ring.
+    """
+    tt = np.asarray(material.reflections["two_theta"], dtype=np.float64)
+    rings = []
+    for i in np.argsort(tt, kind="stable"):
+        if rings and np.isclose(tt[i], tt[rings[-1][0]], rtol=rtol, atol=0.0):
+            rings[-1].append(int(i))
+        else:
+            rings.append([int(i)])
+    return rings
+
+
 def ring_intensities(material, rings, wavelength_A: float, model=None) -> np.ndarray:
-    """Per ring (lists of reflection indices, as group_reflections_into_rings), the summed reflection_intensities."""
+    """Per ring (lists of reflection indices, as group_reflections_into_rings; None: the material's rings, as the
+    operator groups them), the summed reflection_intensities."""
+    if rings is None:
+        rings = group_reflections_into_rings(material)
     I = reflection_intensities(material, wavelength_A, model)
     return np.array([I[list(r)].sum() for r in rings])
+
+
+def ring_scale_factors(material, wavelength_A: float, model=None, rings=None) -> np.ndarray:
+    """Factors that put the measured rings on a common scale with physical ring ratios: 1 / ring_intensities,
+    normalised to a geometric mean of 1. Multiply the data of ring r by factor[r] (data[..., r] for data shaped
+    (N_Omega, My, N_eta, N_rings)) and use the ring-normalised operator (normalized=True), instead of dividing every
+    ring by its measured total (see "Fitting" in the module docstring)."""
+    s = ring_intensities(material, rings, wavelength_A, model)
+    if not np.all(np.isfinite(s)) or np.any(s <= 0):
+        raise ValueError("ring intensities are not all finite and positive (material without an atomic basis?)")
+    f = 1.0 / s
+    return f / np.exp(np.mean(np.log(f)))

@@ -174,3 +174,24 @@ def test_intensity_model_factors():
     np.testing.assert_allclose(IntensityModel(lorentz="none", data="none").factor(tt), 1.0)
     with pytest.raises(ValueError):
         IntensityModel(data="mean")
+
+
+def test_ring_intensities_and_scale_factors():
+    from diffractom.crystallography import group_reflections_into_rings, ring_intensities, ring_scale_factors
+    from diffractom.crystallography.intensity import IntensityModel, reflection_intensities
+    al = Material.from_sites([("Al", 0, 0, 0, 1.0, 0.0108)], a=4.0495, space_group="F m -3 m",
+                             wavelength_A=WAVELENGTH, min_two_theta=0.02, max_two_theta=0.6)
+    model = IntensityModel(data="q_bin_mean")
+    rings = group_reflections_into_rings(al)
+    assert any(len(r) == 2 for r in rings)                 # (333) and (511) share a ring
+    s = ring_intensities(al, None, WAVELENGTH, model)
+    I = reflection_intensities(al, WAVELENGTH, model)
+    np.testing.assert_allclose(s, [I[r].sum() for r in rings])
+    f = ring_scale_factors(al, WAVELENGTH, model)
+    np.testing.assert_allclose(f * s, (f * s)[0])
+    np.testing.assert_allclose(np.exp(np.mean(np.log(f))), 1.0)
+    bare = Material.from_lattice_parameters(a=4.0495, b=4.0495, c=4.0495, alpha=90, beta=90, gamma=90,
+                                            symmetry_group="cubic", wavelength_A=WAVELENGTH,
+                                            min_two_theta=0.02, max_two_theta=0.6)
+    with pytest.raises(ValueError):
+        ring_scale_factors(bare, WAVELENGTH, model)

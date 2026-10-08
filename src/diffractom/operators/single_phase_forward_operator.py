@@ -9,7 +9,8 @@ import gratopy
 from pyclblast import gemmStridedBatched
 from ..utils.grid import Grid
 from ..crystallography.material import Material
-from ..crystallography.intensity import as_intensity_model, reflection_intensities, ring_intensities
+from ..crystallography.intensity import (as_intensity_model, group_reflections_into_rings,  # noqa: F401
+                                         reflection_intensities, ring_intensities)
 from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
 from .pf_kernels import build_all_opencl
@@ -1388,23 +1389,6 @@ class SinglePhaseForwardOperator:
         )
 
 
-
-
-
-def group_reflections_into_rings(material, rtol=1e-6):
-    """
-    Group the reflections of a material into rings of equal two-theta, sorted
-    by increasing two-theta. Returns a list with, per ring, the indices of its
-    reflections, e.g. [[0], [1], ..., [9, 10], ...] when (333) and (511) share a ring.
-    """
-    tt = np.asarray(material.reflections["two_theta"], dtype=np.float64)
-    rings = []
-    for i in np.argsort(tt, kind="stable"):
-        if rings and np.isclose(tt[i], tt[rings[-1][0]], rtol=rtol, atol=0.0):
-            rings[-1].append(int(i))
-        else:
-            rings.append([int(i)])
-    return rings
 
 
 
