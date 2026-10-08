@@ -52,8 +52,8 @@ Two ways to use the prediction, both after the preprocessing below:
   Al1050 (15 % deformed), same basis, weights and solver; per-ring scale between data and fitted model (rms) and
   relative residual: background-subtracted data, structure factors 0.96-1.03 (2 %), 0.255; measured totals 0.76-2.3
   (29 %), 0.354. Data with background: structure factors 0.92-1.17 (7 %), 0.276; totals 0.61-1.30 (21 %), 0.329.
-  Simulated data: +-2-5 % vs +-7-13 %. The orientation maps hardly change (dominant orientation equal in > 94 % of
-  the voxels, density correlation > 0.94): the support of the peaks decides the orientations.
+  Simulated data: +-3-6 % vs +-10-14 %. The orientation maps hardly change (dominant orientation within 1 deg in
+  > 93 % of the voxels, density correlation > 0.94): the support of the peaks decides the orientations.
 * Several phases, or coefficients in absolute units: normalized=False with this intensity_model; the operator
   multiplies ring r by ring_intensities(...) and the coefficients of different phases share one scale. Rings then
   weigh by their intensity in a least-squares fit; per-segment weights can compensate.
