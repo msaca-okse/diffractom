@@ -230,13 +230,14 @@ class SinglePhaseForwardOperator:
                 image_width=self.Nx,
                 detector_width=self.My,
                 detector_shift=self.cor_offset,
-                angle_weights=delta,
+                angle_weights=abs(delta),
                 max_gb=fft_max_gb,
             )
             self.PS = None
         elif projector == "native":
             # angle weight = angular width of a projection (for a 180 degree range this
-            # equals gratopy's default weights, so both projectors agree)
+            # equals gratopy's default weights, so both projectors agree); positive also when
+            # the angles decrease (angle_range[1] < angle_range[0]), else the adjoint changes sign
             self.radon = ParallelRadon(
                 self.queue,
                 (self.Nx, self.Ny),
@@ -245,7 +246,7 @@ class SinglePhaseForwardOperator:
                 image_width=self.Nx,
                 detector_width=self.My,
                 detector_shift=self.cor_offset,
-                angle_weights=delta,
+                angle_weights=abs(delta),
                 bins_per_item=3,
             )
             self.PS = None
