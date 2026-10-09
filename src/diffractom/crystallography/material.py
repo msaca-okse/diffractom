@@ -396,6 +396,8 @@ class Material:
             self.crystal_system = _infer_crystal_system(a, b, c, alpha, beta, gamma)
         self._A = _lattice_matrix_from_params(a, b, c, alpha, beta, gamma)
         self._B = reciprocal_lattice(self._A)
+        if self._sym_op_strings:                       # a new cell (set_lattice): Laue rotations in its frame
+            self._laue_rotations = _laue_rotations_cartesian(self._sym_op_strings, self._A)
 
     def _normalise_crystal_system(self) -> str:
         sys = (self.crystal_system or 'triclinic').lower()

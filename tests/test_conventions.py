@@ -60,3 +60,40 @@ def test_monoclinic_laue_orthogonal():
     assert L is not None and len(L) == 2
     two = [m for m in L if not np.allclose(m, np.eye(3))][0]
     np.testing.assert_allclose(two, np.diag([-1, 1, -1]), atol=1e-9)                  # 2-fold along b = y
+
+
+def test_set_lattice_updates_laue_rotations(tmp_path):
+    from diffractom import Material
+    cif = tmp_path / "q.cif"
+    cif.write_text("""data_q
+_cell_length_a 4.9
+_cell_length_b 4.9
+_cell_length_c 5.4
+_cell_angle_alpha 90
+_cell_angle_beta 90
+_cell_angle_gamma 120
+_symmetry_space_group_name_H-M 'P 32 2 1'
+loop_
+_symmetry_equiv_pos_as_xyz
+x,y,z
+-y,x-y,z+2/3
+-x+y,-x,z+1/3
+y,x,-z
+x-y,-y,-z+1/3
+-x,-x+y,-z+2/3
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_occupancy
+_atom_site_U_iso_or_equiv
+Si Si 0.4697 0.0 0.0 1.0 0.0078
+""")
+    m = Material()
+    m.load_cif(str(cif))
+    m.set_lattice(4.95, 4.95, 5.45, 90, 90, 120)
+    A = _lattice_matrix_from_params(4.95, 4.95, 5.45, 90, 90, 120)
+    assert canon(m._laue_rotations) == canon(_laue_rotations_cartesian(m._sym_op_strings, A))
+    assert canon(m._laue_rotations) == canon([r.as_matrix() for r in pg.trigonal])
