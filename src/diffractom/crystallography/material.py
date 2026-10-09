@@ -73,22 +73,36 @@ def _lattice_matrix_from_params(a: float, b: float, c: float,
                                  alpha: float, beta: float, gamma: float) -> np.ndarray:
     """3×3 direct lattice matrix A where A[:, i] is the i-th lattice vector (Å).
 
-    Convention (IUCr standard):
-        a-vector along x
-        b-vector in the xy-plane
-        c-vector defined by (alpha, beta, gamma)
+    Crystal Cartesian frame of ImageD11 (Busing & Levy 1967, eq. 3; ImageD11.unitcell.B):
+        a* (reciprocal) along x
+        b* in the xy-plane
+        c along z
+    so orientation matrices U (crystal -> sample) are the same as ImageD11's. For a cell with all angles 90°
+    this is a along x, b along y, c along z (built directly, as before).
     """
-    ar = np.deg2rad(alpha)
-    br = np.deg2rad(beta)
-    gr = np.deg2rad(gamma)
-    A = np.zeros((3, 3))
-    A[:, 0] = [a, 0.0, 0.0]
-    A[:, 1] = [b * np.cos(gr), b * np.sin(gr), 0.0]
-    cx = c * np.cos(br)
-    cy = c * (np.cos(ar) - np.cos(br) * np.cos(gr)) / np.sin(gr)
-    cz_sq = max(0.0, c*c - cx*cx - cy*cy)
-    A[:, 2] = [cx, cy, np.sqrt(cz_sq)]
-    return A
+    if alpha == 90.0 and beta == 90.0 and gamma == 90.0:
+        ar = np.deg2rad(alpha)
+        br = np.deg2rad(beta)
+        gr = np.deg2rad(gamma)
+        A = np.zeros((3, 3))
+        A[:, 0] = [a, 0.0, 0.0]
+        A[:, 1] = [b * np.cos(gr), b * np.sin(gr), 0.0]
+        cx = c * np.cos(br)
+        cy = c * (np.cos(ar) - np.cos(br) * np.cos(gr)) / np.sin(gr)
+        A[:, 2] = [cx, cy, np.sqrt(max(0.0, c * c - cx * cx - cy * cy))]
+        return A
+    ca, cb, cg = (np.cos(np.deg2rad(x)) for x in (alpha, beta, gamma))
+    g = np.array([[a * a, a * b * cg, a * c * cb],
+                  [a * b * cg, b * b, b * c * ca],
+                  [a * c * cb, b * c * ca, c * c]])                 # metric tensor
+    gi = np.linalg.inv(g)
+    astar, bstar, cstar = np.sqrt(np.diag(gi))
+    cos_bs = gi[0, 2] / (astar * cstar)
+    cos_gs = gi[0, 1] / (astar * bstar)
+    B = np.array([[astar, bstar * cos_gs, cstar * cos_bs],
+                  [0.0, bstar * np.sqrt(1 - cos_gs ** 2), -cstar * np.sqrt(1 - cos_bs ** 2) * ca],
+                  [0.0, 0.0, 1.0 / c]])                           # columns a*, b*, c* (no 2 pi)
+    return np.linalg.inv(B).T
 
 
 def _lattice_params_from_matrix_rows(M: np.ndarray):

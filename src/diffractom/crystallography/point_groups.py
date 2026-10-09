@@ -39,16 +39,16 @@ cyclic_3 = (
     R.from_matrix([[-0.5, -np.sqrt(3)/2, 0], [np.sqrt(3)/2, -0.5, 0], [0, 0, 1]]),  # 240 deg [001]
 )
 
-# D3
+# D3 (321: 2-fold axes along the a axes, which lie at -30, 90 and 210 deg from x in the ImageD11 /
+# Busing-Levy crystal frame used by Material: a* along x, c along z). 622 below is the same in both frames.
 trigonal = (
     R.from_matrix([[1, 0, 0], [0, 1, 0], [0, 0, 1]]),  # I
     R.from_matrix([[-0.5, np.sqrt(3)/2, 0], [-np.sqrt(3)/2, -0.5, 0], [0, 0, 1]]),  # 120 deg [001]
     R.from_matrix([[-0.5, -np.sqrt(3)/2, 0], [np.sqrt(3)/2, -0.5, 0], [0, 0, 1]]),  # 240 deg [001]
 
-    R.from_matrix([[1, 0, 0], [0, -1, 0], [0, 0, -1]]),  # 180 deg [100]
-    R.from_matrix([[-0.5, np.sqrt(3)/2, 0], [np.sqrt(3)/2, 0.5, 0], [0, 0, -1]]),  # 180 deg [1, sqrt(3), 0]
-    R.from_matrix([[-0.5, -np.sqrt(3)/2, 0], [-np.sqrt(3)/2, 0.5, 0], [0, 0, -1]]),
-    # 180 deg [1, -sqrt(3), 0]
+    R.from_matrix([[0.5, -np.sqrt(3)/2, 0], [-np.sqrt(3)/2, -0.5, 0], [0, 0, -1]]),  # 180 deg [sqrt(3), -1, 0] (a1)
+    R.from_matrix([[0.5, np.sqrt(3)/2, 0], [np.sqrt(3)/2, -0.5, 0], [0, 0, -1]]),  # 180 deg [sqrt(3), 1, 0]
+    R.from_matrix([[-1, 0, 0], [0, 1, 0], [0, 0, -1]]),  # 180 deg [010] (a2)
 )
 
 # C4

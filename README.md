@@ -21,6 +21,11 @@ deformed samples, where the spots merge into rings.
   Radon transform then sums the pixels along the beam at every translation.
 - **Inverse problem.** FISTA solves for non-negative coefficients with a Huber or least-squares data term,
   optionally with ℓ1 or total-variation regularisation and per-segment data weights.
+- **Crystal frame.** Orientation matrices U map the crystal Cartesian frame to the sample frame, with the
+  crystal frame of ImageD11 (Busing & Levy: a* along x, b* in the xy-plane, c along z), so U from ImageD11
+  indexing can be used directly. Before version 0.3 diffractom put a along x, which differs for hexagonal,
+  trigonal, monoclinic and triclinic cells (by 30° about c for hexagonal ones); cubic, tetragonal and
+  orthorhombic results are unchanged.
 - **Scale.** The pole-figure matrix is stored sparse, or generated on the fly when it does not fit in GPU
   memory. Large grids use a Fourier-slice projector. The coefficients can stay in host memory and be
   streamed through the GPU, so the number of orientations and pixels is not limited by GPU memory.
