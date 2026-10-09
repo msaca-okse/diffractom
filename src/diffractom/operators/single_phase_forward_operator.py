@@ -9,6 +9,8 @@ import gratopy
 from pyclblast import gemmStridedBatched
 from ..utils.grid import Grid
 from ..crystallography.material import Material
+from ..crystallography.intensity import (as_intensity_model, group_reflections_into_rings,  # noqa: F401
+                                         reflection_intensities, ring_intensities)
 from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
 from .pf_kernels import build_all_opencl
@@ -52,6 +54,7 @@ class SinglePhaseForwardOperator:
         fft_max_gb: float = 1.5,
         reserve_coefficient_arrays: int = 3,
         pf_cutoff_sigma: float | None = 3.0,
+        intensity_model=None,
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -70,7 +73,14 @@ class SinglePhaseForwardOperator:
         verbose : bool
             Print buffer allocation summary.
         normalized : bool
-            If True, skip intensity scaling of the PF matrix.
+            If True, every ring has the same weight (the data are normalised per ring). If False, each ring is
+            scaled by its integrated intensity predicted from the structure factors (the material needs an atomic
+            basis: Material.from_cif or Material.from_sites), see crystallography/intensity.py.
+        intensity_model : IntensityModel, dict or None
+            With normalized=False: the Lorentz factor and the data-reduction convention of the measured ring
+            intensities (crystallography.intensity.IntensityModel; default: rotation scan, data = polarisation-
+            corrected counts per ring window). The companion repositories' pyFAI integration (means in q bins,
+            summed over the ring window) is ``{"data": "q_bin_mean"}``.
         ctx, queue : optional
             Existing OpenCL context/queue; created automatically if None.
         pf_mode : {"auto", "sparse", "generated", "dense"}
@@ -164,6 +174,7 @@ class SinglePhaseForwardOperator:
         # Keyword arguments override cfg values (e.g. N_Omega=50 overrides cfg['N_Omega'])
         self.cfg = {**cfg, **kwargs}
         self.normalized = normalized
+        self.intensity_model = as_intensity_model(intensity_model)
         self.material = material
         self.grid = grid
         self.verbose = verbose
@@ -362,9 +373,20 @@ class SinglePhaseForwardOperator:
         self.h_cpu = np.asarray(self.material.h_vecs, dtype=np.float32)[first].copy(order="C")
         self.h_gpu_normed = clarray.to_device(self.queue, self.h_cpu_normed)
 
-        intensities = np.asarray(self.material.intensities(), dtype=np.float64)
-        self.intens_cpu = np.array([intensities[refl].sum() for refl in self.ring_reflections],
-                                   dtype=np.float32)
+        if self.normalized:
+            self.intens_cpu = np.ones(len(self.ring_reflections), dtype=np.float32)
+        else:
+            wavelength = 12.398 / float(self.cfg["energy"])
+            ring_I = ring_intensities(self.material, self.ring_reflections, wavelength, self.intensity_model)
+            if not np.all(np.isfinite(ring_I)) or np.any(ring_I <= 0):
+                raise ValueError(
+                    "normalized=False needs the ring intensities predicted from structure factors, but the material "
+                    "has no atomic basis or a ring has zero intensity. Build it with Material.from_cif or "
+                    "Material.from_sites (or use normalized=True).")
+            self.intens_cpu = ring_I.astype(np.float32)
+            if self.verbose:
+                print("ring intensities (relative to the strongest): "
+                      + " ".join(f"{v:.3f}" for v in ring_I / ring_I.max()))
         self.intens_gpu = clarray.to_device(self.queue, self.intens_cpu)
 
         self.sym_ops_cpu = np.asarray(self.material.point_group_matrices, dtype=np.float32, order="C")
@@ -423,6 +445,11 @@ class SinglePhaseForwardOperator:
         sym = np.asarray(self.material.point_group_matrices, dtype=np.float64).reshape(-1, 3, 3)
         multiplicity = np.asarray(self.material.reflections["multiplicity"], dtype=np.float64)
         intensities = np.asarray(self.material.intensities(), dtype=np.float64)
+        if not self.normalized:
+            # family shares of a ring by their integrated intensity (m |F|^2; the Lorentz and data factors are the
+            # same within a ring)
+            intensities = reflection_intensities(self.material, 12.398 / float(self.cfg["energy"]),
+                                                 self.intensity_model)
 
         axes, counts, start = [], [], [0]
         self.ring_family_weights = []
@@ -1363,23 +1390,6 @@ class SinglePhaseForwardOperator:
         )
 
 
-
-
-
-def group_reflections_into_rings(material, rtol=1e-6):
-    """
-    Group the reflections of a material into rings of equal two-theta, sorted
-    by increasing two-theta. Returns a list with, per ring, the indices of its
-    reflections, e.g. [[0], [1], ..., [9, 10], ...] when (333) and (511) share a ring.
-    """
-    tt = np.asarray(material.reflections["two_theta"], dtype=np.float64)
-    rings = []
-    for i in np.argsort(tt, kind="stable"):
-        if rings and np.isclose(tt[i], tt[rings[-1][0]], rtol=rtol, atol=0.0):
-            rings[-1].append(int(i))
-        else:
-            rings.append([int(i)])
-    return rings
 
 
 

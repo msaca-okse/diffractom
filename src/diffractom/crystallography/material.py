@@ -6,13 +6,14 @@ class so that all operators work without modification.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 
-from .cif_parser import parse_cif, _parse_sym_op
-from .form_factors import form_factor_array
+from .cif_parser import parse_cif, _parse_sym_op, _ops_from_space_group, expand_asymmetric_unit
+from .form_factors import element_symbol, form_factor_array
 from .lattice import reciprocal_lattice
 from . import point_groups
 from .space_group_centering import resolve_space_group, centering_of, satisfies_centering_condition
@@ -166,6 +167,7 @@ _REFLECTION_DTYPE = np.dtype([
     ('d_spacing',     'f8'),
     ('two_theta',     'f8'),
     ('intensity',     'f8'),
+    ('sf_squared',    'f8'),   # |F|^2 of one reflection of the family, electrons^2, with Debye-Waller; NaN if unknown
 ])
 
 
@@ -219,46 +221,60 @@ def _resolve_inputs(
 # Structure-factor computation (vectorised)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _xray_sf_sq(hkl_arr: np.ndarray, q_vals: np.ndarray,
-                basis_frac: np.ndarray, elements: list,
-                occupancies: np.ndarray) -> np.ndarray:
-    """Compute |F(hkl)|² for each reflection using Cromer-Mann form factors.
+def _xray_structure_factor(hkl_arr: np.ndarray, q_vals: np.ndarray, basis_frac: np.ndarray, elements: list,
+                           occupancies: np.ndarray, uiso: np.ndarray | None = None,
+                           anomalous: dict | None = None) -> np.ndarray:
+    """Complex X-ray structure factor F(hkl) of the unit cell, in electrons.
 
-    Parameters
-    ----------
-    hkl_arr    : (N, 3) int
-    q_vals     : (N,) float — |G| in Å⁻¹ (physics, with 2π)
-    basis_frac : (M, 3) float — fractional coordinates of all basis sites
-    elements   : list of M element symbols
-    occupancies: (M,) float — site occupancies
+        F(h) = sum_j occ_j (f0_j(s) + f'_j + i f''_j) exp(-8 pi^2 U_j s^2) exp(2 pi i h . x_j),   s = sin(theta)/lambda
 
-    Returns
-    -------
-    (N,) float — |F(hkl)|²
+    hkl_arr (N, 3); q_vals (N,) = |G| in Å⁻¹ (with 2π); basis_frac (M, 3) all sites of the cell; elements (M,);
+    occupancies (M,); uiso (M,) isotropic displacement U in Å² (NaN or None: no Debye-Waller factor);
+    anomalous {element: (f', f'')} (default none).
     """
-    N, M = len(hkl_arr), len(elements)
-    if N == 0 or M == 0:
-        return np.ones(max(N, 1))
-
+    hkl_arr = np.asarray(hkl_arr, dtype=float)
+    q_vals = np.asarray(q_vals, dtype=float)
     occupancies = np.asarray(occupancies, dtype=float)
-
-    # Form factor matrix (N, M): group by unique element to minimise evaluations
-    ff_matrix: np.ndarray = np.zeros((N, M))
-    _ff_cache: dict = {}
+    s2 = (q_vals / (4.0 * np.pi)) ** 2
+    u = np.zeros(len(elements)) if uiso is None else np.nan_to_num(np.asarray(uiso, dtype=float), nan=0.0)
+    F = np.zeros(len(hkl_arr), dtype=complex)
+    if len(hkl_arr) == 0 or len(elements) == 0:
+        return F
+    anomalous = {} if anomalous is None else {element_symbol(k): v for k, v in anomalous.items()}
+    f_cache: dict = {}
     for j, elem in enumerate(elements):
-        if elem not in _ff_cache:
-            _ff_cache[elem] = form_factor_array(elem, q_vals)
-        ff_matrix[:, j] = _ff_cache[elem]
+        key = element_symbol(elem)
+        if key not in f_cache:
+            fp, fpp = anomalous.get(key, (0.0, 0.0))
+            f_cache[key] = form_factor_array(key, q_vals) + fp + 1j * fpp
+        phase = np.exp(2j * np.pi * (hkl_arr @ basis_frac[j]))
+        F += occupancies[j] * f_cache[key] * np.exp(-8.0 * np.pi ** 2 * u[j] * s2) * phase
+    return F
 
-    # Phase matrix (N, M): 2π (h·x_j + k·y_j + l·z_j)
-    phases = 2.0 * np.pi * (hkl_arr.astype(float) @ basis_frac.T)
 
-    # Weighted structure factor
-    w = occupancies * ff_matrix
-    re_F = np.sum(w * np.cos(phases), axis=1)
-    im_F = np.sum(w * np.sin(phases), axis=1)
-
-    return re_F**2 + im_F**2
+def _laue_rotations_cartesian(sym_op_strings: list[str], A: np.ndarray) -> np.ndarray | None:
+    """Proper rotations of the Laue group of a space group, as Cartesian matrices in the frame of the direct lattice
+    matrix A (columns = lattice vectors): R = A W A^-1 for every operation W (fractional), with -W for improper ones.
+    Returns (G, 3, 3), or None if the operations do not give orthogonal matrices (inconsistent cell)."""
+    Ainv = np.linalg.inv(A)
+    out, seen = [], set()
+    for op_str in sym_op_strings:
+        W = np.array([r[:3] for r in _parse_sym_op(op_str)], dtype=float)
+        if np.max(np.abs(W - np.rint(W))) > 0.1 or abs(abs(np.linalg.det(W)) - 1) > 1e-6:
+            continue
+        W = np.rint(W)
+        if np.linalg.det(W) < 0:
+            W = -W
+        R = A @ W @ Ainv
+        u, _, vt = np.linalg.svd(R)
+        Rc = u @ vt                                       # nearest orthogonal matrix (rounding in the cell)
+        if np.max(np.abs(R - Rc)) > 1e-3:
+            return None
+        key = tuple(np.round(Rc, 6).ravel())
+        if key not in seen:
+            seen.add(key)
+            out.append(Rc)
+    return np.array(out) if out else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,6 +339,15 @@ class Material:
         self._basis_frac:  np.ndarray | None = None   # (M, 3) fractional coords
         self._elements:    list | None = None          # M element symbols
         self._occupancies: np.ndarray | None = None   # (M,)
+
+        # Isotropic displacement U (Å²) per basis site (NaN: none given), anomalous dispersion {element: (f', f'')}
+        self._uiso:        np.ndarray | None = None
+        self.anomalous:    dict | None = None
+
+        # Laue-group proper rotations (Cartesian, crystal frame) from the space-group operations; used for the
+        # pole-figure symmetry instead of the crystal-system table when known
+        self._laue_rotations: np.ndarray | None = None
+        self._sym_op_strings: list[str] | None = None
 
         # Crystallographic HKL-space symmetry ops (from CIF sym_ops)
         # If set, these are used instead of Cartesian point-group matrices for
@@ -396,8 +421,50 @@ class Material:
             self._basis_frac  = cif['basis']
             self._elements    = cif['elements']
             self._occupancies = cif['occupancies']
+            self._uiso        = cif.get('uiso')
+            if self._uiso is not None and np.any(np.isnan(self._uiso)):
+                warnings.warn(f"{cif_path}: no displacement parameter (U/B) for some sites; their Debye-Waller "
+                              "factor is set to 1. Set Material.set_displacement() to override.", stacklevel=2)
         if cif.get('sym_ops'):
-            self._hkl_grouping_ops = _sym_ops_to_hkl_ops(cif['sym_ops'])
+            self._set_symmetry_operations(cif['sym_ops'])
+
+    def _set_symmetry_operations(self, sym_op_strings: list[str]) -> None:
+        """Reflection grouping (HKL-space Laue operations) and the Cartesian Laue rotations from the space-group
+        operations ('x,y,z' strings)."""
+        self._sym_op_strings = list(sym_op_strings)
+        self._hkl_grouping_ops = _sym_ops_to_hkl_ops(sym_op_strings)
+        if self._A is not None:
+            self._laue_rotations = _laue_rotations_cartesian(sym_op_strings, self._A)
+
+    def set_displacement(self, U: float | dict | None = None, B: float | dict | None = None) -> None:
+        """Set isotropic displacement parameters (Å²): one value for all sites, or {element: value}. Give U or B
+        (B = 8 pi^2 U). Recompute the reflections afterwards (compute_reflections)."""
+        if (U is None) == (B is None):
+            raise ValueError("Give exactly one of U and B.")
+        val, scale = (U, 1.0) if U is not None else (B, 1.0 / (8.0 * np.pi ** 2))
+        n = 0 if self._elements is None else len(self._elements)
+        if isinstance(val, dict):
+            val = {element_symbol(k): v for k, v in val.items()}
+            self._uiso = np.array([val.get(element_symbol(e), np.nan) * scale for e in self._elements])
+        else:
+            self._uiso = np.full(n, float(val) * scale)
+
+    @property
+    def volume(self) -> float:
+        """Unit-cell volume in Å³."""
+        self._compute_reciprocal_lattice_matrix()
+        return float(abs(np.linalg.det(self._A)))
+
+    def structure_factors(self, hkl, debye_waller: bool = True) -> np.ndarray:
+        """Complex X-ray structure factors F(hkl) of the unit cell (electrons), with the Debye-Waller factor of the
+        displacement parameters and the anomalous dispersion in self.anomalous. hkl: (N, 3)."""
+        if self._basis_frac is None or self._elements is None or len(self._elements) == 0:
+            raise RuntimeError("No atomic basis: build the material from a CIF (Material.from_cif) or with "
+                               "Material.from_sites to compute structure factors.")
+        hkl = np.atleast_2d(np.asarray(hkl, dtype=float))
+        q = np.linalg.norm(self._compute_reciprocal_lattice_matrix() @ hkl.T, axis=0)
+        return _xray_structure_factor(hkl, q, self._basis_frac, self._elements, self._occupancies,
+                                      self._uiso if debye_waller else None, self.anomalous)
 
     def set_neutron_sites(self, sites) -> None:
         """Set neutron scattering sites directly, without requiring element names.
@@ -483,6 +550,69 @@ class Material:
             intensity_cutoff_fraction=intensity_cutoff_fraction,
             global_intensity_norm=global_intensity_norm,
         )
+        return mat
+
+    # ------------------------------------------------------------------
+    # Factory: from an asymmetric unit and a space group (no CIF file)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_sites(
+        cls,
+        sites,
+        *,
+        a: float,
+        b: float | None = None,
+        c: float | None = None,
+        alpha: float = 90.0,
+        beta: float = 90.0,
+        gamma: float = 90.0,
+        space_group: str | int | None = None,
+        sym_ops: Sequence[str] | None = None,
+        name: str = 'material',
+        **reflection_kwargs,
+    ) -> 'Material':
+        """Build a material from its asymmetric unit, as a CIF would describe it.
+
+        sites : list of (element, x, y, z) or (element, x, y, z, occupancy) or (element, x, y, z, occupancy, U),
+            fractional coordinates, U the isotropic displacement in Å² (default 0: no Debye-Waller factor).
+        space_group : Hermann-Mauguin symbol (e.g. 'P 63/m m c', 'R -3 m:H') or number; its operations come from
+            gemmi (optional dependency). Or give sym_ops, a list of 'x,y,z' operation strings (incl. centring).
+        reflection_kwargs : as Material.from_cif (wavelength_A or energy_keV, and a 2theta or q range or hkl_list).
+        """
+        if sym_ops is None:
+            if space_group is None:
+                raise ValueError("Give space_group or sym_ops.")
+            symbol = space_group if isinstance(space_group, str) else None
+            number = space_group if not isinstance(space_group, str) else None
+            sym_ops = _ops_from_space_group(symbol, number)
+        mat = cls(name=name)
+        if isinstance(space_group, int):
+            mat.set_space_group(number=space_group)
+        elif isinstance(space_group, str):
+            mat.space_group_symbol = space_group
+        b_ = a if b is None else b
+        c_ = a if c is None else c
+        mat._setup_lattice(float(a), float(b_), float(c_), float(alpha), float(beta), float(gamma))
+        asym = []
+        for site in sites:
+            elem, x, y, z = site[:4]
+            occ = float(site[4]) if len(site) > 4 else 1.0
+            u = float(site[5]) if len(site) > 5 else 0.0
+            asym.append({'sym': element_symbol(elem), 'fx': float(x), 'fy': float(y), 'fz': float(z), 'occ': occ,
+                         'uiso': u, 'label': elem})
+        basis, elements, occ, uiso, _ = expand_asymmetric_unit(asym, list(sym_ops))
+        mat._basis_frac = np.array(basis, dtype=float)
+        mat._elements = elements
+        mat._occupancies = np.array(occ, dtype=float)
+        mat._uiso = np.array(uiso, dtype=float)
+        mat._set_symmetry_operations(list(sym_ops))
+        q_lo, q_hi, lam = _resolve_inputs(**{k: reflection_kwargs.get(k) for k in (
+            'energy_kev', 'wavelength_A', 'energy_keV', 'min_two_theta', 'max_two_theta', 'q_min', 'q_max',
+            'hkl_list')})
+        mat.compute_reflections(q_min=q_lo, q_max=q_hi, wavelength_A=lam, hkl_list=reflection_kwargs.get('hkl_list'),
+                                intensity_cutoff_fraction=reflection_kwargs.get('intensity_cutoff_fraction', 0.0),
+                                global_intensity_norm=reflection_kwargs.get('global_intensity_norm'))
         return mat
 
     # ------------------------------------------------------------------
@@ -957,8 +1087,8 @@ class Material:
             self._elements   is not None and len(self._elements) > 0
         )
         if has_basis:
-            sf_sq = _xray_sf_sq(hkl_arr, q_fam,
-                                 self._basis_frac, self._elements, self._occupancies)
+            sf_sq = np.abs(_xray_structure_factor(hkl_arr, q_fam, self._basis_frac, self._elements,
+                                                  self._occupancies, self._uiso, self.anomalous)) ** 2
             raw_I = mults.astype(float) * sf_sq
         else:
             # Atom positions unknown — intensity cannot be predicted.
@@ -986,6 +1116,9 @@ class Material:
             mask   = accessible & (intensities >= cutoff)
         else:
             mask   = accessible
+        if raw_I is not None:
+            # systematic absences (glides, screws, centring) are not rings
+            mask = mask & (sf_sq > 1e-8 * max(float(sf_sq.max()), 1e-300))
 
         if not np.any(mask):
             raise ValueError(
@@ -993,11 +1126,13 @@ class Material:
                 "Check intensity_cutoff_fraction, q range, or crystal system."
             )
 
+        sf_sq       = np.full(len(hkl_arr), np.nan) if sf_sq is None else sf_sq
         hkl_arr     = hkl_arr[mask]
         mults       = mults[mask]
         d_fam       = d_fam[mask]
         two_theta   = two_theta[mask]
         intensities = intensities[mask]
+        sf_sq       = sf_sq[mask]
 
         # Sort by 2θ (or by d descending if no wavelength)
         order = np.argsort(two_theta if wavelength_A is not None else -d_fam)
@@ -1006,6 +1141,7 @@ class Material:
         d_fam       = d_fam[order]
         two_theta   = two_theta[order]
         intensities = intensities[order]
+        sf_sq       = sf_sq[order]
 
         # ── 7. Store ──────────────────────────────────────────────────────────
         N = len(hkl_arr)
@@ -1015,6 +1151,7 @@ class Material:
         self.reflections['d_spacing']    = d_fam
         self.reflections['two_theta']    = two_theta
         self.reflections['intensity']    = intensities
+        self.reflections['sf_squared']   = sf_sq
 
         self.compute_h_vectors()
         self.attach_point_group()
@@ -1139,8 +1276,12 @@ class Material:
         
         rotations = point_group_map[system]
         permutations = point_group_map_permutation[system]
-        
-        mats = [r.as_matrix().astype(np.float32).reshape(-1) for r in rotations]
+
+        if self._laue_rotations is not None:
+            # the proper rotations of the Laue group of the actual space group (any setting)
+            mats = [r.astype(np.float32).reshape(-1) for r in self._laue_rotations]
+        else:
+            mats = [r.as_matrix().astype(np.float32).reshape(-1) for r in rotations]
         mats_permutations = [p.astype(np.float32).reshape(-1) for p in permutations]
 
         self.point_group_matrices = np.stack(mats, axis=0)

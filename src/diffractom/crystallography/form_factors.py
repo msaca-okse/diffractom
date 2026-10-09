@@ -213,44 +213,38 @@ _FORM_FACTOR_DATA: dict[str, tuple] = {
 import numpy as np
 
 
+def element_symbol(symbol: str) -> str:
+    """Normalise an element symbol: 'FE' -> 'Fe'; deuterium 'D' -> 'H'. Raises for unknown elements."""
+    key = symbol.strip().capitalize()
+    if key == "D":
+        key = "H"
+    if key not in _FORM_FACTOR_DATA:
+        raise ValueError(f"No X-ray form factor for element {symbol!r} (Cromer-Mann table, neutral atoms).")
+    return key
+
+
 def form_factor(symbol: str, q: float) -> float:
-    """Compute X-ray atomic form factor f(q) via the Cromer-Mann approximation.
+    """Compute X-ray atomic form factor f0(q) via the Cromer-Mann approximation.
 
     Parameters
     ----------
     symbol : str
-        Element symbol (case-insensitive, e.g. "Fe", "fe", "FE").
+        Element symbol (case-insensitive, e.g. "Fe", "fe", "FE"). Neutral atoms; ion charges are ignored by the
+        CIF reader (a good approximation except at the lowest q).
     q : float
         Magnitude of the scattering vector |G| in Å⁻¹ (physics convention: q = 2π/d).
 
     Returns
     -------
     float
-        Form factor f(q).  Falls back to atomic number approximation for unknown elements.
+        Form factor f0(q) in electrons. Raises ValueError for unknown elements.
     """
-    key = symbol.strip().capitalize()
-    data = _FORM_FACTOR_DATA.get(key)
-    if data is None:
-        # Fallback: crude approximation using the number of letters as a proxy.
-        # In practice this rarely happens for standard CIF files.
-        return 1.0
-
-    a_coefs, b_coefs, c = data
-    s2 = (q / (4.0 * np.pi)) ** 2   # (sin θ / λ)²
-    f = c
-    for ai, bi in zip(a_coefs, b_coefs):
-        f += ai * np.exp(-bi * s2)
-    return float(f)
+    return float(form_factor_array(symbol, np.array([q]))[0])
 
 
 def form_factor_array(symbol: str, q_arr: np.ndarray) -> np.ndarray:
-    """Vectorised form factor evaluation for a single element over many q values."""
-    key = symbol.strip().capitalize()
-    data = _FORM_FACTOR_DATA.get(key)
-    if data is None:
-        return np.ones(len(q_arr), dtype=float)
-
-    a_coefs, b_coefs, c = data
+    """Vectorised form factor evaluation for a single element over many q values (raises for unknown elements)."""
+    a_coefs, b_coefs, c = _FORM_FACTOR_DATA[element_symbol(symbol)]
     q_arr = np.asarray(q_arr, dtype=float)
     s2 = (q_arr / (4.0 * np.pi)) ** 2
     f = np.full_like(q_arr, c)

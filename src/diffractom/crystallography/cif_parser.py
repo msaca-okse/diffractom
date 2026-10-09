@@ -130,6 +130,99 @@ def _close_modulo(a: float, b: float, tol: float = 0.01) -> bool:
 # Main parser
 # ---------------------------------------------------------------------------
 
+_ANISO_U = ('11', '22', '33', '12', '13', '23')
+
+
+def _parse_aniso(loops) -> dict:
+    """Anisotropic displacements {label: (U11, U22, U33, U12, U13, U23)} in Å² from an aniso loop
+    (U_ij, or B_ij converted with B = 8π² U). Empty if the CIF has none."""
+    for loop in loops:
+        cols = loop['columns']
+        lab_keys = ('_atom_site_aniso_label', '_atom_site_aniso.label')
+        i_lab = next((cols.index(k) for k in lab_keys if k in cols), None)
+        if i_lab is None:
+            continue
+        for kind, scale in (('U', 1.0), ('B', 1.0 / (8.0 * np.pi ** 2))):
+            idx = []
+            for ij in _ANISO_U:
+                keys = (f'_atom_site_aniso_{kind}_{ij}', f'_atom_site_aniso.{kind}_{ij}')
+                idx.append(next((cols.index(k) for k in keys if k in cols), None))
+            if all(i is not None for i in idx):
+                out = {}
+                for row in loop['rows_tokens']:
+                    try:
+                        out[row[i_lab]] = tuple(_parse_cif_float(row[i]) * scale for i in idx)
+                    except (ValueError, IndexError):
+                        continue
+                return out
+    return {}
+
+
+def _u_equivalent(u6, cell) -> float:
+    """U_eq = (1/3) sum_ij U_ij a*_i a*_j (a_i . a_j) (Fischer & Tillmanns 1988) from the CIF U_ij."""
+    a, b, c, al, be, ga = cell
+    ca, cb, cg = np.cos(np.radians([al, be, ga]))
+    G = np.array([[a * a, a * b * cg, a * c * cb], [a * b * cg, b * b, b * c * ca], [a * c * cb, b * c * ca, c * c]])
+    astar = np.sqrt(np.diag(np.linalg.inv(G)))
+    U11, U22, U33, U12, U13, U23 = u6
+    U = np.array([[U11, U12, U13], [U12, U22, U23], [U13, U23, U33]])
+    return float(np.einsum('ij,i,j,ij->', U, astar, astar, G) / 3.0)
+
+
+def _ops_from_space_group(symbol, number) -> list:
+    """All symmetry operations (incl. centring) of a space group as 'x,y,z' strings, from gemmi."""
+    try:
+        import gemmi
+    except ImportError:
+        raise ValueError(
+            "The CIF lists no symmetry operations, only the space group "
+            f"({symbol or number}). Add the operations to the CIF, or install gemmi "
+            "(pip install gemmi) to generate them.") from None
+    sg = None
+    if symbol:
+        sg = gemmi.find_spacegroup_by_name(symbol)
+    if sg is None and number:
+        sg = gemmi.find_spacegroup_by_number(int(number))
+    if sg is None:
+        raise ValueError(f"Unknown space group {symbol or number}.")
+    return [op.triplet() for op in sg.operations()]
+
+
+def expand_asymmetric_unit(asym_atoms: list[dict], sym_ops: list[str]):
+    """Apply the symmetry operations ('x,y,z' strings) to the asymmetric unit (dicts with sym, fx, fy, fz, occ,
+    uiso, label) and keep one copy of every position in the cell (special positions deduplicated).
+    Returns (basis, elements, occupancies, uiso, labels) as lists."""
+    parsed_ops = [_parse_sym_op(op) for op in sym_ops]
+
+    basis_list:    list[list[float]] = []
+    elements_list: list[str]         = []
+    occ_list:      list[float]       = []
+    uiso_list:     list[float]       = []
+    label_list:    list[str]         = []
+
+    for atom in asym_atoms:
+        start = len(basis_list)
+        for op in parsed_ops:
+            pos = _apply_sym_op(op, atom['fx'], atom['fy'], atom['fz'])
+            mx = _mod1(pos[0])
+            my = _mod1(pos[1])
+            mz = _mod1(pos[2])
+
+            # duplicates only among the images of the same site (distinct sites may share a position: mixed
+            # occupancy)
+            is_dup = any(
+                _close_modulo(b[0], mx) and _close_modulo(b[1], my) and _close_modulo(b[2], mz)
+                for b in basis_list[start:]
+            )
+            if not is_dup:
+                basis_list.append([mx, my, mz])
+                elements_list.append(atom['sym'])
+                occ_list.append(atom['occ'])
+                uiso_list.append(atom.get('uiso', np.nan))
+                label_list.append(atom.get('label', atom['sym']))
+    return basis_list, elements_list, occ_list, uiso_list, label_list
+
+
 def parse_cif(path) -> dict:
     """Parse a CIF file.
 
@@ -149,6 +242,12 @@ def parse_cif(path) -> dict:
         basis           : np.ndarray  shape (N, 3)  fractional coordinates of full basis
         elements        : list[str]   — element symbol per site
         occupancies     : np.ndarray  shape (N,)
+        uiso            : np.ndarray  shape (N,) — isotropic displacement U (Å²) per site: U_iso, or B_iso / 8π²,
+                          or U_eq from anisotropic U_ij / B_ij; NaN where the CIF gives none
+        labels          : list[str]   — atom-site label per site
+
+    Symmetry: the operations listed in the CIF are used. A CIF without them but with a space-group symbol or
+    number is expanded with the operations from gemmi (optional dependency); without gemmi this raises.
     """
     text = Path(path).read_text(encoding='utf-8', errors='replace')
     lines = text.splitlines()
@@ -353,6 +452,8 @@ def parse_cif(path) -> dict:
     _FY_KEYS     = ('_atom_site_fract_y',       '_atom_site.fract_y')
     _FZ_KEYS     = ('_atom_site_fract_z',       '_atom_site.fract_z')
     _OCC_KEYS    = ('_atom_site_occupancy',     '_atom_site.occupancy')
+    _UISO_KEYS   = ('_atom_site_U_iso_or_equiv', '_atom_site.U_iso_or_equiv', '_atom_site_u_iso_or_equiv')
+    _BISO_KEYS   = ('_atom_site_B_iso_or_equiv', '_atom_site.B_iso_or_equiv', '_atom_site_b_iso_or_equiv')
 
     asym_atoms: list[dict] = []
 
@@ -371,6 +472,8 @@ def parse_cif(path) -> dict:
         i_fy    = _find_col(_FY_KEYS)
         i_fz    = _find_col(_FZ_KEYS)
         i_occ   = _find_col(_OCC_KEYS)
+        i_uiso  = _find_col(_UISO_KEYS)
+        i_biso  = _find_col(_BISO_KEYS)
 
         if i_label is None or i_fx is None:
             continue   # not an atom site loop
@@ -410,35 +513,41 @@ def parse_cif(path) -> dict:
                 except (ValueError, TypeError):
                     occ = 1.0
 
-            asym_atoms.append({'sym': elem, 'fx': fx, 'fy': fy, 'fz': fz, 'occ': occ})
+            # Isotropic displacement (U in Å²; B = 8π² U)
+            uiso = np.nan
+            for i_col, scale in ((i_uiso, 1.0), (i_biso, 1.0 / (8.0 * np.pi ** 2))):
+                if i_col is not None and i_col < len(row_toks) and np.isnan(uiso):
+                    try:
+                        uiso = _parse_cif_float(row_toks[i_col]) * scale
+                    except (ValueError, TypeError):
+                        pass
+
+            asym_atoms.append({'sym': elem, 'fx': fx, 'fy': fy, 'fz': fz, 'occ': occ, 'uiso': uiso,
+                               'label': label})
 
         if asym_atoms:
             break   # use first matching atom-site loop
 
     # --------------------------------------------------------------------------
+    # Anisotropic displacements -> U_eq (for sites without an isotropic value)
+    # --------------------------------------------------------------------------
+    aniso = _parse_aniso(loops)
+    if aniso:
+        ueq = {lab: _u_equivalent(u, (a, b, c, alpha, beta, gamma)) for lab, u in aniso.items()}
+        for atom in asym_atoms:
+            if np.isnan(atom['uiso']) and atom['label'] in ueq:
+                atom['uiso'] = ueq[atom['label']]
+
+    # --------------------------------------------------------------------------
+    # Symmetry operations from the space group, if the CIF lists none
+    # --------------------------------------------------------------------------
+    if sym_ops == ['x,y,z'] and (sg_symbol or sg_number):
+        sym_ops = _ops_from_space_group(sg_symbol, sg_number) or sym_ops
+
+    # --------------------------------------------------------------------------
     # Expand asymmetric unit via symmetry operations
     # --------------------------------------------------------------------------
-    parsed_ops = [_parse_sym_op(op) for op in sym_ops]
-
-    basis_list:    list[list[float]] = []
-    elements_list: list[str]         = []
-    occ_list:      list[float]       = []
-
-    for atom in asym_atoms:
-        for op in parsed_ops:
-            pos = _apply_sym_op(op, atom['fx'], atom['fy'], atom['fz'])
-            mx = _mod1(pos[0])
-            my = _mod1(pos[1])
-            mz = _mod1(pos[2])
-
-            is_dup = any(
-                _close_modulo(b[0], mx) and _close_modulo(b[1], my) and _close_modulo(b[2], mz)
-                for b in basis_list
-            )
-            if not is_dup:
-                basis_list.append([mx, my, mz])
-                elements_list.append(atom['sym'])
-                occ_list.append(atom['occ'])
+    basis_list, elements_list, occ_list, uiso_list, label_list = expand_asymmetric_unit(asym_atoms, sym_ops)
 
     # --------------------------------------------------------------------------
     # Material name
@@ -461,4 +570,6 @@ def parse_cif(path) -> dict:
         'basis':              np.array(basis_list, dtype=float) if basis_list else np.zeros((0, 3)),
         'elements':           elements_list,
         'occupancies':        np.array(occ_list, dtype=float) if occ_list else np.zeros(0),
+        'uiso':               np.array(uiso_list, dtype=float) if uiso_list else np.zeros(0),
+        'labels':             label_list,
     }

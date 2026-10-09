@@ -176,6 +176,33 @@ accept `prox_kind` values `"nonneg"`, `"l1"`, `"nonneg_l1"` and `"nonneg_tv"`
 translations, where zero weight excludes the segment. See
 [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) for the full API.
 
+### Ring intensities from structure factors
+
+With `normalized=True` the operator predicts every ring up to a scale, so the
+data are usually divided by their ring totals. A material built from a CIF file
+(any space group; `Material.from_cif`, or `Material.from_sites` for a list of
+atoms) also predicts the ring intensities: m |F|^2 with the Debye-Waller factor,
+the Lorentz factor of a rotation scan and a factor for how the data were reduced
+(`IntensityModel`; the theory is in `diffractom/crystallography/intensity.py`).
+For one phase, put the rings on their physical scale and keep the ring-normalised
+operator:
+
+```python
+from diffractom import IntensityModel
+from diffractom.crystallography import ring_scale_factors
+
+mat = Material.from_cif("aluminum.cif", wavelength_A=wavelength, hkl_list=hkl_list)
+mat.set_displacement(B=0.85)   # only if the CIF has no displacement parameters
+model = IntensityModel(data="q_bin_mean")   # pyFAI integrate2d means in q bins, summed per ring
+b = (data * ring_scale_factors(mat, wavelength, model)).reshape(N_Omega, My, N_eta * N_rings)
+```
+
+`normalized=False, intensity_model=model` instead multiplies every ring by its
+predicted intensity, so coefficients of different phases share one scale.
+Unnormalised intensities need the background under the rings removed in the
+data reduction and segments partly off the detector excluded
+(`diffractom.utils.segment_coverage`).
+
 ## License
 
 Apache License 2.0
