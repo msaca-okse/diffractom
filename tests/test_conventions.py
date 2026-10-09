@@ -97,3 +97,14 @@ Si Si 0.4697 0.0 0.0 1.0 0.0078
     A = _lattice_matrix_from_params(4.95, 4.95, 5.45, 90, 90, 120)
     assert canon(m._laue_rotations) == canon(_laue_rotations_cartesian(m._sym_op_strings, A))
     assert canon(m._laue_rotations) == canon([r.as_matrix() for r in pg.trigonal])
+
+
+@pytest.mark.parametrize("name", ["trigonal", "hexagonal", "cubic", "tetragonal"])
+def test_odf_grid_covers_fundamental_zone(name):
+    pytest.importorskip("orix")
+    from scipy.spatial.transform import Rotation
+    from diffractom import odf_basis as ob
+    sym = ob.symmetry_rotations(name)
+    q = ob.uniform_fundamental_zone(5.0, name)
+    d = ob.nearest_misorientation_deg(Rotation.random(2000, random_state=3).as_quat(), q, sym)
+    assert np.percentile(d, 99) < 4.2                      # trigonal in orix's frame without the rotation: 5.5

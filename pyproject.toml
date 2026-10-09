@@ -28,6 +28,8 @@ dependencies = [
 fft = ["pyvkfft"]
 # the example notebook (examples/example_diffractom_pipeline.ipynb)
 examples = ["h5py", "matplotlib", "orix", "notebook"]
+# the cubochoric orientation grid of odf_basis.uniform_fundamental_zone (method="random" needs nothing)
+odf = ["orix"]
 
 [project.urls]
 Repository = "https://github.com/msaca-okse/diffractom"

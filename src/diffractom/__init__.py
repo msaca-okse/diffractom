@@ -2,7 +2,7 @@
 
 from .crystallography.material import Material
 from .crystallography.intensity import IntensityModel
-from .utils.grid import Grid
+from .utils.grid import Grid, MatrixGrid
 from .utils.support import fov_support_mask
 from .operators.single_phase_forward_operator import SinglePhaseForwardOperator
 from .operators.multi_phase_forward_operator import MultiPhaseForwardOperator
@@ -28,6 +28,7 @@ __all__ = [
     "IntensityModel",
     "Material",
     "Grid",
+    "MatrixGrid",
     "fov_support_mask",
     "SinglePhaseForwardOperator",
     "MultiPhaseForwardOperator",
