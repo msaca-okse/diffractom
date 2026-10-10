@@ -56,6 +56,8 @@ class SinglePhaseForwardOperator:
         pf_cutoff_sigma: float | None = 3.0,
         intensity_model=None,
         sparse_batch_max: int = SPARSE_BATCH_MAX,
+        rings=None,
+        ring_two_theta=None,
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -82,6 +84,16 @@ class SinglePhaseForwardOperator:
             intensities (crystallography.intensity.IntensityModel; default: rotation scan, data = polarisation-
             corrected counts per ring window). The companion repositories' pyFAI integration (means in q bins,
             summed over the ring window) is ``{"data": "q_bin_mean"}``.
+        rings : list of (reflection indices, weights), optional
+            The data channels ("rings") as groups of the material's reflections, instead of the reflections with
+            the same two-theta. A channel is an integration window; weight = the fraction of the reflection's
+            peak profile inside the window (0..1). Reflections of a window add up with their structure-factor
+            intensities times the weight (normalized=False) or their multiplicities times the weight (True), so
+            peaks that share a window fully or partly, also of other phases (one operator per phase, summed), are
+            modelled. Default: group_reflections_into_rings(material), weights 1.
+        ring_two_theta : (N_rings,) array, optional
+            Two-theta (radians) at which a channel's detector directions are evaluated; default: the first
+            reflection's (the ring's). With ``rings``: the weighted mean of the window's reflections.
         ctx, queue : optional
             Existing OpenCL context/queue; created automatically if None.
         pf_mode : {"auto", "sparse", "generated", "dense"}
@@ -186,8 +198,18 @@ class SinglePhaseForwardOperator:
         self.grid = grid
         self.verbose = verbose
         self.N_eta = self.cfg['N_eta']
-        # reflections with the same two-theta form one ring (one data channel)
-        self.ring_reflections = group_reflections_into_rings(self.material)
+        # reflections with the same two-theta form one ring (one data channel), or the given windows
+        if rings is None:
+            self.ring_reflections = group_reflections_into_rings(self.material)
+            self.ring_overlap = [np.ones(len(r)) for r in self.ring_reflections]
+        else:
+            self.ring_reflections = [np.asarray(ix, dtype=np.int64) for ix, _ in rings]
+            self.ring_overlap = [np.asarray(w, dtype=np.float64) for _, w in rings]
+            if any(len(ix) == 0 or len(ix) != len(w) or np.any(w < 0) for ix, w in
+                   zip(self.ring_reflections, self.ring_overlap)):
+                raise ValueError("rings: every channel needs >= 1 reflection index and one weight >= 0 per index")
+        self._custom_rings = rings is not None
+        self._ring_two_theta = None if ring_two_theta is None else np.asarray(ring_two_theta, dtype=np.float32)
         self.N_peaks = len(self.ring_reflections)  # number of rings
         self.N_seg = self.N_peaks * self.N_eta
         self.Nx = self.cfg['Nx']
@@ -326,6 +348,15 @@ class SinglePhaseForwardOperator:
         self.two_theta_peaks = 2.0 * np.arcsin(
             np.linalg.norm(self.h_cpu, axis=1) / (4.0 * np.pi) * wavelength_A
         ).astype(np.float32)
+        if self._ring_two_theta is not None:
+            self.two_theta_peaks = self._ring_two_theta.copy()
+        elif self._custom_rings:
+            # the overlap-weighted mean two-theta of a window's reflections (computed as for one ring)
+            h = np.asarray(self.material.h_vecs, dtype=np.float32)
+            tth = 2.0 * np.arcsin(np.linalg.norm(h, axis=1) / (4.0 * np.pi) * wavelength_A).astype(np.float32)
+            self.two_theta_peaks = np.array([np.average(tth[ix], weights=w) if w.sum() > 0 else tth[ix[0]]
+                                             for ix, w in zip(self.ring_reflections, self.ring_overlap)],
+                                            dtype=np.float32)
 
         S_eta = self.N_eta_subdivisions
 
@@ -384,8 +415,13 @@ class SinglePhaseForwardOperator:
             self.intens_cpu = np.ones(len(self.ring_reflections), dtype=np.float32)
         else:
             wavelength = 12.398 / float(self.cfg["energy"])
-            ring_I = ring_intensities(self.material, self.ring_reflections, wavelength, self.intensity_model)
-            if not np.all(np.isfinite(ring_I)) or np.any(ring_I <= 0):
+            if not self._custom_rings:
+                ring_I = ring_intensities(self.material, self.ring_reflections, wavelength, self.intensity_model)
+            else:
+                refl_I = reflection_intensities(self.material, wavelength, self.intensity_model)
+                ring_I = np.array([np.sum(refl_I[ix] * w) for ix, w in zip(self.ring_reflections, self.ring_overlap)])
+            bad = (ring_I < 0) if self._custom_rings else (ring_I <= 0)     # a window may hold nothing of this phase
+            if not np.all(np.isfinite(ring_I)) or np.any(bad) or not np.any(ring_I > 0):
                 raise ValueError(
                     "normalized=False needs the ring intensities predicted from structure factors, but the material "
                     "has no atomic basis or a ring has zero intensity. Build it with Material.from_cif or "
@@ -469,10 +505,12 @@ class SinglePhaseForwardOperator:
 
         axes, counts, start = [], [], [0]
         self.ring_family_weights = []
-        for refl in self.ring_reflections:
-            share = intensities[refl] if not self.normalized else multiplicity[refl]
+        for refl, overlap in zip(self.ring_reflections, self.ring_overlap):
+            share = (intensities[refl] if not self.normalized else multiplicity[refl]) * overlap
+            if overlap.sum() <= 0:                          # an empty window (intensity 0): any valid shares
+                share = multiplicity[refl].copy()
             if not np.all(np.isfinite(share)) or share.sum() <= 0:
-                share = multiplicity[refl]
+                share = multiplicity[refl] * overlap
             share = share / share.sum()
             self.ring_family_weights.append(share)
 
