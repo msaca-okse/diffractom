@@ -135,15 +135,18 @@ def uniform_fundamental_zone(spacing_deg, symmetry, method="cubochoric", seed=0)
 
 
 def _frame_rotation(orix_group, sym: Rotation) -> Rotation:
-    """Rz(phi) with sym = Rz(phi) G_orix Rz(phi)^T (phi in steps of 15 deg); the identity if the groups agree."""
+    """C with sym = C G_orix C^T: a rotation of the cube group combined with a step of 15 deg about z (orix sets its
+    hexagonal/trigonal groups up with a along x, its monoclinic ones with the 2-fold along z; diffractom's (ImageD11's)
+    frame has a* along x and, for b-unique monoclinic cells, the 2-fold along y). The identity if the groups agree."""
     g = Rotation.from_quat(np.asarray(orix_group.data)[:, [1, 2, 3, 0]]).as_matrix()
     ours = {tuple(np.round(m, 6).ravel()) for m in sym.as_matrix()}
-    for phi in np.arange(0, 360, 15):
-        Rz = Rotation.from_euler("z", phi, degrees=True)
-        Rm = Rz.as_matrix()
-        if {tuple(np.round(Rm @ m @ Rm.T, 6).ravel()) for m in g} == ours:
-            return Rz
-    raise ValueError("the point group is not orix's group in any setting rotated about z; use method='random'")
+    for c in Rotation.create_group("O"):
+        for phi in np.arange(0, 90, 15):
+            C = c * Rotation.from_euler("z", phi, degrees=True)
+            Cm = C.as_matrix()
+            if {tuple(np.round(Cm @ m @ Cm.T, 6).ravel()) for m in g} == ours:
+                return C
+    raise ValueError("the point group is not orix's group in any rotated setting; use method='random'")
 
 
 def _orix_group(order):
