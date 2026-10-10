@@ -1,7 +1,7 @@
 """FISTA for data that are the sum of several operators' predictions, e.g. one SinglePhaseForwardOperator per
 phase writing into the same integration windows (operator option ``rings``):
 
-    min_{x_p >= 0}  sum_i w_i huber_delta((sum_p A_p x_p - b)_i)
+    min_{x_p >= 0}  sum_i w_i huber_delta((sum_p A_p x_p - b)_i) + sum_p l1_p sum(x_p)
 
 Every operator is used through its NumPy ``direct`` / ``adjoint`` (so each keeps its own PF storage, projector and
 coefficient streaming); the coefficients x_p are NumPy arrays (K_p, Ny, Nx). huber_delta = inf is weighted least
@@ -46,9 +46,11 @@ def estimate_L_sum(operators, niter=8, seed=0, verbose=0, weights=None):
 class FISTASum:
     """Non-negative FISTA with a Huber (or least-squares) data term for a sum of operators."""
 
-    def __init__(self, operators, L, huber_delta=np.inf, support="fov"):
+    def __init__(self, operators, L, huber_delta=np.inf, support="fov", l1=0.0):
+        """l1: weight of a sparsity penalty l1 * sum(x) (x >= 0), a scalar or one value per operator."""
         self.operators = list(operators)
         self.L = float(L)
+        self.l1 = np.broadcast_to(np.asarray(l1, dtype=np.float64), (len(self.operators),)).copy()
         self.huber_delta = float(huber_delta)
         self.masks = [op.support_mask().astype(np.float32) if support == "fov" else None for op in self.operators]
         self.history = []
@@ -70,12 +72,14 @@ class FISTASum:
             g = (_huber_grad(r, self.huber_delta) * w).astype(np.float32)
             report = verbose and (it == 1 or it % diagnostics_interval == 0 or it == niter)
             if report:
-                f = _huber_value(r, self.huber_delta, w)
+                f = _huber_value(r, self.huber_delta, w) + sum(float(l * x.sum(dtype=np.float64)) for l, x in zip(self.l1, ys))
             del r
             t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
             beta = (t - 1.0) / t_new
             for p, op in enumerate(self.operators):
                 x_new = ys[p] - tau * op.adjoint(g)
+                if self.l1[p] > 0:
+                    x_new -= np.float32(tau * self.l1[p])           # prox of l1 * sum(x) with x >= 0
                 np.maximum(x_new, 0, out=x_new)
                 if self.masks[p] is not None:
                     x_new *= self.masks[p][None]
