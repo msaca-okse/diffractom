@@ -11,6 +11,7 @@ from .operators.matrix_tomographic_operator import MatrixTomographicOperator
 from .operators.bragg_edge_tomographic_operator import BraggEdgeTomographicOperator
 from .optimization.fista_huber import FISTAHuber
 from .optimization.fista_l2 import FISTAL2
+from .optimization.fista_sum import FISTASum, estimate_L_sum
 from .optimization.streaming import estimate_L_power_streamed
 
 from .utils.reinterpolation.reinterpolationSO3 import (
@@ -34,6 +35,8 @@ __all__ = [
     "MultiPhaseForwardOperator",
     "FISTAHuber",
     "FISTAL2",
+    "FISTASum",
+    "estimate_L_sum",
     "estimate_L_power_streamed",
     "BulkTextureForwardOperator",
     "MatrixTomographicOperator",

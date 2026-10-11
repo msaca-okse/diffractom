@@ -135,15 +135,18 @@ def uniform_fundamental_zone(spacing_deg, symmetry, method="cubochoric", seed=0)
 
 
 def _frame_rotation(orix_group, sym: Rotation) -> Rotation:
-    """Rz(phi) with sym = Rz(phi) G_orix Rz(phi)^T (phi in steps of 15 deg); the identity if the groups agree."""
+    """C with sym = C G_orix C^T: a rotation of the cube group combined with a step of 15 deg about z (orix sets its
+    hexagonal/trigonal groups up with a along x, its monoclinic ones with the 2-fold along z; diffractom's (ImageD11's)
+    frame has a* along x and, for b-unique monoclinic cells, the 2-fold along y). The identity if the groups agree."""
     g = Rotation.from_quat(np.asarray(orix_group.data)[:, [1, 2, 3, 0]]).as_matrix()
     ours = {tuple(np.round(m, 6).ravel()) for m in sym.as_matrix()}
-    for phi in np.arange(0, 360, 15):
-        Rz = Rotation.from_euler("z", phi, degrees=True)
-        Rm = Rz.as_matrix()
-        if {tuple(np.round(Rm @ m @ Rm.T, 6).ravel()) for m in g} == ours:
-            return Rz
-    raise ValueError("the point group is not orix's group in any setting rotated about z; use method='random'")
+    for c in Rotation.create_group("O"):
+        for phi in np.arange(0, 90, 15):
+            C = c * Rotation.from_euler("z", phi, degrees=True)
+            Cm = C.as_matrix()
+            if {tuple(np.round(Cm @ m @ Cm.T, 6).ravel()) for m in g} == ours:
+                return C
+    raise ValueError("the point group is not orix's group in any rotated setting; use method='random'")
 
 
 def _orix_group(order):
@@ -280,6 +283,76 @@ def reconstruct_odf(cfg, material, data, weights=None, spacing_deg=4.0, levels=5
             print(f"  {len(keep)} orientations above {keep_rel:g} x max ({level.w[keep].sum() / level.w.sum():.4f} "
                   f"of the weight) -> {len(keep) * n3} children -> {len(sel)} after thinning", flush=True)
         q = kids[sel]
+        h /= 2
+    return out
+
+
+def reconstruct_odf_phases(cfg, phases, data, weights=None, spacing_deg=4.0, levels=4, sigma_factor=0.6,
+                           niter=200, niter_first=60, keep_rel=1e-3, keep_mass=None, n_sub=4,
+                           grid_method="cubochoric", huber_delta=np.inf, max_gb=4.0, normalized=False,
+                           exact_thinning_max=1_000_000, verbose=1, **op_kwargs):
+    """
+    Coarse-to-fine bulk ODFs of several phases fitted together (data summed over translations), for
+    data whose channels hold reflections of several phases (integration windows; operator option
+    ``rings``). phases: list of dicts with "material", "rings" (as SinglePhaseForwardOperator) and either
+    "orientations" (a fixed basis, (K, 3, 3), refitted at every level; "sigma_deg" its kernel width) or
+    nothing (a free phase: uniform grid of its fundamental zone at spacing_deg, refined level by level
+    around its supported orientations as reconstruct_odf). The phases' predictions add up (FISTASum);
+    normalized=False (structure-factor intensities) puts the phases on one scale, so the coefficients
+    are volumes. Returns per phase a list of ODFLevel (fixed phases: one per level, same q).
+    """
+    from .optimization.fista_sum import FISTASum, estimate_L_sum
+    b = bulk_data(data)
+    wseg = None if weights is None else np.asarray(weights, np.float32).ravel()
+    wb = b[:, 0] * (1.0 if wseg is None else wseg)
+    bnorm = float(np.linalg.norm(wb))
+    syms = [symmetry_rotations(ph["material"]) for ph in phases]
+    qs, fixed = [], []
+    for ph, sym in zip(phases, syms):
+        if ph.get("orientations") is not None:
+            qs.append(Rotation.from_matrix(np.asarray(ph["orientations"])).as_quat())
+            fixed.append(True)
+        else:
+            qs.append(uniform_fundamental_zone(spacing_deg, sym, method=grid_method))
+            fixed.append(False)
+    out = [[] for _ in phases]
+    h = float(spacing_deg)
+    for lev in range(levels):
+        t0 = time.perf_counter()
+        sig = [ph.get("sigma_deg", sigma_factor * h) if fx else sigma_factor * h for ph, fx in zip(phases, fixed)]
+        ops = [bulk_operator(cfg, ph["material"], q, sg, max_gb=max_gb, normalized=normalized, rings=ph["rings"],
+                             **op_kwargs) for ph, q, sg in zip(phases, qs, sig)]
+        L = 1.1 * estimate_L_sum(ops, niter=8)
+        solver = FISTASum(ops, L=L, huber_delta=huber_delta, support=None)
+        n_it = niter_first if lev == 0 else niter
+        xs = solver.run([np.zeros(op.coeff_shape, np.float32) for op in ops], b, niter=n_it, weights=wseg, verbose=0)
+        r = solver.direct(xs)[:, 0] - b[:, 0]
+        if wseg is not None:
+            r *= wseg
+        res = float(np.linalg.norm(r)) / bnorm
+        for p, (q, x) in enumerate(zip(qs, xs)):
+            out[p].append(ODFLevel(q=q, w=x.ravel().copy(), spacing_deg=h, sigma_deg=sig[p], residual=res,
+                                   seconds=time.perf_counter() - t0, objective=[f for _, f in solver.history]))
+        if verbose:
+            print(f"level {lev}: spacing {h:.3f} deg, K per phase {[len(q) for q in qs]}, residual {res:.4f}, "
+                  f"weight per phase {[float(x.sum()) for x in xs]}, {time.perf_counter() - t0:.0f} s", flush=True)
+        for op in ops:
+            op.free_memory()
+        if lev == levels - 1:
+            break
+        for p, sym in enumerate(syms):
+            if fixed[p]:
+                continue
+            level = out[p][-1]
+            keep = level.support(keep_rel)
+            if keep_mass is not None:
+                cum = np.cumsum(level.w[keep], dtype=np.float64)
+                keep = keep[:int(np.searchsorted(cum, keep_mass * level.w.sum())) + 1]
+            kids = _children(qs[p][keep], h, n_sub, sym)
+            sel = thin(kids, 0.7 * h / 2, sym) if len(kids) <= exact_thinning_max else thin_cells(kids, 0.8 * h / 2)
+            if verbose:
+                print(f"  phase {p}: {len(keep)} orientations kept -> {len(sel)} children", flush=True)
+            qs[p] = kids[sel]
         h /= 2
     return out
 

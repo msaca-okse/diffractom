@@ -108,3 +108,15 @@ def test_odf_grid_covers_fundamental_zone(name):
     q = ob.uniform_fundamental_zone(5.0, name)
     d = ob.nearest_misorientation_deg(Rotation.random(2000, random_state=3).as_quat(), q, sym)
     assert np.percentile(d, 99) < 4.2                      # trigonal in orix's frame without the rotation: 5.5
+
+
+def test_odf_grid_monoclinic_b_unique():
+    pytest.importorskip("orix")
+    from scipy.spatial.transform import Rotation
+    from diffractom import odf_basis as ob
+    two_b = Rotation.from_matrix(np.array([np.eye(3), np.diag([-1.0, 1.0, -1.0])]))      # 2-fold along y (b unique)
+    two_c = Rotation.from_matrix(np.array([np.eye(3), np.diag([-1.0, -1.0, 1.0])]))      # orix's setting (2 along z)
+    rnd = Rotation.random(2000, random_state=3).as_quat()
+    p99 = [np.percentile(ob.nearest_misorientation_deg(rnd, ob.uniform_fundamental_zone(6.0, s), s), 99)
+           for s in (two_b, two_c)]
+    assert abs(p99[0] - p99[1]) < 0.3                       # the same coverage as in orix's own setting
