@@ -47,12 +47,22 @@ class FISTASum:
     """Non-negative FISTA with a Huber (or least-squares) data term for a sum of operators."""
 
     def __init__(self, operators, L, huber_delta=np.inf, support="fov", l1=0.0):
-        """l1: weight of a sparsity penalty l1 * sum(x) (x >= 0), a scalar or one value per operator."""
+        """l1: weight of a sparsity penalty l1 * sum(x) (x >= 0), a scalar or one value per operator.
+        support: "fov" (coefficients only inside the field of view), None, or a mask (Ny, Nx): coefficients only
+        where it is non-zero and inside the field of view (e.g. the sample outline)."""
         self.operators = list(operators)
         self.L = float(L)
         self.l1 = np.broadcast_to(np.asarray(l1, dtype=np.float64), (len(self.operators),)).copy()
         self.huber_delta = float(huber_delta)
-        self.masks = [op.support_mask().astype(np.float32) if support == "fov" else None for op in self.operators]
+        if support is None:
+            self.masks = [None for _ in self.operators]
+        elif isinstance(support, str):
+            if support != "fov":
+                raise ValueError("support: 'fov', None or a mask (Ny, Nx)")
+            self.masks = [op.support_mask().astype(np.float32) for op in self.operators]
+        else:
+            m = (np.asarray(support) != 0).astype(np.float32)
+            self.masks = [m * op.support_mask().astype(np.float32) for op in self.operators]
         self.history = []
 
     def direct(self, xs):
