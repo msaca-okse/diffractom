@@ -46,8 +46,14 @@ def estimate_L_sum(operators, niter=8, seed=0, verbose=0, weights=None):
 class FISTASum:
     """Non-negative FISTA with a Huber (or least-squares) data term for a sum of operators."""
 
-    def __init__(self, operators, L, huber_delta=np.inf, support="fov", l1=0.0):
+    def __init__(self, operators, L, huber_delta=np.inf, support="fov", l1=0.0, volume_fractions=None,
+                 volume_weight=1.0):
         """l1: weight of a sparsity penalty l1 * sum(x) (x >= 0), a scalar or one value per operator.
+        volume_fractions: target share of every operator's summed coefficients in the total of the operators that have
+        a target (one value per operator, None or nan = free), held softly by the penalty
+        lam / 2 * sum_p (S_p - f_p T)^2 with S_p = sum(x_p), T = the sum of S_p over the targeted operators and
+        lam = volume_weight * L / (number of targeted coefficients): for phases whose shares the data cannot separate
+        (reflections of two phases in the same channels) but which are known from elsewhere, e.g. a powder pattern.
         support: "fov" (coefficients only inside the field of view), None, or a mask (Ny, Nx): coefficients only
         where it is non-zero and inside the field of view (e.g. the sample outline)."""
         self.operators = list(operators)
@@ -63,7 +69,23 @@ class FISTASum:
         else:
             m = (np.asarray(support) != 0).astype(np.float32)
             self.masks = [m * op.support_mask().astype(np.float32) for op in self.operators]
+        self.vf = None
+        if volume_fractions is not None:
+            vf = np.array([np.nan if v is None else float(v) for v in volume_fractions], dtype=np.float64)
+            if np.isfinite(vf).sum() >= 2:
+                self.vf = vf / np.nansum(vf)
+                n = sum(int(np.prod(op.coeff_shape)) for op, v in zip(self.operators, vf) if np.isfinite(v))
+                self.vlam = float(volume_weight) * self.L / n
+                self.L *= 1.0 + 2.0 * float(volume_weight)          # the penalty's curvature is at most 2 lam n
         self.history = []
+
+    def volume_gradient(self, xs):
+        """Per operator the (constant) gradient of the volume-fraction penalty, and the penalty's value."""
+        S = np.array([float(x.sum(dtype=np.float64)) for x in xs])
+        on = np.isfinite(self.vf)
+        e = np.where(on, S - np.where(on, self.vf, 0.0) * S[on].sum(), 0.0)
+        g = np.where(on, e - np.sum(np.where(on, self.vf, 0.0) * e), 0.0)
+        return self.vlam * g, 0.5 * self.vlam * float(np.sum(e ** 2))
 
     def direct(self, xs):
         return sum(op.direct(x) for op, x in zip(self.operators, xs))
@@ -86,8 +108,15 @@ class FISTASum:
             del r
             t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
             beta = (t - 1.0) / t_new
+            vg = None
+            if self.vf is not None:
+                vg, vval = self.volume_gradient(ys)
+                if report:
+                    f += vval
             for p, op in enumerate(self.operators):
                 x_new = ys[p] - tau * op.adjoint(g)
+                if vg is not None and vg[p] != 0.0:
+                    x_new -= np.float32(tau * vg[p])
                 if self.l1[p] > 0:
                     x_new -= np.float32(tau * self.l1[p])           # prox of l1 * sum(x) with x >= 0
                 np.maximum(x_new, 0, out=x_new)
