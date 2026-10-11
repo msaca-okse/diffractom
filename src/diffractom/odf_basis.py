@@ -322,7 +322,7 @@ def reconstruct_odf_phases(cfg, phases, data, weights=None, spacing_deg=4.0, lev
         sig = [ph.get("sigma_deg", sigma_factor * h) if fx else sigma_factor * h for ph, fx in zip(phases, fixed)]
         ops = [bulk_operator(cfg, ph["material"], q, sg, max_gb=max_gb, normalized=normalized, rings=ph["rings"],
                              **op_kwargs) for ph, q, sg in zip(phases, qs, sig)]
-        L = 1.1 * estimate_L_sum(ops, niter=8)
+        L = 1.1 * estimate_L_sum(ops, niter=8, weights=wseg)
         solver = FISTASum(ops, L=L, huber_delta=huber_delta, support=None)
         n_it = niter_first if lev == 0 else niter
         xs = solver.run([np.zeros(op.coeff_shape, np.float32) for op in ops], b, niter=n_it, weights=wseg, verbose=0)
