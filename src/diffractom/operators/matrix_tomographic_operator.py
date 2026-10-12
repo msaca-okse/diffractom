@@ -46,8 +46,8 @@ class MatrixTomographicOperator:
         verbose: bool = False,
         ctx: cl.Context | None = None,
         queue: cl.CommandQueue | None = None,
-        projector: str = "gratopy",
-        radon_kernel: str = "hat",
+        projector: str = "native",
+        radon_kernel: str | None = None,
         angle_weights=None,
     ):
         """Initialise the matrix-tomographic operator.
@@ -72,19 +72,21 @@ class MatrixTomographicOperator:
         cor_offset : float
             Centre-of-rotation offset in detector pixels (default 0).
         image_width_factor : float
-            Width of the image in detector pixels, relative to Nx (default 1: pixel = detector pixel).
+            Voxel size in detector pixels (default 1). Larger voxels (e.g. Nx = My / 2 with image_width_factor = 2)
+            keep the full detector resolution in the data while reducing the unknowns: an alternative to binning
+            the data. Needs the native projector with the trapezoid kernel when > 1.
         verbose : bool
             Print the buffer allocation summary.
         ctx, queue : optional
             Existing OpenCL context/queue; created automatically if None.
-        projector : "gratopy" (default) or "native"
-            The tomographic projector: gratopy, or diffractom's ParallelRadon (the same
-            discretisation, results equal to 2e-7; faster for large images and many angles, slower
-            for small ones: 123 x 123 pixels, 24 angles, K = 9400 on a V100: 62 vs 41 ms per forward).
-        radon_kernel : "hat" (default) or "trapezoid"
-            With projector="native": how a pixel is spread over the detector bins (see ParallelRadon). The hat
-            (also gratopy's) gives a bin-to-bin ripple at 45 and 135 degrees when the voxels are as large as the
-            detector bins; "trapezoid" (the pixel's footprint) does not, at the same cost.
+        projector : "native" (default) or "gratopy"
+            The tomographic projector: diffractom's ParallelRadon, or gratopy (pixel-driven with a hat kernel;
+            the default until 0.2.0). With radon_kernel="hat" the two agree to 2e-7.
+        radon_kernel : None (default), "trapezoid" or "hat"
+            With projector="native": how a pixel is spread over the detector bins (see ParallelRadon). Default:
+            "trapezoid", the pixel's footprint on the detector. "hat" is gratopy's kernel: when the voxels are as
+            large as the detector bins it gives a bin-to-bin ripple of 6.7 % at 45 and 135 degrees, and it needs
+            image_width_factor <= 1.
         angle_weights : None (default), "uniform" or an array of N_Omega weights
             Weights of the angles in the backward projection, i.e. in the adjoint (the solvers then
             minimise the angle-weighted residual). None: gratopy's (half the angular gap to the
@@ -99,8 +101,11 @@ class MatrixTomographicOperator:
             raise ValueError(f"angles must have shape ({N_Omega},), got {angles.shape}")
         if projector not in ("native", "gratopy"):
             raise ValueError(f"projector must be 'native' or 'gratopy', not {projector!r}")
+        if radon_kernel is None:
+            radon_kernel = "trapezoid" if projector == "native" else "hat"
         if radon_kernel != "hat" and projector != "native":
             raise ValueError("radon_kernel other than 'hat' needs projector='native'")
+        self.radon_kernel = radon_kernel
 
         self.N_Omega = N_Omega
         self.My = My

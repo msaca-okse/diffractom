@@ -23,11 +23,11 @@ class ParallelRadon:
 
     Discretisation (pixel-centred image, detector bins of width delta_s):
     pixel (x, y) projects at angle theta_a to detector coordinate
-    ``t = X_a x + Y_a y + T0_a`` (in bins) and contributes to bin s with the hat
-    weight ``max(0, 1 - |t - s|)``. The forward projection is scaled by
+    ``t = X_a x + Y_a y + T0_a`` (in bins) and contributes to bin s with the weight
+    ``K(t - s)`` of the kernel (see ``kernel``). The forward projection is scaled by
     ``delta_x**2 / delta_s``; the backward projection is the transpose weighted by
     the angle weights, i.e. the adjoint up to ``w_a delta_s / delta_x**2``.
-    This is the discretisation of gratopy's parallel-beam transform
+    With ``kernel="hat"`` this is the discretisation of gratopy's parallel-beam transform
     (K. Bredies and R. Huber), with the same parameters.
 
     Channel-fastest arrays ("_k" below) are flat float32 arrays: images
@@ -49,16 +49,20 @@ class ParallelRadon:
         Default: pi / R, i.e. R evenly spaced angles covering 180 degrees.
     bins_per_item : int
         Detector bins computed per work item in the forward projection.
-    kernel : {"hat", "trapezoid"}
-        How a pixel is spread over the detector bins. "hat" (default, the discretisation above and gratopy's):
-        linear interpolation between the two bins nearest to the projected pixel centre. "trapezoid": the footprint
-        of the pixel, a box as wide as the spacing A of neighbouring pixel centres on the detector
-        (A = max(|cos|, |sin|) delta_x / delta_s), averaged over the bin (distance-driven projection):
-        ``K(d) = clip(((1 + A) / 2 - |d|) / A, 0, 1)``. Same cost and same two bins per pixel; identical to the hat
-        at 0 and 90 degrees. The hat does not sum to one over a row of pixels unless A = 1 / integer, which
-        modulates the projection of a smooth image from bin to bin: by 6.6 % (rms) at exactly 45 degrees, 1.3 % at
-        26.6 and 63.4, 0.9 % at 33.7 and 56.3 degrees (for delta_x = delta_s); a reconstruction then gets a
-        diagonal cross-hatch pattern. The trapezoid sums to one at every angle. It needs delta_x <= delta_s.
+    kernel : {"trapezoid", "hat"}
+        How a pixel is spread over the detector bins.
+        "trapezoid" (default): the footprint of the pixel, a box as wide as the spacing A of neighbouring pixel
+        centres on the detector (A = max(|cos|, |sin|) delta_x / delta_s bins), averaged over the bin
+        (distance-driven projection): ``K(d) = clip((1 + A) / 2 - |d|, 0, min(1, A)) / A``. Every bin gets the same
+        total weight from a row of pixels at every angle. Pixels may be smaller or larger than the detector bins:
+        for A <= 1 a pixel touches the two nearest bins, for larger pixels ceil(1 + A) bins.
+        "hat": linear interpolation between the two bins nearest to the projected pixel centre, the discretisation
+        above and gratopy's (diffractom's default until 0.2.0; identical to the trapezoid at 0 and 90 degrees when
+        delta_x = delta_s). Its total weight per bin is constant only for A = 1 / integer: for delta_x = delta_s the
+        projection of a smooth image is modulated from bin to bin by 6.7 % (rms) at exactly 45 degrees (a few
+        percent within +-1.5 degrees of it for compact features), 1.3 % at 26.6 and 63.4, 0.9 % at 33.7 and 56.3
+        degrees, and a reconstruction gets a diagonal cross-hatch pattern. It needs delta_x <= delta_s (larger
+        pixels would leave bins empty).
     tiled : bool
         Use the tiled kernels (default): they stage what a work-group shares in local memory (the
         image rows of a block of angles and bins in the forward projection, the sinogram bins of a
@@ -74,7 +78,7 @@ class ParallelRadon:
 
     def __init__(self, queue, img_shape, angles, n_detectors, image_width, detector_width,
                  detector_shift=0.0, angle_weights=None, bins_per_item=3, channels_per_launch=None,
-                 tiled=True, kernel="hat"):
+                 tiled=True, kernel="trapezoid"):
         self.queue = queue
         self.Nx, self.Ny = (int(n) for n in img_shape)
         self.Ns = int(n_detectors)
@@ -97,9 +101,12 @@ class ParallelRadon:
 
         if kernel not in ("hat", "trapezoid"):
             raise ValueError(f"kernel must be 'hat' or 'trapezoid', not {kernel!r}")
-        if kernel == "trapezoid" and np.maximum(np.abs(X), np.abs(Y)).max() > 1.0 + 1e-6:
-            raise ValueError("kernel='trapezoid' needs pixels no larger than the detector bins (delta_x <= delta_s)")
+        a_max = float(np.maximum(np.abs(X), np.abs(Y)).max())       # largest spacing of pixel centres, in bins
+        if kernel == "hat" and a_max > 1.0 + 1e-6:
+            raise ValueError("kernel='hat' needs pixels no larger than the detector bins (delta_x <= delta_s); "
+                             "use kernel='trapezoid'")
         self.kernel = kernel
+        self.n_taps = max(2, int(np.ceil(1.0 + a_max - 1e-6)))      # bins a pixel touches (trapezoid)
         geo = np.stack([X, Y, T0, self.angle_weights], axis=1).astype(np.float32)
         self.geo_gpu = clarray.to_device(queue, np.ascontiguousarray(geo))
 
@@ -114,11 +121,13 @@ class ParallelRadon:
             raise ValueError("channels_per_launch must be a positive multiple of 4")
         self.channels_per_launch = int(channels_per_launch)
         src = Path(__file__).with_name("radon_kernels.cl").read_text()
-        options = [f"-DNB={self.bins_per_item}"] + (["-DTRAPEZOID"] if kernel == "trapezoid" else [])
+        options = [f"-DNB={self.bins_per_item}"]
+        if kernel == "trapezoid":
+            options += ["-DTRAPEZOID", f"-DNTAP={self.n_taps}"]
         if self.tiled:
             if self.FCQ * self.FSB * self.FAB > queue.device.max_work_group_size:
                 self.FAB = max(1, queue.device.max_work_group_size // (self.FCQ * self.FSB))
-            options += self._tiling(geo, queue.device)
+            options += self._tiling(geo, queue.device, a_max)
         self.prg = cl.Program(queue.context, src).build(options=options)
         self._fwd = self.prg.radon_forward_k
         self._bwd = self.prg.radon_backward_k
@@ -135,7 +144,7 @@ class ParallelRadon:
     FCQ, FSB, FAB = 4, 8, 16
     BCQ, BAB, BT = 4, 16, 8
 
-    def _tiling(self, geo, device):
+    def _tiling(self, geo, device, a_max=1.0):
         """Compile-time constants of the tiled kernels, from the geometry: the angle blocks of the
         forward projection (consecutive angles with the same row axis), the width W of the image
         segment a forward work-group needs per row (computed for every block, bin group and row,
@@ -165,8 +174,9 @@ class ParallelRadon:
             Nu, Nv = (self.Nx, self.Ny) if ry else (self.Ny, self.Nx)
             v = np.arange(Nv, dtype=np.float64)
             c = B[:, None] * v[None, :] + T0[a0:a0 + na, None]                  # (angles, rows)
-            e1 = (S0[:, :, None, None] - 1 - c[None]) / A[None, :, None]         # (groups, 1, angles, rows)
-            e2 = (S1[:, :, None, None] - c[None]) / A[None, :, None]
+            hw = (0.5 * (1.0 + np.abs(A)) if self.kernel == "trapezoid" else np.ones_like(A))[None, :, None]   # half width
+            e1 = (S0[:, :, None, None] - hw - c[None]) / A[None, :, None]        # (groups, 1, angles, rows)
+            e2 = (S1[:, :, None, None] - 1 + hw - c[None]) / A[None, :, None]
             lo = np.clip(np.floor(np.minimum(e1, e2)), 0, Nu - 1).min(axis=(1, 2))   # (groups, rows)
             hi = np.clip(np.ceil(np.maximum(e1, e2)), 0, Nu - 1).max(axis=(1, 2))
             W = max(W, int((hi - lo).max()) + 4)
@@ -177,7 +187,8 @@ class ParallelRadon:
             W = budget // (self.FCQ * 16)
         self.W = int(W)
         span = np.max((self.BT - 1) * (np.abs(X.astype(np.float64)) + np.abs(Y.astype(np.float64))))
-        self.BLMAX = int(np.ceil(span)) + 4
+        hw_max = 0.5 * (1.0 + a_max) if self.kernel == "trapezoid" else 1.0
+        self.BLMAX = int(np.ceil(span + 2.0 * hw_max)) + 2
         per_angle = self.BLMAX * self.BCQ * 16
         self.BAB = max(1, min(self.BAB, budget // per_angle))   # fewer angles per tile for narrow bins
         if self.BAB * per_angle > budget:                      # (bins beyond BLMAX: from global memory)

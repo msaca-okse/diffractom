@@ -9,12 +9,14 @@
 // i.e. the backward is the transpose of the forward, weighted by w[a] / scale.
 //
 // With -DTRAPEZOID the hat is replaced by the footprint of the pixel on the detector: along the image axis with the
-// larger of |X|, |Y| (A, the spacing of neighbouring pixel centres on the detector, <= 1 bin) a pixel covers a box of
+// larger of |X|, |Y| (A, the spacing of neighbouring pixel centres on the detector, in bins) a pixel covers a box of
 // width A; averaged over a bin of width 1 this gives the trapezoid
-//     K(d) = clamp(((1 + A) / 2 - |d|) / A, 0, 1),            d = t - s
-// (distance-driven projection). It has the support of the hat (at most the two nearest bins) and is the hat for
-// A = 1 (0 and 90 degrees). Its sum over a row of pixels is exactly 1 for every bin at every angle; the hat's is
-// not unless A = 1 / integer: at 45 degrees (A = 1 / sqrt 2) the hat modulates a smooth image by 6.6 % from bin to bin.
+//     K(d) = clamp((1 + A) / 2 - |d|, 0, min(1, A)) / A,            d = t - s
+// (distance-driven projection). Its sum over a row of pixels is the same for every bin at every angle; the hat's is
+// not unless A = 1 / integer: at 45 degrees with pixels as large as the bins (A = 1 / sqrt 2) the hat modulates a
+// smooth image by 6.7 % from bin to bin. For A <= 1 the trapezoid touches the two nearest bins, like the hat (and is
+// the hat for A = 1); pixels larger than the bins (A > 1) touch NTAP = ceil(1 + A_max) bins, which the hat cannot do
+// (it would leave bins empty).
 //
 // k is the fastest axis of both img and sino. All channels share the geometry, so each
 // work item handles 4 consecutive channels (float4): the hat weights are computed once
@@ -33,6 +35,9 @@
 
 #ifndef NB
 #define NB 3
+#endif
+#ifndef NTAP
+#define NTAP 2
 #endif
 #define TILE 32
 
@@ -64,13 +69,18 @@ __kernel void radon_forward_k(
     const size_t dv = rows_are_y ? (size_t)Nx * ks : ks;
     const float inv = 1.0f / A;
 #ifdef TRAPEZOID
-    const float hw = 0.5f * (1.0f + fabs(A)), iw = 1.0f / fabs(A);     // half width and slope of the trapezoid
+    const float hw = 0.5f * (1.0f + fabs(A)), top = fmin(1.0f, fabs(A)), iw = 1.0f / fabs(A);   // half width, plateau, 1 / A
 #endif
 
     for (int v = 0; v < Nv; ++v) {
         const float c = B * v + g.z;
+#ifdef TRAPEZOID
+        const float lo = fmin((s0 - hw - c) * inv, (s0 + NB - 1 + hw - c) * inv);
+        const float hi = fmax((s0 - hw - c) * inv, (s0 + NB - 1 + hw - c) * inv);
+#else
         const float lo = fmin((s0 - 1.0f - c) * inv, (s0 + NB - c) * inv);
         const float hi = fmax((s0 - 1.0f - c) * inv, (s0 + NB - c) * inv);
+#endif
         const int u0 = max((int)floor(lo), 0);
         const int u1 = min((int)ceil(hi), Nu - 1);
         __global const float4 *row = img + (size_t)v * dv + k;
@@ -79,7 +89,7 @@ __kernel void radon_forward_k(
             const float t = A * u + c - s0;
             #pragma unroll
 #ifdef TRAPEZOID
-            for (int j = 0; j < NB; ++j) acc[j] += clamp((hw - fabs(t - j)) * iw, 0.0f, 1.0f) * val;
+            for (int j = 0; j < NB; ++j) acc[j] += (clamp(hw - fabs(t - j), 0.0f, top) * iw) * val;
 #else
             for (int j = 0; j < NB; ++j) acc[j] += fmax(1.0f - fabs(t - j), 0.0f) * val;
 #endif
@@ -114,9 +124,13 @@ __kernel void radon_backward_k(
         const int sp = sm + 1;
         float4 v = (float4)(0.0f);
 #ifdef TRAPEZOID
-        const float Aa = fmax(fabs(g.x), fabs(g.y)), hw = 0.5f * (1.0f + Aa), iw = 1.0f / Aa;
-        if (sm >= 0 && sm < Ns) v += clamp((hw - (t - sm)) * iw, 0.0f, 1.0f) * sino[((size_t)a * Ns + sm) * ks + k];
-        if (sp >= 0 && sp < Ns) v += clamp((hw - (sp - t)) * iw, 0.0f, 1.0f) * sino[((size_t)a * Ns + sp) * ks + k];
+        const float Aa = fmax(fabs(g.x), fabs(g.y)), hw = 0.5f * (1.0f + Aa), top = fmin(1.0f, Aa), iw = 1.0f / Aa;
+        const int sf = (int)floor(t - hw) + 1;                       // first bin the footprint touches
+        #pragma unroll
+        for (int j = 0; j < NTAP; ++j) {
+            const int sj = sf + j;
+            if (sj >= 0 && sj < Ns) v += (clamp(hw - fabs(t - sj), 0.0f, top) * iw) * sino[((size_t)a * Ns + sj) * ks + k];
+        }
 #else
         if (sm >= 0 && sm < Ns) v += (1.0f - (t - sm)) * sino[((size_t)a * Ns + sm) * ks + k];
         if (sp >= 0 && sp < Ns) v += (1.0f - (sp - t)) * sino[((size_t)a * Ns + sp) * ks + k];
@@ -235,7 +249,7 @@ __kernel void radon_forward_tiled(
     const float B = rows_are_y ? g.y : g.x;
     const float inv = 1.0f / A;
 #ifdef TRAPEZOID
-    const float hw = 0.5f * (1.0f + fabs(A)), iw = 1.0f / fabs(A);     // half width and slope of the trapezoid
+    const float hw = 0.5f * (1.0f + fabs(A)), top = fmin(1.0f, fabs(A)), iw = 1.0f / fabs(A);   // half width, plateau, 1 / A
 #endif
     const int work = active_a && s0 < Ns && kq < k4_n;
 
@@ -255,7 +269,12 @@ __kernel void radon_forward_tiled(
                 const float Bb = rows_are_y ? gb.y : gb.x;
                 const float ib = 1.0f / Ab;
                 const float c = Bb * v + gb.z;
+#ifdef TRAPEZOID
+                const float hb = 0.5f * (1.0f + fabs(Ab));
+                const float l = fmin((S0 - hb - c) * ib, (S1 - 1 + hb - c) * ib);
+#else
                 const float l = fmin((S0 - 1.0f - c) * ib, (S1 - c) * ib);
+#endif
                 lo = min(lo, max((int)floor(l), 0));
             }
             lbase[lid] = lo - 1;
@@ -275,8 +294,13 @@ __kernel void radon_forward_tiled(
                 const int v = v0 + r;
                 // as in radon_forward_k
                 const float c = B * v + g.z;
+#ifdef TRAPEZOID
+                const float lo = fmin((s0 - hw - c) * inv, (s0 + NB - 1 + hw - c) * inv);
+                const float hi = fmax((s0 - hw - c) * inv, (s0 + NB - 1 + hw - c) * inv);
+#else
                 const float lo = fmin((s0 - 1.0f - c) * inv, (s0 + NB - c) * inv);
                 const float hi = fmax((s0 - 1.0f - c) * inv, (s0 + NB - c) * inv);
+#endif
                 const int u0 = max((int)floor(lo), 0);
                 const int u1 = min((int)ceil(hi), Nu - 1);
                 const int base = lbase[r];
@@ -287,7 +311,7 @@ __kernel void radon_forward_tiled(
                     const float t = A * u + c - s0;
                     #pragma unroll
 #ifdef TRAPEZOID
-                    for (int j = 0; j < NB; ++j) acc[j] += clamp((hw - fabs(t - j)) * iw, 0.0f, 1.0f) * val;
+                    for (int j = 0; j < NB; ++j) acc[j] += (clamp(hw - fabs(t - j), 0.0f, top) * iw) * val;
 #else
                     for (int j = 0; j < NB; ++j) acc[j] += fmax(1.0f - fabs(t - j), 0.0f) * val;
 #endif
@@ -332,7 +356,11 @@ __kernel void radon_backward_tiled(
             const float xa = (float)x0, xb = (float)(x0 + BT - 1), ya = (float)y0, yb = (float)(y0 + BT - 1);
             const float t0 = g.x * xa + g.y * ya + g.z, t1 = g.x * xb + g.y * ya + g.z;
             const float t2 = g.x * xa + g.y * yb + g.z, t3 = g.x * xb + g.y * yb + g.z;
+#ifdef TRAPEZOID
+            lsmin[lid] = (int)floor(fmin(fmin(t0, t1), fmin(t2, t3)) - 0.5f * (1.0f + fmax(fabs(g.x), fabs(g.y))));
+#else
             lsmin[lid] = (int)floor(fmin(fmin(t0, t1), fmin(t2, t3))) - 1;
+#endif
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         for (int i = lid; i < na * BLMAX * BCQ; i += nloc) {
@@ -354,11 +382,14 @@ __kernel void radon_backward_tiled(
                 const int lm = sm - lsmin[al], lp = sp - lsmin[al];
                 float4 v = (float4)(0.0f);
 #ifdef TRAPEZOID
-                const float Aa = fmax(fabs(g.x), fabs(g.y)), hw = 0.5f * (1.0f + Aa), iw = 1.0f / Aa;
-                if (sm >= 0 && sm < Ns)
-                    v += clamp((hw - (t - sm)) * iw, 0.0f, 1.0f) * ((lm >= 0 && lm < BLMAX) ? ls[al][lm][q] : sino[((size_t)a * Ns + sm) * ks + k]);
-                if (sp >= 0 && sp < Ns)
-                    v += clamp((hw - (sp - t)) * iw, 0.0f, 1.0f) * ((lp >= 0 && lp < BLMAX) ? ls[al][lp][q] : sino[((size_t)a * Ns + sp) * ks + k]);
+                const float Aa = fmax(fabs(g.x), fabs(g.y)), hw = 0.5f * (1.0f + Aa), top = fmin(1.0f, Aa), iw = 1.0f / Aa;
+                const int sf = (int)floor(t - hw) + 1;
+                #pragma unroll
+                for (int j = 0; j < NTAP; ++j) {
+                    const int sj = sf + j, lj = sj - lsmin[al];
+                    if (sj >= 0 && sj < Ns)
+                        v += (clamp(hw - fabs(t - sj), 0.0f, top) * iw) * ((lj >= 0 && lj < BLMAX) ? ls[al][lj][q] : sino[((size_t)a * Ns + sj) * ks + k]);
+                }
 #else
                 if (sm >= 0 && sm < Ns)
                     v += (1.0f - (t - sm)) * ((lm >= 0 && lm < BLMAX) ? ls[al][lm][q] : sino[((size_t)a * Ns + sm) * ks + k]);
