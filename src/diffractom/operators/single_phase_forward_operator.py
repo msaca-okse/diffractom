@@ -49,6 +49,7 @@ class SinglePhaseForwardOperator:
         sparse_max_fill_partial: float = 0.1,
         sparse_max_gb: float | None = None,
         projector: str = "auto",
+        radon_kernel: str = "hat",
         fft_max_gb: float = 1.5,
         reserve_coefficient_arrays: int = 3,
         pf_cutoff_sigma: float | None = 3.0,
@@ -125,6 +126,12 @@ class SinglePhaseForwardOperator:
             differ from the native projector by about 1 %), and faster for large grids.
             ``"auto"`` (default): "fft" for grids of more than 400 x 400 pixels (if pyvkfft
             is installed), "native" otherwise.
+        radon_kernel : {"hat", "trapezoid"}
+            Only for the native projector: how a pixel is spread over the detector bins (see ParallelRadon).
+            "hat" (default): linear interpolation, the discretisation of gratopy. "trapezoid": the pixel's
+            footprint on the detector (distance-driven), which removes the bin-to-bin ripple of the hat at 45
+            and 135 degrees (and weaker ones at other rational slopes) at the same cost; results differ from
+            the hat's at the level of that ripple.
         fft_max_gb : float
             GPU memory for the scratch buffers of the "fft" projector (they hold a slice of
             the batch's orientations at a time).
@@ -219,6 +226,9 @@ class SinglePhaseForwardOperator:
             raise ValueError(f"projector must be 'auto', 'native', 'fft' or 'gratopy', not {projector!r}")
         if projector == "auto":
             projector = "fft" if self.Nx * self.Ny > AUTO_FFT_PIXELS and fourier_radon.available() else "native"
+        if radon_kernel != "hat" and projector != "native":
+            raise ValueError(f"radon_kernel={radon_kernel!r} needs the native projector (projector is {projector!r})")
+        self.radon_kernel = radon_kernel
         self.projector = projector
         self.fradon = None
         if projector == "fft":
@@ -247,6 +257,7 @@ class SinglePhaseForwardOperator:
                 detector_shift=self.cor_offset,
                 angle_weights=delta,
                 bins_per_item=3,
+                kernel=radon_kernel,
             )
             self.PS = None
         else:

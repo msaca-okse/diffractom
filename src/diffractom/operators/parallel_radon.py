@@ -49,6 +49,16 @@ class ParallelRadon:
         Default: pi / R, i.e. R evenly spaced angles covering 180 degrees.
     bins_per_item : int
         Detector bins computed per work item in the forward projection.
+    kernel : {"hat", "trapezoid"}
+        How a pixel is spread over the detector bins. "hat" (default, the discretisation above and gratopy's):
+        linear interpolation between the two bins nearest to the projected pixel centre. "trapezoid": the footprint
+        of the pixel, a box as wide as the spacing A of neighbouring pixel centres on the detector
+        (A = max(|cos|, |sin|) delta_x / delta_s), averaged over the bin (distance-driven projection):
+        ``K(d) = clip(((1 + A) / 2 - |d|) / A, 0, 1)``. Same cost and same two bins per pixel; identical to the hat
+        at 0 and 90 degrees. The hat does not sum to one over a row of pixels unless A = 1 / integer, which
+        modulates the projection of a smooth image from bin to bin: by 6.6 % (rms) at exactly 45 degrees, 1.3 % at
+        26.6 and 63.4, 0.9 % at 33.7 and 56.3 degrees (for delta_x = delta_s); a reconstruction then gets a
+        diagonal cross-hatch pattern. The trapezoid sums to one at every angle. It needs delta_x <= delta_s.
     tiled : bool
         Use the tiled kernels (default): they stage what a work-group shares in local memory (the
         image rows of a block of angles and bins in the forward projection, the sinogram bins of a
@@ -64,7 +74,7 @@ class ParallelRadon:
 
     def __init__(self, queue, img_shape, angles, n_detectors, image_width, detector_width,
                  detector_shift=0.0, angle_weights=None, bins_per_item=3, channels_per_launch=None,
-                 tiled=True):
+                 tiled=True, kernel="hat"):
         self.queue = queue
         self.Nx, self.Ny = (int(n) for n in img_shape)
         self.Ns = int(n_detectors)
@@ -85,6 +95,11 @@ class ParallelRadon:
         T0 = (self.Ns - 1) / 2.0 - X * (self.Nx - 1) / 2.0 - Y * (self.Ny - 1) / 2.0 - detector_shift / delta_s
         self.scale = np.float32(delta_x * delta_x / delta_s)
 
+        if kernel not in ("hat", "trapezoid"):
+            raise ValueError(f"kernel must be 'hat' or 'trapezoid', not {kernel!r}")
+        if kernel == "trapezoid" and np.maximum(np.abs(X), np.abs(Y)).max() > 1.0 + 1e-6:
+            raise ValueError("kernel='trapezoid' needs pixels no larger than the detector bins (delta_x <= delta_s)")
+        self.kernel = kernel
         geo = np.stack([X, Y, T0, self.angle_weights], axis=1).astype(np.float32)
         self.geo_gpu = clarray.to_device(queue, np.ascontiguousarray(geo))
 
@@ -99,7 +114,7 @@ class ParallelRadon:
             raise ValueError("channels_per_launch must be a positive multiple of 4")
         self.channels_per_launch = int(channels_per_launch)
         src = Path(__file__).with_name("radon_kernels.cl").read_text()
-        options = [f"-DNB={self.bins_per_item}"]
+        options = [f"-DNB={self.bins_per_item}"] + (["-DTRAPEZOID"] if kernel == "trapezoid" else [])
         if self.tiled:
             if self.FCQ * self.FSB * self.FAB > queue.device.max_work_group_size:
                 self.FAB = max(1, queue.device.max_work_group_size // (self.FCQ * self.FSB))
