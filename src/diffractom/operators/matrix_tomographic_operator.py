@@ -47,6 +47,7 @@ class MatrixTomographicOperator:
         ctx: cl.Context | None = None,
         queue: cl.CommandQueue | None = None,
         projector: str = "gratopy",
+        radon_kernel: str = "hat",
         angle_weights=None,
     ):
         """Initialise the matrix-tomographic operator.
@@ -80,6 +81,10 @@ class MatrixTomographicOperator:
             The tomographic projector: gratopy, or diffractom's ParallelRadon (the same
             discretisation, results equal to 2e-7; faster for large images and many angles, slower
             for small ones: 123 x 123 pixels, 24 angles, K = 9400 on a V100: 62 vs 41 ms per forward).
+        radon_kernel : "hat" (default) or "trapezoid"
+            With projector="native": how a pixel is spread over the detector bins (see ParallelRadon). The hat
+            (also gratopy's) gives a bin-to-bin ripple at 45 and 135 degrees when the voxels are as large as the
+            detector bins; "trapezoid" (the pixel's footprint) does not, at the same cost.
         angle_weights : None (default), "uniform" or an array of N_Omega weights
             Weights of the angles in the backward projection, i.e. in the adjoint (the solvers then
             minimise the angle-weighted residual). None: gratopy's (half the angular gap to the
@@ -94,6 +99,8 @@ class MatrixTomographicOperator:
             raise ValueError(f"angles must have shape ({N_Omega},), got {angles.shape}")
         if projector not in ("native", "gratopy"):
             raise ValueError(f"projector must be 'native' or 'gratopy', not {projector!r}")
+        if radon_kernel != "hat" and projector != "native":
+            raise ValueError("radon_kernel other than 'hat' needs projector='native'")
 
         self.N_Omega = N_Omega
         self.My = My
@@ -130,7 +137,8 @@ class MatrixTomographicOperator:
             # channels fastest, padded to a multiple of 4 (zero rows of B for the padding)
             self.Kstride = -(-K // 4) * 4
             self.radon = ParallelRadon(self.queue, (Nx, Ny), angles, My, image_width=image_width,
-                                       detector_width=My, detector_shift=cor_offset, angle_weights=w)
+                                       detector_width=My, detector_shift=cor_offset, angle_weights=w,
+                                       kernel=radon_kernel)
             self.PS = None
         else:
             self.Kstride = K
