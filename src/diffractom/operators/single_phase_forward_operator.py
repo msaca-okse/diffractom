@@ -51,6 +51,7 @@ class SinglePhaseForwardOperator:
         sparse_max_fill_partial: float = 0.1,
         sparse_max_gb: float | None = None,
         projector: str = "auto",
+        radon_kernel: str | None = None,
         fft_max_gb: float = 1.5,
         reserve_coefficient_arrays: int = 3,
         pf_cutoff_sigma: float | None = 3.0,
@@ -144,15 +145,21 @@ class SinglePhaseForwardOperator:
         projector : {"auto", "native", "fft", "gratopy"}
             Parallel-beam Radon transform used for the tomographic part.
             ``"native"`` is diffractom's ParallelRadon, vectorised over the orientations;
-            ``"gratopy"`` uses gratopy. Both use the same discretisation (pixel samples
-            spread onto the detector bins with a hat weight; they agree to float32
-            rounding); the native one is 2-8x faster for many orientations.
+            ``"gratopy"`` uses gratopy (pixel samples spread onto the detector bins with a
+            hat weight; with ``radon_kernel="hat"`` the two agree to float32 rounding); the
+            native one is 2-8x faster for many orientations.
             ``"fft"`` (FourierRadon) computes the projections through the Fourier slice
             theorem (needs pyvkfft): the same geometry, a more accurate discretisation
             (against exact line integrals about 1e-5 instead of 0.5-1.5 %, so results
             differ from the native projector by about 1 %), and faster for large grids.
             ``"auto"`` (default): "fft" for grids of more than 400 x 400 pixels (if pyvkfft
             is installed), "native" otherwise.
+        radon_kernel : {None, "trapezoid", "hat"}
+            Only for the native projector: how a pixel is spread over the detector bins (see ParallelRadon).
+            Default (None): "trapezoid", the pixel's footprint on the detector (distance-driven).
+            "hat": linear interpolation, the discretisation of gratopy and diffractom's default until 0.2.0; it
+            modulates projections from bin to bin near 45 and 135 degrees (6.7 % at exactly 45 degrees), and
+            results differ from the trapezoid's at that level. Pass "hat" to reproduce earlier results bitwise.
         fft_max_gb : float
             GPU memory for the scratch buffers of the "fft" projector (they hold a slice of
             the batch's orientations at a time).
@@ -259,6 +266,11 @@ class SinglePhaseForwardOperator:
             raise ValueError(f"projector must be 'auto', 'native', 'fft' or 'gratopy', not {projector!r}")
         if projector == "auto":
             projector = "fft" if self.Nx * self.Ny > AUTO_FFT_PIXELS and fourier_radon.available() else "native"
+        if radon_kernel is None:
+            radon_kernel = "trapezoid" if projector == "native" else "hat"
+        if radon_kernel != "hat" and projector != "native":
+            raise ValueError(f"radon_kernel={radon_kernel!r} needs the native projector (projector is {projector!r})")
+        self.radon_kernel = radon_kernel
         self.projector = projector
         self.fradon = None
         if projector == "fft":
@@ -288,6 +300,7 @@ class SinglePhaseForwardOperator:
                 detector_shift=self.cor_offset,
                 angle_weights=abs(delta),
                 bins_per_item=3,
+                kernel=radon_kernel,
             )
             self.PS = None
         else:
