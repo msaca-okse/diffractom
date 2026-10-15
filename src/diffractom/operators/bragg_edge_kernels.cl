@@ -62,7 +62,7 @@
  *         while avoiding float32 underflow: V_cm³ ≈ 1e-23 so V_cm³² ≈ 1e-46 sits
  *         right at the edge of the float32 subnormal range, previously causing
  *         NaN/Inf in the naive cm-based computation.
- *     6.  Edge broadening (geometric + instrumental):
+ *     6.  Gaussian edge broadening (orientation spread + lattice strain):
  *           σ = λ0 · sqrt(tan²(α0)·σ_grid² + e0²) · edge_blur_scale
  *     7.  Exponential tail decay length:
  *           α = τ(λ0) / 10000
@@ -189,7 +189,8 @@ static float ic_profile(float lam, float lam0,
  *                  amplitude-formula note above for why this matters for
  *                  float32 numerical stability)
  * sigma_grid     – angular half-width of the orientation node in radians
- * e0             – instrumental exponential resolution parameter
+ * e0             – rms lattice strain ⟨(Δd/d)²⟩^½ of the sample (Malamud &
+ *                  Santisteban 2016, eq. 19), not an instrument parameter
  * edge_blur_scale– multiplier applied to the edge broadening term
  * lam_min, lam_max – wavelength window (Å)
  * N_orient, N_Omega, N_lam, N_hkl – dimensions
