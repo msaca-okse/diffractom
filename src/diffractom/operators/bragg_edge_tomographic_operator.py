@@ -131,7 +131,11 @@ def build_bragg_matrix_cpu(
     sig : float
         Orientation spread in **radians** (``G_big`` in MATLAB).
     e0 : float
-        Instrument resolution parameter (``e0 = 0.0001`` in MATLAB).
+        rms relative spread of the lattice spacings, ε = ⟨(Δd/d)²⟩^½ (dimensionless;
+        the strain ε of Malamud & Santisteban 2016, J. Appl. Cryst. 49, 348, eq. 19). A property of the
+        sample (microstrain, e.g. ~1e-3 for as-built laser powder-bed-fused steel), not of the instrument:
+        the Gaussian width of every peak is σ = λ₀ · sqrt(e0² + sig² tan²α₀). Any Gaussian instrument
+        broadening not described by the pulse tail is absorbed into it as well.
     pulse_tail_fn : callable, optional
         Function ``f(lam) -> tau`` that returns the instrument pulse-tail
         parameter τ(λ).  ``α = τ / 10000`` is the exponential decay length
@@ -298,7 +302,11 @@ def build_bragg_matrix_gpu(
     sig : float
         Orientation spread in radians (G_big).
     e0 : float
-        Instrument resolution parameter.
+        rms relative spread of the lattice spacings, ε = ⟨(Δd/d)²⟩^½ (dimensionless;
+        the strain ε of Malamud & Santisteban 2016, J. Appl. Cryst. 49, 348, eq. 19). A property of the
+        sample (microstrain, e.g. ~1e-3 for as-built laser powder-bed-fused steel), not of the instrument:
+        the Gaussian width of every peak is σ = λ₀ · sqrt(e0² + sig² tan²α₀). Any Gaussian instrument
+        broadening not described by the pulse tail is absorbed into it as well.
     pulse_tail_fn : callable, optional
         Must be :func:`~diffractom.utils.instrument.raden_pulse_tail` (the
         only model the kernel implements).
@@ -487,7 +495,11 @@ def build_bragg_matrix_quadrature(
         Orientation spread used by the Bragg-edge profile itself.
 
     e0
-        Instrument resolution parameter.
+        rms relative spread of the lattice spacings, ε = ⟨(Δd/d)²⟩^½ (dimensionless;
+        the strain ε of Malamud & Santisteban 2016, J. Appl. Cryst. 49, 348, eq. 19). A property of the
+        sample (microstrain, e.g. ~1e-3 for as-built laser powder-bed-fused steel), not of the instrument:
+        the Gaussian width of every peak is σ = λ₀ · sqrt(e0² + sig² tan²α₀). Any Gaussian instrument
+        broadening not described by the pulse tail is absorbed into it as well.
 
     quadrature_memory_gb
         Approximate maximum size of the returned B batch in GB.
@@ -750,7 +762,11 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         Corresponds to ``G_big`` (in rad) in the MATLAB code.  If *None*
         (default), the value is taken from ``grid.nodes[leaf_0].sigma``.
     e0 : float
-        Instrument exponential resolution parameter (dimensionless, ~1e-4).
+        rms relative spread of the lattice spacings, ε = ⟨(Δd/d)²⟩^½ (dimensionless;
+        the strain ε of Malamud & Santisteban 2016, J. Appl. Cryst. 49, 348, eq. 19). A property of the
+        sample (microstrain, e.g. ~1e-3 for as-built laser powder-bed-fused steel), not of the instrument:
+        the Gaussian width of every peak is σ = λ₀ · sqrt(e0² + sig² tan²α₀). Any Gaussian instrument
+        broadening not described by the pulse tail is absorbed into it as well.
     pulse_tail_fn : callable, optional
         Instrument pulse-tail function ``f(lam) -> tau``.  Defaults to
         :func:`~diffractom.utils.instrument.raden_pulse_tail` (RADEN/J-PARC).
