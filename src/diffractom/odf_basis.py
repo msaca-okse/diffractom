@@ -150,9 +150,9 @@ def _frame_rotation(orix_group, sym: Rotation) -> Rotation:
 
 
 def _orix_group(order):
-    """orix's proper point group with this many rotations (1, 2, 222, 32, 422, 622, 432)."""
+    """orix's proper point group with this many rotations (1, 2, 3, 222, 32, 422, 622, 432)."""
     from orix.quaternion import symmetry as S
-    groups = {1: S.C1, 2: S.C2, 4: S.D2, 6: S.D3, 8: S.D4, 12: S.D6, 24: S.O}
+    groups = {1: S.C1, 2: S.C2, 3: S.C3, 4: S.D2, 6: S.D3, 8: S.D4, 12: S.D6, 24: S.O}
     if order not in groups:
         raise ValueError(f"no cubochoric sampling for a point group of order {order}; use method='random'")
     return groups[order]
