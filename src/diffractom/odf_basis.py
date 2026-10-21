@@ -121,12 +121,17 @@ def uniform_fundamental_zone(spacing_deg, symmetry, method="cubochoric", seed=0)
     sym = symmetry_rotations(symmetry)
     if method == "cubochoric":
         from orix.sampling import get_sample_fundamental
-        group = _orix_group(len(sym))
-        r = get_sample_fundamental(resolution=spacing_deg, point_group=group, method="cubochoric")
-        q = Rotation.from_quat(np.ascontiguousarray(r.data[:, [1, 2, 3, 0]]))
-        # orix's hexagonal/trigonal groups are set up with a along x, diffractom's (ImageD11's) frame has a* along x:
-        # if sym = Rz(phi) G_orix Rz(phi)^T, the orix samples U_o (covering with G_orix) map to U_o Rz(phi)^T
-        return np.ascontiguousarray((q * _frame_rotation(group, sym).inv()).as_quat())
+        for group in _orix_groups(len(sym)):                # e.g. order 6: 32 (D3) or 6 (C6)
+            try:
+                C = _frame_rotation(group, sym)
+            except ValueError:
+                continue
+            r = get_sample_fundamental(resolution=spacing_deg, point_group=group, method="cubochoric")
+            q = Rotation.from_quat(np.ascontiguousarray(r.data[:, [1, 2, 3, 0]]))
+            # orix's hexagonal/trigonal groups are set up with a along x, diffractom's (ImageD11's) frame has a* along x:
+            # if sym = Rz(phi) G_orix Rz(phi)^T, the orix samples U_o (covering with G_orix) map to U_o Rz(phi)^T
+            return np.ascontiguousarray((q * C.inv()).as_quat())
+        raise ValueError("the point group is not orix's group in any rotated setting; use method='random'")
     if method == "random":
         n = int(3 * 8 * np.pi ** 2 / np.deg2rad(spacing_deg) ** 3 / len(sym))
         q = to_fundamental_zone(Rotation.random(n, random_state=seed).as_quat(), sym)
@@ -149,10 +154,10 @@ def _frame_rotation(orix_group, sym: Rotation) -> Rotation:
     raise ValueError("the point group is not orix's group in any rotated setting; use method='random'")
 
 
-def _orix_group(order):
-    """orix's proper point group with this many rotations (1, 2, 3, 222, 32, 422, 622, 432)."""
+def _orix_groups(order):
+    """orix's proper point groups with this many rotations (1; 2; 3; 222, 4; 32, 6; 422; 622, 23; 432)."""
     from orix.quaternion import symmetry as S
-    groups = {1: S.C1, 2: S.C2, 3: S.C3, 4: S.D2, 6: S.D3, 8: S.D4, 12: S.D6, 24: S.O}
+    groups = {1: [S.C1], 2: [S.C2], 3: [S.C3], 4: [S.D2, S.C4], 6: [S.D3, S.C6], 8: [S.D4], 12: [S.D6, S.T], 24: [S.O]}
     if order not in groups:
         raise ValueError(f"no cubochoric sampling for a point group of order {order}; use method='random'")
     return groups[order]
