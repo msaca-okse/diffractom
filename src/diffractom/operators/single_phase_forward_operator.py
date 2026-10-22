@@ -36,6 +36,9 @@ class SinglePhaseForwardOperator:
     All heavy computation runs on OpenCL.
     """
 
+    coefficient_layout = "dense"   # coefficients (K, Ny, Nx); "local": LocalSinglePhaseForwardOperator's patches
+    _pf_forward_csr = True         # the sparse modes keep (or transpose to) the forward CSR for the PF products
+
     def __init__(
         self,
         cfg: Mapping[str, Any],
@@ -979,7 +982,7 @@ class SinglePhaseForwardOperator:
         budget = np.inf if max_gb is None else max_gb * 1024**3
         if mode == "generated":
             store, n_store = None, 0
-        elif both <= budget:
+        elif both <= budget and self._pf_forward_csr:
             store, n_store = "both", nb
         elif adj <= budget:
             store, n_store = "adjoint", nb
@@ -1040,7 +1043,7 @@ class SinglePhaseForwardOperator:
         # scratch buffers for what happens in every call
         if generated or store == "adjoint":
             gen.allocate(max([n_cand[ib] for ib in generated], default=0),
-                         max(nnz_stored, default=0) if store == "adjoint" else 0)
+                         max(nnz_stored, default=0) if store == "adjoint" and self._pf_forward_csr else 0)
             self.pf_gen = gen
         else:
             gen.release()
@@ -1547,8 +1550,9 @@ def estimate_L_power(
     q = op.queue
     rng = np.random.default_rng(seed)
 
-    # x in domain, (K, Ny, Nx)
-    x = clarray.empty(q, (op.K, op.Ny, op.Nx), np.float32)
+    dense = getattr(op, "coefficient_layout", "dense") == "dense"
+    # x in domain, (K, Ny, Nx) (or the operator's coefficient shape)
+    x = clarray.empty(q, (op.K, op.Ny, op.Nx) if dense else op.coeff_shape, np.float32)
     # y in range, C
     Ax = clarray.empty(q, (op.N_Omega, op.My, op.N_seg), np.float32, order="C")
     # z = A^*Ax in domain
@@ -1556,7 +1560,10 @@ def estimate_L_power(
 
     # init x random (drawn as (Nx, Ny, K) and stored with the pixel fastest, as before the
     # coefficients became (K, Ny, Nx) C-order: the same start, the same estimate)
-    x_host = np.ascontiguousarray(rng.standard_normal((op.Nx, op.Ny, op.K)).astype(np.float32).transpose(2, 1, 0))
+    if dense:
+        x_host = np.ascontiguousarray(rng.standard_normal((op.Nx, op.Ny, op.K)).astype(np.float32).transpose(2, 1, 0))
+    else:
+        x_host = rng.standard_normal(op.coeff_shape).astype(np.float32)
     assert x.data is not None
     cl.enqueue_copy(q, x.data, x_host)
     q.finish()

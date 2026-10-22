@@ -80,15 +80,9 @@ class FISTASum:
         self.L = float(L)
         self.l1 = np.broadcast_to(np.asarray(l1, dtype=np.float64), (len(self.operators),)).copy()
         self.huber_delta = float(huber_delta)
-        if support is None:
-            self.masks = [None for _ in self.operators]
-        elif isinstance(support, str):
-            if support != "fov":
-                raise ValueError("support: 'fov', None or a mask (Ny, Nx)")
-            self.masks = [op.support_mask().astype(np.float32) for op in self.operators]
-        else:
-            m = (np.asarray(support) != 0).astype(np.float32)
-            self.masks = [m * op.support_mask().astype(np.float32) for op in self.operators]
+        if isinstance(support, str) and support != "fov":
+            raise ValueError("support: 'fov', None or a mask (Ny, Nx)")
+        self.masks = [self._mask(op, support) for op in self.operators]
         self.vf = None
         if volume_fractions is not None:
             vf = np.array([np.nan if v is None else float(v) for v in volume_fractions], dtype=np.float64)
@@ -98,6 +92,19 @@ class FISTASum:
                 self.vlam = float(volume_weight) * self.L / n
                 self.L *= 1.0 + 2.0 * float(volume_weight)          # the penalty's curvature is at most 2 lam n
         self.history = []
+
+    @staticmethod
+    def _mask(op, support):
+        """The support of an operator's coefficients, broadcastable to them (None: no constraint). Operators
+        with a local basis (coefficient_layout "local") hold the field of view in their support already."""
+        if support is None:
+            return None
+        if getattr(op, "coefficient_layout", "dense") != "dense":
+            return None if isinstance(support, str) else op.coefficient_mask(np.asarray(support) != 0)
+        m = op.support_mask().astype(np.float32)
+        if not isinstance(support, str):
+            m = m * (np.asarray(support) != 0).astype(np.float32)
+        return m[None]
 
     def volume_gradient(self, xs):
         """Per operator the (constant) gradient of the volume-fraction penalty, and the penalty's value."""
@@ -111,7 +118,7 @@ class FISTASum:
         return sum(op.direct(x) for op, x in zip(self.operators, xs))
 
     def run(self, xs, b, niter, weights=None, verbose=1, diagnostics_interval=10, offset=None):
-        """xs: list of starting coefficients (NumPy, (K_p, Ny, Nx)); b: data (N_Omega, My, N_seg); weights:
+        """xs: list of starting coefficients (NumPy, (K_p, Ny, Nx), or the operator's coeff_shape); b: data (N_Omega, My, N_seg); weights:
         broadcastable to b (e.g. (N_seg,)); offset: a fixed prediction added to sum_p A_p x_p (e.g. of parts that are
         not fitted; with log_scale it matters whether it is added here or subtracted from b). Returns the list of
         coefficients."""
@@ -148,7 +155,7 @@ class FISTASum:
                     x_new -= np.float32(tau * self.l1[p])           # prox of l1 * sum(x) with x >= 0
                 np.maximum(x_new, 0, out=x_new)
                 if self.masks[p] is not None:
-                    x_new *= self.masks[p][None]
+                    x_new *= self.masks[p]
                 ys[p] = x_new + beta * (x_new - xs[p])
                 xs[p] = x_new
             t = t_new

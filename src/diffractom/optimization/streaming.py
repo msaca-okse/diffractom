@@ -342,7 +342,11 @@ def estimate_L_power_streamed(op, niter=20, seed=0, eps=1e-30, verbose=1, parall
     drawn in parallel, a column from its own stream (default_rng([seed, ix])): a few seconds.
     parallel_start=False draws the same numbers as estimate_L_power (the GPU version), from one
     stream, which cannot be parallelised: about 7 minutes for 1200 x 1200 pixels and K = 20000.
-    The two starts give slightly different estimates (and so slightly different FISTA steps)."""
+    The two starts give slightly different estimates (and so slightly different FISTA steps).
+    Operators whose coefficients are not streamed (e.g. LocalSinglePhaseForwardOperator): estimate_L_power."""
+    if getattr(op, "coefficient_layout", "dense") != "dense":
+        from ..operators.single_phase_forward_operator import estimate_L_power
+        return estimate_L_power(op, niter=niter, seed=seed, eps=eps, verbose=verbose)
     st = streamer_for(op)
     pool = st.pool
     rng = np.random.default_rng(seed)

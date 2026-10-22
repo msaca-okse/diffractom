@@ -80,6 +80,12 @@ def support_mask_to_gpu(queue, operator, support):
     """
     if support is None or support is False:
         return None
+    if getattr(operator, "coefficient_layout", "dense") != "dense":
+        # e.g. LocalSinglePhaseForwardOperator: its support (field of view included) is part of the operator
+        if isinstance(support, str) and support == "fov":
+            return None
+        raise ValueError("a support mask cannot be applied to this operator's coefficients; restrict the "
+                         "operator's LocalSupport instead (LocalSupport.restrict)")
     if isinstance(support, str):
         if support != "fov":
             raise ValueError(f"support must be 'fov', None or an (Ny, Nx) array, not {support!r}")
