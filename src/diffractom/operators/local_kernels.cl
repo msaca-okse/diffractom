@@ -42,58 +42,76 @@ __kernel void local_radon_forward(
     __constant float4 *geo,
     const int R, const float scale
 ){
-    const int pa = get_group_id(1);
-    const int p = pa / R, a = pa - p * R;
+    // work-group: get_local_size(1) angles of one patch, get_local_size(0) bins of each at a time
+    const int AB = get_local_size(1);
+    const int nab = (R + AB - 1) / AB;
+    const int p = get_group_id(1) / nab;
+    const int a = (get_group_id(1) - p * nab) * AB + get_local_id(1);
     const int4 bx = box[p];
     const int Wp = W[p];
-    const int o = off[(size_t)p * R + a];
-    const float4 g = geo[a];
-    const int rows_are_y = fabs(g.x) >= fabs(g.y);
-    const float A = rows_are_y ? g.x : g.y;
-    const float B = rows_are_y ? g.y : g.x;
-    const int v_lo = rows_are_y ? bx.x : bx.y;      // rows of the projection: y (or x)
-    const int v_n = rows_are_y ? bx.z : bx.w;
-    const int u_lo = rows_are_y ? bx.y : bx.x;      // along a row: x (or y)
-    const int u_hi = u_lo + (rows_are_y ? bx.w : bx.z) - 1;
-    const size_t du = rows_are_y ? 1 : (size_t)bx.w;
-    const size_t dv = rows_are_y ? (size_t)bx.w : 1;
-    const float inv = 1.0f / A;
-#ifdef TRAPEZOID
-    const float hw = 0.5f * (1.0f + fabs(A)), top = fmin(1.0f, fabs(A)), iw = 1.0f / fabs(A);
-#endif
     __global const float *cp = coef + coff[p];
     __global const uchar *mp = mask + coff[p];
-    __global float *sp = strips + soff[p] + (size_t)a * Wp;
-
-    for (int j = get_local_id(0); j < Wp; j += get_local_size(0)) {
-        const int s = o + j;
-        const int s0 = (s >= 0 ? s / NB : -((NB - 1 - s) / NB)) * NB;     // the strip of NB bins holding s
-        const int jj = s - s0;
-        float acc = 0.0f;
-        for (int vv = 0; vv < v_n; ++vv) {
-            const int v = v_lo + vv;
-            const float c = B * v + g.z;
+    if (a < R) {
+        const int o = off[(size_t)p * R + a];
+        const float4 g = geo[a];
+        const int rows_are_y = fabs(g.x) >= fabs(g.y);
+        const float A = rows_are_y ? g.x : g.y;
+        const float B = rows_are_y ? g.y : g.x;
+        const int v_lo = rows_are_y ? bx.x : bx.y;      // rows of the projection: y (or x)
+        const int v_n = rows_are_y ? bx.z : bx.w;
+        const int u_lo = rows_are_y ? bx.y : bx.x;      // along a row: x (or y)
+        const int u_hi = u_lo + (rows_are_y ? bx.w : bx.z) - 1;
+        const int du = rows_are_y ? 1 : bx.w;
+        const int dv = rows_are_y ? bx.w : 1;
+        const float inv = 1.0f / A;
 #ifdef TRAPEZOID
-            const float lo = fmin((s0 - hw - c) * inv, (s0 + NB - 1 + hw - c) * inv);
-            const float hi = fmax((s0 - hw - c) * inv, (s0 + NB - 1 + hw - c) * inv);
-#else
-            const float lo = fmin((s0 - 1.0f - c) * inv, (s0 + NB - c) * inv);
-            const float hi = fmax((s0 - 1.0f - c) * inv, (s0 + NB - c) * inv);
+        const float hw = 0.5f * (1.0f + fabs(A)), top = fmin(1.0f, fabs(A)), iw = 1.0f / fabs(A);
 #endif
-            const int u0 = max((int)floor(lo), u_lo);
-            const int u1 = min((int)ceil(hi), u_hi);
-            for (int u = u0; u <= u1; ++u) {
-                const size_t q = (size_t)vv * dv + (size_t)(u - u_lo) * du;
-                const float val = mp[q] ? cp[q] : 0.0f;
-                const float t = A * u + c - s0;
+        const float S = B * inv;                        // |S| <= 1: the u-range moves by -S per row
+        __global float *sp = strips + soff[p] + (size_t)a * Wp;
+        for (int j = get_local_id(0); j < Wp; j += get_local_size(0)) {
+            const int s = o + j;
+            const int s0 = (s >= 0 ? s / NB : -((NB - 1 - s) / NB)) * NB;     // the strip of NB bins holding s
+            const int jj = s - s0;
+            // the pixels with a non-zero weight for bin s: |A u + c - s| < hw (hat: < 1), c = B v + T0. Their range
+            // per row, with a margin of 1e-3 pixel for rounding, and the rows where it meets the box (+- 1 row).
+            // Pixels outside it would add exactly zero; the weights are those of the NB-bin strip (t from s0).
 #ifdef TRAPEZOID
-                acc += (clamp(hw - fabs(t - jj), 0.0f, top) * iw) * val;
+            const float hb = hw;
 #else
-                acc += fmax(1.0f - fabs(t - jj), 0.0f) * val;
+            const float hb = 1.0f;
 #endif
+            const float e1 = (s - hb - g.z) * inv, e2 = (s + hb - g.z) * inv;
+            const float Lmin = fmin(e1, e2) - 0.01f, Lmax = fmax(e1, e2) + 0.01f;
+            int va = 0, vb = v_n - 1;
+            if (fabs(S) > 1e-6f) {
+                const float r1 = (Lmin - u_hi) / S, r2 = (Lmax - u_lo) / S;
+                va = max(va, (int)floor(fmin(r1, r2)) - 1 - v_lo);
+                vb = min(vb, (int)ceil(fmax(r1, r2)) + 1 - v_lo);
+            } else if (Lmax < u_lo || Lmin > u_hi) {
+                vb = -1;
             }
+            float acc = 0.0f;
+            for (int vv = va; vv <= vb; ++vv) {
+                const int v = v_lo + vv;
+                const float c = B * v + g.z;
+                const float lo = fmin((s - hb - c) * inv, (s + hb - c) * inv) - 1e-3f;
+                const float hi = fmax((s - hb - c) * inv, (s + hb - c) * inv) + 1e-3f;
+                const int u0 = max((int)floor(lo), u_lo);
+                const int u1 = min((int)ceil(hi), u_hi);
+                for (int u = u0; u <= u1; ++u) {
+                    const int q = vv * dv + (u - u_lo) * du;
+                    const float val = mp[q] ? cp[q] : 0.0f;
+                    const float t = A * u + c - s0;
+#ifdef TRAPEZOID
+                    acc += (clamp(hw - fabs(t - jj), 0.0f, top) * iw) * val;
+#else
+                    acc += fmax(1.0f - fabs(t - jj), 0.0f) * val;
+#endif
+                }
+            }
+            sp[j] = scale * acc;
         }
-        sp[j] = scale * acc;
     }
 }
 

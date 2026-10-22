@@ -31,7 +31,8 @@ from .single_phase_forward_operator import SinglePhaseForwardOperator
 TY = 8          # detector lines per tile of the PF products (local_kernels.cl)
 LS_PF = 256     # work-group size of the forward PF product (a work-item per segment)
 LS_PA = 256     # work-group size of the adjoint PF product (a work-item per patch; V100: 8.8 ms vs 20.5 with 64)
-LS_RADON = 32   # work-group size of the strip projection (bins of one patch and angle)
+LS_RADON = 32   # strip projection: work-items per angle (bins of one patch)
+RADON_AB = 4    # strip projection: angles per work-group, in parallel
 LS_BACK = 64    # pixels per work-group of the backprojection
 
 
@@ -258,9 +259,10 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
 
     def _radon_forward(self, coeffs, lb):
         R = int(self.N_Omega)
-        self._k_rf(self.queue, (LS_RADON, lb["n"] * R), (LS_RADON, 1), coeffs.data, self._mask.data,
-                   self._strips.data, lb["box"].data, lb["coff"].data, lb["W"].data, lb["soff"].data,
-                   lb["off"].data, self.radon.geo_gpu.data, np.int32(R), self.radon.scale)
+        nab = -(-R // RADON_AB)
+        self._k_rf(self.queue, (LS_RADON, RADON_AB * lb["n"] * nab), (LS_RADON, RADON_AB), coeffs.data,
+                   self._mask.data, self._strips.data, lb["box"].data, lb["coff"].data, lb["W"].data,
+                   lb["soff"].data, lb["off"].data, self.radon.geo_gpu.data, np.int32(R), self.radon.scale)
 
     def _radon_backward(self, coeffs, lb):
         self._k_rb(self.queue, (lb["n_blk"] * LS_BACK,), (LS_BACK,), self._strips.data, coeffs.data,
