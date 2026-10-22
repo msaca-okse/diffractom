@@ -8,6 +8,10 @@ g(v) = c asinh(v / c): sum_i w_i / 2 (g(u_i) - g(b_i))^2, u = sum_p A_p x_p. Tha
 difference of logarithms above it (c (ln u - ln b) for u, b >> c), so whether a bright spot is there counts more than how
 bright it is. Not convex where the prediction exceeds the data many times; the step is 1 / (log_step L).
 
+With ``over_weight`` = a < 1 the least-squares misfit is one-sided: bins where the prediction exceeds the data count a times,
+so a crystal whose modelled spots only partly overlap the measured ones (peak shape, orientation spread, cell) is not
+pushed out of the fit by the parts that miss. Convex; the step is unchanged.
+
 Every operator is used through its NumPy ``direct`` / ``adjoint`` (so each keeps its own PF storage, projector and
 coefficient streaming); the coefficients x_p are NumPy arrays (K_p, Ny, Nx). huber_delta = inf is weighted least
 squares. Pixels outside each operator's field of view are kept at zero (support="fov").
@@ -28,10 +32,12 @@ def _huber_value(r, delta, w):
     return float(np.sum(w * np.where(a <= delta, 0.5 * r * r, delta * (a - 0.5 * delta)), dtype=np.float64))
 
 
-def _data_term(u, b, w, delta, c=None, gb=None):
+def _data_term(u, b, w, delta, c=None, gb=None, over_weight=1.0):
     """Weighted gradient of the data term with respect to the prediction u, and a function giving its value."""
     if c is None:
         r = u - b
+        if over_weight != 1.0:
+            w = w * np.where(r > 0, np.float32(over_weight), np.float32(1.0))
         return (_huber_grad(r, delta) * w).astype(np.float32), lambda: _huber_value(r, delta, w)
     q = u / c
     r = c * np.arcsinh(q) - gb
@@ -62,7 +68,7 @@ class FISTASum:
     """Non-negative FISTA with a Huber (or least-squares) data term for a sum of operators."""
 
     def __init__(self, operators, L, huber_delta=np.inf, support="fov", l1=0.0, volume_fractions=None,
-                 volume_weight=1.0, log_scale=None, log_step=2.0):
+                 volume_weight=1.0, log_scale=None, log_step=2.0, over_weight=1.0):
         """l1: weight of a sparsity penalty l1 * sum(x) (x >= 0), a scalar or one value per operator.
         volume_fractions: target share of every operator's summed coefficients in the total of the operators that have
         a target (one value per operator, None or nan = free), held softly by the penalty
@@ -77,6 +83,7 @@ class FISTASum:
         self.operators = list(operators)
         self.log_scale = None if log_scale is None else np.asarray(log_scale, dtype=np.float32)
         self.log_step = float(log_step)
+        self.over_weight = float(over_weight)
         self.L = float(L)
         self.l1 = np.broadcast_to(np.asarray(l1, dtype=np.float64), (len(self.operators),)).copy()
         self.huber_delta = float(huber_delta)
@@ -127,7 +134,7 @@ class FISTASum:
             u = self.direct(ys)
             if offset is not None:
                 u += offset
-            g, value = _data_term(u, b, w, self.huber_delta, c, gb)
+            g, value = _data_term(u, b, w, self.huber_delta, c, gb, self.over_weight)
             del u
             report = verbose and (it == 1 or it % diagnostics_interval == 0 or it == niter)
             if report:
