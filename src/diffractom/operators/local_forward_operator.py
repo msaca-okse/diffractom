@@ -12,6 +12,20 @@ generated, sparse) and the geometry are those of SinglePhaseForwardOperator, whi
 Same operator as SinglePhaseForwardOperator applied to coefficients that are zero outside the support (native
 projector): with one patch per orientation (split_patches=False) the results agree bitwise; with several
 patches per orientation (the default when an orientation's voxels are scattered) to float rounding.
+
+Measured (A40, 2026-10-22, commit ade510a; synthetic Voronoi grains of mean diameter d voxels, 4 orientations per
+grain within 1 deg, each allowed in its grain grown by 2 voxels; N x N grid, 360 omega, 360 eta, 14 rings, sigma
+0.4 deg; FISTA-Huber seconds per iteration, local / global with the same orientations):
+    N 200, d 10, K  2036: 0.048 / 0.172      coefficients 1 MB / 0.3 GB
+    N 200, d  5, K  8148: 0.090 / 0.645                   2 MB / 1.2 GB
+    N 400, d 20, K  2036: 0.094 / 0.622                   4 MB / 1.2 GB
+    N 400, d 10, K  8148: 0.227 / 2.24                    5 MB / 4.9 GB
+    N 400, d  5, K 32596: 0.69  / 8.86 (streamed)         8 MB / 19 GB
+    N 600, d 10, K 18336: 0.79  / 6.19 (streamed)        12 MB / 25 GB
+    N 600, d  5, K 73340: 2.75  / - (105 GB per array)   19 MB
+The Z-order numbering and larger batches since (1b1fc8a) cut the passes over the data array at large K: V100,
+N 400, d 5: 0.94 -> 0.31 s. Simulated Al 10 deg (99 x 99, K 3025 -> 2347 used, 3.8 % of the coefficients):
+forward + adjoint 30 ms vs 132 ms (V100).
 """
 from __future__ import annotations
 
