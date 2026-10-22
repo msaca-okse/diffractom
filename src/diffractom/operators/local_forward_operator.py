@@ -26,6 +26,7 @@ from ..utils.arrays import as_host, check_device
 from ..utils.grid import MatrixGrid
 from ..utils.support import fov_support_mask
 from .local_support import LocalSupport, build_patches
+from .pf_generate import CAND_BYTES, NNZ_BYTES
 from .single_phase_forward_operator import SinglePhaseForwardOperator
 
 TY = 8          # detector lines per tile of the PF products (local_kernels.cl)
@@ -34,6 +35,18 @@ LS_PA = 256     # work-group size of the adjoint PF product (a work-item per pat
 LS_RADON = 32   # strip projection: work-items per angle (bins of one patch)
 RADON_AB = 4    # strip projection: angles per work-group, in parallel
 LS_BACK = 64    # pixels per work-group of the backprojection
+
+
+def _morton(y, x):
+    """Z-order (Morton) code of non-negative integer coordinates below 2^16."""
+    def spread(v):
+        v = np.asarray(v, dtype=np.uint64) & np.uint64(0xFFFF)
+        v = (v | (v << np.uint64(8))) & np.uint64(0x00FF00FF)
+        v = (v | (v << np.uint64(4))) & np.uint64(0x0F0F0F0F)
+        v = (v | (v << np.uint64(2))) & np.uint64(0x33333333)
+        v = (v | (v << np.uint64(1))) & np.uint64(0x55555555)
+        return v
+    return (spread(y) << np.uint64(1)) | spread(x)
 
 
 def _grid_arrays(grid):
@@ -64,6 +77,10 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
     split_patches, merge_gap, min_box_fill : how the pairs are grouped into patches (build_patches): an
         orientation whose voxels fill less than min_box_fill of their bounding box is split into clusters
         (voxels within merge_gap of each other stay together). split_patches=False: one box per orientation.
+    spatial_order : number the orientations internally along a Z-order curve through their voxels (default), so
+        that an orientation batch covers one part of the slice: its PF products then read and write only the
+        detector lines of that part instead of the whole data array. False: the grid's order. (Internal: the
+        coefficients and to_dense / to_coo use the grid's order either way.)
     pf_chunk : segments per chunk of the PF products in local memory (default: as many as 32 KB hold for TY lines).
 
     Only the native projector (radon_kernel "trapezoid" or "hat") and the sparse PF modes ("auto", "sparse",
@@ -73,7 +90,7 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
     coefficient_layout = "local"
 
     def __init__(self, cfg, material, grid, max_gb, support: LocalSupport, verbose=False, split_patches=True,
-                 merge_gap=2, min_box_fill=0.5, restrict_to_fov=True, pf_chunk=None, **kwargs):
+                 merge_gap=2, min_box_fill=0.5, restrict_to_fov=True, spatial_order=True, pf_chunk=None, **kwargs):
         t0 = time.perf_counter()
         projector = kwargs.pop("projector", "native")
         if projector not in ("native", "auto"):
@@ -104,10 +121,28 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
             raise ValueError("the support is empty (inside the field of view)")
         self.support = support
         self.K_basis = len(mats)
-        self.orientation_index = support.orientations_used()     # operator orientation -> grid orientation
-        k_int = np.searchsorted(self.orientation_index, support.k)
-        self._patches = build_patches(k_int, support.iy, support.ix, len(self.orientation_index),
-                                      split=split_patches, merge_gap=merge_gap, min_box_fill=min_box_fill)
+        used = support.orientations_used()
+        k_used = np.searchsorted(used, support.k)
+        if spatial_order:
+            # orientations numbered along a Z-order curve through their voxels' centroids: an orientation batch then
+            # covers one part of the slice, and its PF products touch only the detector lines that part projects to
+            cnt = np.bincount(k_used, minlength=len(used))
+            cy = np.bincount(k_used, weights=support.iy, minlength=len(used)) / cnt
+            cx = np.bincount(k_used, weights=support.ix, minlength=len(used)) / cnt
+            order = np.argsort(_morton(cy.astype(np.int64), cx.astype(np.int64)), kind="stable")
+        else:
+            order = np.arange(len(used))
+        rank = np.empty(len(used), dtype=np.int64)
+        rank[order] = np.arange(len(used))
+        self.orientation_index = used[order]                    # operator orientation -> grid orientation
+        k_int = rank[k_used]
+        perm = np.lexsort((support.ix, support.iy, k_int))      # pairs sorted by operator orientation
+        P = build_patches(k_int[perm], support.iy[perm], support.ix[perm], len(used), split=split_patches,
+                          merge_gap=merge_gap, min_box_fill=min_box_fill)
+        pair_index = np.empty_like(P["pair_index"])
+        pair_index[perm] = P["pair_index"]                     # in the order of support's pairs
+        P["pair_index"] = pair_index
+        self._patches = P
         self.n_coef = self._patches["n_coef"]
         self.n_patches = len(self._patches["pk"])
         self._pf_chunk = pf_chunk
@@ -152,6 +187,19 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
         strips = 4 * self.N_Omega * 64 * self.K_batch_max          # a guess (the strips are not known yet)
         free = available - 4 * coeff_bytes - 2 * data_bytes - strips - 1024**3
         return 0.5 * max(free, 0) / 1024**3
+
+    def sparse_batch_size(self, fill):
+        """Orientations per batch: as many as max_gb holds of the strips (estimated at 64 bins per angle) and the
+        generator's scratch at this fill, at most sparse_batch_max and what the forward PF product's table holds in
+        local memory (TY x batch floats); no image buffers (unlike SinglePhaseForwardOperator) and no minimum
+        number of batches (nothing is streamed). Fewer batches = fewer passes over the data array."""
+        R, CP = self.N_Omega, self.N_seg
+        nnz_per_k = 1.1 * fill * R * CP
+        bytes_per_k = 4 * R * 64 + 8 * R + (CAND_BYTES + NNZ_BYTES) * nnz_per_k
+        kb = int(self.pf_batch_max_gb * 1024**3 // bytes_per_k)
+        local_max = (self.queue.device.local_mem_size - 1024) // (4 * TY)
+        limit = min(self.sparse_batch_max, local_max, (2**31 - 1) // max(R * self.My, int(nnz_per_k) + 1, R))
+        return max(1, min(kb, limit, self.K))
 
     def adjoint_batches_cl(self, *args, **kwargs):
         raise NotImplementedError("the local-basis operator has no batched adjoint (no fused FISTA update)")
