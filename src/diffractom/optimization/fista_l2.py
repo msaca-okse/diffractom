@@ -159,6 +159,8 @@ class FISTAL2:
         self.k_extrapolate    = cl.Kernel(self.fista_prg, "extrapolate")
 
         self.prox_kernels = ProxKernels(self.ctx)
+        if prox_kind == "nonneg_tv" and getattr(operator, "coefficient_layout", "dense") != "dense":
+            raise ValueError("prox_kind 'nonneg_tv' needs (K, Ny, Nx) coefficient images")
         self.support_gpu = support_mask_to_gpu(self.queue, operator, support)
         self.tv_kernels = TVProxKernels(self.ctx)
 
@@ -250,13 +252,14 @@ class FISTAL2:
                 converted copy) or a C-contiguous pyopencl array (everything on the GPU).
         out_gpu:  the data b, (N_Omega, My, N_seg) float32: a NumPy array (uploaded) or a
                 C-contiguous pyopencl array.
-        returns the solution: the NumPy array (streamed) or x0_gpu (on the GPU)
+        returns the solution: the NumPy array (streamed, or copied back from the GPU for operators
+                that cannot stream, e.g. MatrixTomographicOperator) or x0_gpu (on the GPU)
         """
         t_start = time.perf_counter()  # iteration times in iter_stats count from here (setup in the first)
         q = self.queue
 
         # ---- inputs: shapes, dtype, layout; NumPy data are uploaded ----
-        streamed, x0_gpu, out_gpu, _, uploaded = prepare_inputs(self.op, q, x0_gpu, out_gpu, None)
+        streamed, x0_gpu, out_gpu, _, uploaded, host_x0, _ = prepare_inputs(self.op, q, x0_gpu, out_gpu, None)
         if streamed and not self.fused:
             raise ValueError("streaming the coefficients (x0 as a NumPy array) needs the fused update: an "
                              "element-wise prox ('nonneg', 'l1', 'nonneg_l1') and fused=True")
@@ -510,4 +513,8 @@ class FISTAL2:
         q.finish()
         # --------------------------------------------
 
+        if host_x0 is not None:  # a NumPy start for an operator that cannot stream: the result back in it
+            x.get(ary=host_x0)
+            x.base_data.release()
+            x = host_x0
         return x

@@ -115,7 +115,8 @@ class PartialSums:
 
 def fused_available(operator, prox_kind):
     """Whether the fused update can be used with this operator and proximal operator."""
-    return prox_kind in PROX_CODES and hasattr(operator, "adjoint_batches_cl")
+    return (prox_kind in PROX_CODES and hasattr(operator, "adjoint_batches_cl")
+            and getattr(operator, "coefficient_layout", "dense") == "dense")
 
 
 class FusedUpdate:

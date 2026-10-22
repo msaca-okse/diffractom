@@ -208,6 +208,44 @@ Unnormalised intensities need the background under the rings removed in the
 data reduction and segments partly off the detector excluded
 (`diffractom.utils.segment_coverage`).
 
+### Local basis: orientations only where they occur
+
+With a global basis every orientation has an image on the whole grid (K x Ny x Nx
+coefficients) and is projected over the whole detector. When it is known beforehand
+where an orientation can occur, e.g. from point-by-point indexing (the candidate grains
+of every voxel), `LocalSinglePhaseForwardOperator` keeps coefficients only there. A
+`LocalSupport` lists the allowed (orientation, voxel) pairs; the operator stores them as
+small rectangular patches, projects each patch onto a strip of the detector a few bins
+wider than the patch, and applies the PF matrix only where strips are. It is the same
+operator as `SinglePhaseForwardOperator` on coefficients that are zero outside the
+support (bitwise, with one patch per orientation).
+
+```python
+from diffractom import LocalSupport, LocalSinglePhaseForwardOperator, estimate_L_power
+
+# cand_iy, cand_ix: voxel of every pbp candidate on the TT grid (row, column);
+# cand_U: its orientation matrix (crystal -> sample), (N, 3, 3); basis: the grid's (K, 3, 3)
+support = LocalSupport.from_candidates(basis, cand_iy, cand_ix, cand_U, "cubic", (Ny, Nx),
+                                       tol_deg=1.0, dilate=2)
+op = LocalSinglePhaseForwardOperator(cfg, mat, grid, max_gb=2.0, support=support, normalized=True)
+x = np.zeros(op.coeff_shape, dtype=np.float32)   # flat: only the allowed coefficients
+L = estimate_L_power(op, niter=6)
+x = FISTAHuber(op, prox_kind="nonneg", L=1.1 * L, huber_delta=100).run(x, b, niter=100)
+coeffs = op.to_dense(x)                           # (K, Ny, Nx), zero outside the support
+k, iy, ix, value = op.to_coo(x)                   # the same without the dense array
+```
+
+On the simulated aluminium samples (99 x 99 voxels; the best 2 pbp candidates per voxel,
+1 degree, grown by 2 voxels) it gives the maps of the global basis with 2-5 % of its
+coefficients; without growing, voxels at grain boundaries lose their orientation. The
+restricted problem also allows a 4-7x larger FISTA step. On synthetic grain maps (A40,
+360 x 360 x 14 rings, 4 orientations per grain) a FISTA iteration was 4-13x faster than
+with the global basis, and the coefficients took megabytes instead of gigabytes (numbers
+in `LocalSinglePhaseForwardOperator`'s docstring). The data array and the PF matrix are
+as large as with the global basis. `FISTASum` combines it with global operators (e.g. a
+coarse basis for a fine-grained phase). Not supported: the TV prox, streaming (not
+needed), projectors other than the native one.
+
 ## License
 
 Apache License 2.0

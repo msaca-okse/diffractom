@@ -4,7 +4,9 @@ from .crystallography.material import Material
 from .crystallography.intensity import IntensityModel
 from .utils.grid import Grid, MatrixGrid
 from .utils.support import fov_support_mask
-from .operators.single_phase_forward_operator import SinglePhaseForwardOperator
+from .operators.single_phase_forward_operator import SinglePhaseForwardOperator, estimate_L_power
+from .operators.local_forward_operator import LocalSinglePhaseForwardOperator
+from .operators.local_support import LocalSupport
 from .operators.multi_phase_forward_operator import MultiPhaseForwardOperator
 from .operators.bulk_texture_forward_operator import BulkTextureForwardOperator
 from .operators.matrix_tomographic_operator import MatrixTomographicOperator
@@ -32,6 +34,9 @@ __all__ = [
     "MatrixGrid",
     "fov_support_mask",
     "SinglePhaseForwardOperator",
+    "LocalSinglePhaseForwardOperator",
+    "LocalSupport",
+    "estimate_L_power",
     "MultiPhaseForwardOperator",
     "FISTAHuber",
     "FISTAL2",
