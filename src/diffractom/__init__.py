@@ -10,7 +10,7 @@ from .operators.local_support import LocalSupport
 from .operators.multi_phase_forward_operator import MultiPhaseForwardOperator
 from .operators.bulk_texture_forward_operator import BulkTextureForwardOperator
 from .operators.matrix_tomographic_operator import MatrixTomographicOperator
-from .operators.bragg_edge_tomographic_operator import BraggEdgeTomographicOperator
+from .operators.bragg_edge_tomographic_operator import BraggEdgeTomographicOperator, bragg_edge_matrix
 from .optimization.fista_huber import FISTAHuber
 from .optimization.fista_l2 import FISTAL2
 from .optimization.fista_sum import FISTASum, estimate_L_sum
@@ -46,6 +46,7 @@ __all__ = [
     "BulkTextureForwardOperator",
     "MatrixTomographicOperator",
     "BraggEdgeTomographicOperator",
+    "bragg_edge_matrix",
     "build_interpolation_kernelSO3",
     "interpolateSO3",
     "build_interpolation_kernelS2",

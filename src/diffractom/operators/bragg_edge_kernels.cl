@@ -84,6 +84,10 @@
  *     τ(x) = erf((x - 1.39341)/0.18492) · (18.94806 - 10.82914·x)
  *           + 16.6964·x
  * ------------------------------------------------------------------ */
+#ifndef TAU_SCALE
+#define TAU_SCALE 1.0f
+#endif
+
 static float tau_func(float x) {
     float erf_arg = (x - 1.39341f) / 0.18492f;
     float e = erf(erf_arg);
@@ -99,6 +103,35 @@ static float tau_func(float x) {
  * alpha     – exponential tail length (Å)
  * amplitude – pre-computed kinematic amplitude (0 for inactive reflections)
  * ------------------------------------------------------------------ */
+#ifdef EXACT_EMG
+/* scaled complementary error function erfcx(z) = exp(z^2) erfc(z), z >= 0 (float32-safe) */
+static float erfcx_pos(float z) {
+    if (z < 5.0f) return exp(z * z) * erfc(z);
+    float i2 = 1.0f / (z * z);
+    return (0.5641895835f / z) * (1.0f - 0.5f * i2 + 0.75f * i2 * i2 - 1.875f * i2 * i2 * i2);
+}
+
+/*
+ * Exact profile: a Gaussian of width sigma convolved with the one-sided exponential pulse tail of decay length
+ * alpha (exponentially modified Gaussian), for any sigma / alpha. Reduces to the Gaussian for sigma >> alpha and
+ * to the bare exponential tail for sigma << alpha.
+ */
+static float ic_profile(float lam, float lam0,
+                        float sigma, float alpha, float amplitude) {
+    if (amplitude == 0.0f) return 0.0f;
+    float dlam = lam - lam0;
+    float x = dlam / sigma;
+    float sa = sigma / alpha;
+    float z = 0.7071067812f * (sa - x);
+    if (z >= 0.0f) {
+        if (x < -9.0f) return 0.0f;
+        return amplitude * (0.5f / alpha) * exp(-0.5f * x * x) * erfcx_pos(z);
+    }
+    float exponent = 0.5f * sa * sa - dlam / alpha;      /* < 0 here */
+    if (exponent < -80.0f) return 0.0f;
+    return amplitude * (0.5f / alpha) * exp(exponent) * erfc(z);
+}
+#else
 static float ic_profile(float lam, float lam0,
                         float sigma, float alpha, float amplitude) {
     if (amplitude == 0.0f) return 0.0f;
@@ -131,6 +164,7 @@ static float ic_profile(float lam, float lam0,
                * exp(-0.5f * arg * arg);
     }
 }
+#endif
 
 /* ------------------------------------------------------------------
  * Main kernel
@@ -255,7 +289,7 @@ __kernel void bragg_edge_col(
 
             float tan_a0 = tan(alpha0);
             sigma = lam0 * sqrt(tan_a0*tan_a0*sg2 + e02) * edge_blur_scale;
-            alpha = tau_func(lam0) / 10000.0f;
+            alpha = TAU_SCALE * tau_func(lam0) / 10000.0f;
 
             if (sigma <= 0.0f) sigma = 1.0e-6f;
             if (alpha <= 0.0f) alpha = 1.0e-6f;

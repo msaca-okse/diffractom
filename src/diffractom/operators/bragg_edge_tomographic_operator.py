@@ -23,42 +23,37 @@ where :math:`\\Phi_{hkl}` is an Ikeda-Carpenter Bragg-edge profile and
 :math:`\\lambda_0` is the edge wavelength for the given beam direction in
 the crystal frame of orientation k.
 
+Geometry
+--------
+The rotation axis is z. At beam angle phi (degrees, as recorded in the experiment) the neutron beam
+runs along ``b = R_z(phi) @ (0, 1, 0) = (-sin phi, cos phi, 0)`` in the sample frame (the convention
+of the MATLAB matrix generation). The sample frame is that of the reconstructed images: x along the
+columns, y along the rows of a coefficient image (K, Ny, Nx). The tomographic projection at phi
+integrates along the same direction b, so the projector angle is ``phi + 90 deg`` (in radians; the
+projectors integrate along (cos a, sin a)). If the real sample turned the other way, the
+reconstruction is the mirror image with mirrored orientations, still consistent with the data.
+
 Usage example
 -------------
 ::
 
     import numpy as np
-    from diffractom.crystallography.neutron_material import NeutronMaterial
-    from diffractom.operators import BraggEdgeTomographicOperator
-    from diffractom.utils import Grid
+    from diffractom import Material, Grid, BraggEdgeTomographicOperator, FISTAHuber
 
-    material = NeutronMaterial.steel_316L()
-    # Build an equispaced orientation grid with ~185 nodes for cubic symmetry
-    grid = Grid.from_equispaced_fundamental_zone(
-        resolution_deg=15, sigma=np.deg2rad(15))
-    lam = np.linspace(0.5, 6.5, 1000)          # wavelength grid in Å
+    atoms = np.loadtxt("atomos_316L_alloy.txt")[:, 1:]        # x, y, z, b (fm), u^2 (A^2)
+    material = Material.from_neutron_sites(atoms, a=3.6105)
+    grid = Grid.from_random_fundamental_zone(40000, "cubic", np.deg2rad(1.0))
+    grid.prune_close_orientations(theta_deg=3.0)
+    lam = np.linspace(1.5, 4.6, 220)                     # wavelength grid in A
     beam_angles = np.array([0, 30, 45, 60, 90, 120, 135, 150, 180])  # degrees
-    powder = np.ones_like(lam) * 0.3            # placeholder powder cross-section
 
-    K = len(grid.active_leaf_nodes())           # number of orientation columns
     op = BraggEdgeTomographicOperator(
-        material=material,
-        grid=grid,
-        beam_angles=beam_angles,
-        lam=lam,
-        # sigma_grid is read from grid by default; pass explicitly to override
-        e0=1e-4,
-        powder_xs=powder,
-        include_powder=True,
-        # --- MatrixTomographicOperator args ---
-        angles=np.deg2rad(beam_angles),
-        N_Omega=len(beam_angles),
-        My=512,
-        Nx=256,
-        Ny=256,
-        K=K + 1,                # +1 for powder
-        N_seg=len(lam),
+        material=material, grid=grid, beam_angles=beam_angles, lam=lam, e0=2e-3,
+        My=128, Nx=128, Ny=128,                           # MatrixTomographicOperator arguments
     )
+    x = np.zeros(op.coeff_shape, np.float32)             # (K, Ny, Nx)
+    data = ...                                           # (N_Omega, My, N_lam): attenuation -log(T)
+    x = FISTAHuber(op, prox_kind="nonneg", L=1.1 * op.estimate_L_power(6), huber_delta=1.0).run(x, data, 200)
 """
 
 from __future__ import annotations
@@ -84,11 +79,35 @@ from scipy.stats import qmc
 # OpenCL program loader
 # ---------------------------------------------------------------------------
 
-def _build_bragg_program(ctx: cl.Context) -> cl.Program:
-    """Compile bragg_edge_kernels.cl for the given OpenCL context."""
+_PROGRAMS = {}  # compiled programs per context (the quadrature calls the builder once per batch)
+
+
+PROFILES = ("legacy", "emg")
+
+
+def _build_bragg_program(ctx: cl.Context, profile: str = "legacy", pulse_tail_scale: float = 1.0) -> cl.Program:
+    """Compile bragg_edge_kernels.cl for the given OpenCL context.
+
+    profile "legacy": xs_singlecrystal_2022.m (pulse tail only where sigma < 0.2 alpha, a Gaussian elsewhere);
+    "emg": the exact convolution of the Gaussian with the exponential pulse tail for every sigma / alpha.
+    """
+    if profile not in PROFILES:
+        raise ValueError(f"profile must be one of {PROFILES}")
     cl_path = Path(__file__).with_name("bragg_edge_kernels.cl")
     src = cl_path.read_text()
-    return cl.Program(ctx, src).build()
+    opts = [f"-DTAU_SCALE={float(pulse_tail_scale):.8e}f"] + (["-DEXACT_EMG"] if profile == "emg" else [])
+    return cl.Program(ctx, src).build(options=opts)
+
+
+def emg_profile(dlam, sigma, alpha):
+    """Unit-area Gaussian (sigma) convolved with exp(-t / alpha) / alpha, t >= 0, at dlam = lam - lam0."""
+    from scipy.special import erfcx, erfc as sp_erfc
+    x = dlam / sigma
+    z = (sigma / alpha - x) / np.sqrt(2.0)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        pos = np.exp(-0.5 * x * x) * erfcx(np.maximum(z, 0.0))
+        neg = np.exp(np.minimum(0.5 * (sigma / alpha) ** 2 - dlam / alpha, 0.0)) * sp_erfc(np.minimum(z, 0.0))
+    return np.where(z >= 0, pos, neg) / (2.0 * alpha)
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +126,13 @@ def build_bragg_matrix_cpu(
     e0: float,
     pulse_tail_fn=raden_pulse_tail,
     edge_blur_scale: float = 1.0,
+    profile: str = "legacy",
+    pulse_tail_scale: float = 1.0,
 ) -> np.ndarray:
     """CPU implementation faithful to xs_text_full_cubic + xs_singlecrystal_2022.
+
+    profile : "legacy" (the MATLAB peak shape: pulse tail only where sigma < 0.2 alpha) or "emg" (exact
+    exponentially modified Gaussian for every sigma / alpha).
 
     Replicates the MATLAB computation that produces ``matrix_15_*deg.txt``.
     Works for any crystal system — no cubic assumption is made.
@@ -225,7 +249,13 @@ def build_bragg_matrix_cpu(
                 lam0_m * np.sqrt(np.tan(alpha0)**2 * sig**2 + e0**2)
                 * edge_blur_scale
             )
-            alfa    = pulse_tail_fn(lam0_m) / 10000.0
+            alfa    = pulse_tail_scale * pulse_tail_fn(lam0_m) / 10000.0
+
+            if profile == "emg":
+                dlam = lam[np.newaxis, :] - lam0_m[:, np.newaxis]
+                B[i_ang, i_n] += np.sum(amplitude[:, np.newaxis]
+                                        * emg_profile(dlam, sigma_g[:, np.newaxis], alfa[:, np.newaxis]), axis=0)
+                continue
 
             kk  = sigma_g <  0.2 * alfa    # erfc × exponential form
             kk1 = ~kk                      # Gaussian approximation
@@ -275,6 +305,8 @@ def build_bragg_matrix_gpu(
     ctx: cl.Context | None = None,
     queue: cl.CommandQueue | None = None,
     local_size: int = 64,
+    profile: str = "legacy",
+    pulse_tail_scale: float = 1.0,
 ) -> np.ndarray:
     """GPU-accelerated Bragg-edge matrix builder.
 
@@ -339,7 +371,10 @@ def build_bragg_matrix_gpu(
     if queue is None:
         queue = cl.CommandQueue(ctx)
 
-    prg = _build_bragg_program(ctx)
+    key = (ctx.int_ptr, profile, float(pulse_tail_scale))
+    prg = _PROGRAMS.get(key)
+    if prg is None:
+        prg = _PROGRAMS[key] = _build_bragg_program(ctx, profile, pulse_tail_scale)
     kernel = cl.Kernel(prg, "bragg_edge_col")
 
     # --- reflection table: [gx, gy, gz, F2, d] ---
@@ -452,6 +487,8 @@ def build_bragg_matrix_quadrature(
     queue: cl.CommandQueue | None = None,
     local_size: int = 64,
     quadrature_memory_gb: float = 1.0,
+    profile: str = "legacy",
+    pulse_tail_scale: float = 1.0,
 ) -> np.ndarray:
     """
     Build a Bragg-edge matrix by integrating over SO(3) quadrature
@@ -590,23 +627,8 @@ def build_bragg_matrix_quadrature(
         K,
     )
 
-    print(
-        f"Quadrature: K={K}, N_quad={N_quad}, "
-        f"batch_K={batch_K}"
-    )
 
-    batch_bytes = (
-        N_Omega
-        * batch_K
-        * N_quad
-        * N_lam
-        * 4
-    )
 
-    print(
-        f"Maximum B batch size: "
-        f"{batch_bytes / 1024**3:.3f} GB"
-    )
 
     # --------------------------------------------------------------
     # Output.
@@ -660,6 +682,8 @@ def build_bragg_matrix_quadrature(
                 ctx=ctx,
                 queue=queue,
                 local_size=local_size,
+                profile=profile,
+                pulse_tail_scale=pulse_tail_scale,
             )
 
         else:
@@ -675,6 +699,8 @@ def build_bragg_matrix_quadrature(
                 e0=e0,
                 pulse_tail_fn=pulse_tail_fn,
                 edge_blur_scale=edge_blur_scale,
+                profile=profile,
+                pulse_tail_scale=pulse_tail_scale,
             ).astype(np.float32)
 
         # ----------------------------------------------------------
@@ -704,11 +730,7 @@ def build_bragg_matrix_quadrature(
         #     (1, 1, N_quad, 1)
         # ----------------------------------------------------------
 
-        B_batch = np.sum(
-            B_quad
-            * weights[None, None, :, None],
-            axis=2,
-        )
+        B_batch = np.einsum("okql,q->okl", B_quad, weights, optimize=True)
 
         B_integrated[
             :,
@@ -716,15 +738,79 @@ def build_bragg_matrix_quadrature(
             :,
         ] = B_batch
 
-        print(
-            f"Quadrature batch "
-            f"{k_start}:{k_end} / {K}"
-        )
 
         del B_quad
         del B_batch
 
     return B_integrated
+
+
+def bragg_edge_matrix(
+    material: Material,
+    rotations: Rotation,
+    beam_angles_deg,
+    lam: np.ndarray,
+    sigma: float,
+    e0: float = 1e-4,
+    pulse_tail_fn=raden_pulse_tail,
+    edge_blur_scale: float = 1.0,
+    h_max: int = 10,
+    threshold: float = 1e-3,
+    use_gpu: bool = True,
+    ctx: cl.Context | None = None,
+    queue: cl.CommandQueue | None = None,
+    N_quad: int | None = None,
+    sigma_distance: float | None = None,
+    quadrature_memory_gb: float = 1.0,
+    profile: str = "legacy",
+    sigma_quad: float | None = None,
+    quad_seed: int | None = 0,
+    pulse_tail_scale: float = 1.0,
+) -> np.ndarray:
+    """The Bragg-edge matrix B (N_Omega, K, N_lam) of one material for the orientations `rotations`.
+
+    What BraggEdgeTomographicOperator builds, without the operator: matrices of several materials (phases)
+    can be stacked along K and used with MatrixTomographicOperator (with projector angles
+    deg2rad(beam_angles) + pi/2, the convention of BraggEdgeTomographicOperator).
+
+    sigma : orientation spread of every orientation (radians). With N_quad, B is averaged over N_quad
+    orientations in a ball of radius sigma_distance around every orientation (and the profile width of every
+    quadrature point is sigma_quad, by default 1.2 sigma_distance / N_quad^(1/3)).
+
+    profile : peak shape, "legacy" (MATLAB xs_singlecrystal_2022: the pulse tail only where the Gaussian width is
+    below 0.2 of the tail length) or "emg" (the exact convolution of the Gaussian with the exponential pulse tail).
+    pulse_tail_scale multiplies the tail length tau(lambda) (1 = the instrument's; a diagnostic).
+    """
+    beam_angles_deg = np.asarray(beam_angles_deg, dtype=np.float64)
+    lam = np.asarray(lam, dtype=np.float64)
+    bragg_table = material.neutron_bragg_table(lam_min=float(lam.min()), lam_max=float(lam.max()), h_max=h_max,
+                                               threshold=threshold)
+    if N_quad is None:
+        if use_gpu:
+            return build_bragg_matrix_gpu(bragg_table=bragg_table, rotations=rotations,
+                                          beam_angles_deg=beam_angles_deg, lam=lam, sig=sigma, e0=e0,
+                                          pulse_tail_fn=pulse_tail_fn, edge_blur_scale=edge_blur_scale,
+                                          ctx=ctx, queue=queue, profile=profile,
+                                          pulse_tail_scale=pulse_tail_scale)
+        return build_bragg_matrix_cpu(bragg_table=bragg_table, rotations=rotations, beam_angles_deg=beam_angles_deg,
+                                      lam=lam, sig=sigma, e0=e0, pulse_tail_fn=pulse_tail_fn,
+                                      edge_blur_scale=edge_blur_scale, profile=profile,
+                                      pulse_tail_scale=pulse_tail_scale).astype(np.float32)
+    if N_quad <= 0:
+        raise ValueError("N_quad must be positive.")
+    if sigma_distance is None or sigma_distance <= 0:
+        raise ValueError("sigma_distance must be given and positive when N_quad is specified.")
+    quad_rots, weights = sample_so3_ball_quadrature(rotations=rotations.as_matrix(), radius=sigma_distance,
+                                                    n_samples=N_quad, normalize_weights=True, seed=quad_seed)
+    if sigma_quad is None:
+        sigma_quad = 1.2 * sigma_distance / N_quad ** (1 / 3)
+    return build_bragg_matrix_quadrature(bragg_table=bragg_table, quad_rots=quad_rots, weights=weights,
+                                         K=len(rotations), beam_angles_deg=beam_angles_deg, lam=lam,
+                                         sig=sigma_quad, e0=e0,
+                                         pulse_tail_fn=pulse_tail_fn, edge_blur_scale=edge_blur_scale,
+                                         use_gpu=use_gpu, ctx=ctx, queue=queue,
+                                         quadrature_memory_gb=quadrature_memory_gb, profile=profile,
+                                         pulse_tail_scale=pulse_tail_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -748,13 +834,13 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         no material-specific logic remains in the operator itself.
     grid : Grid
         Orientation grid whose active leaf nodes define the K basis functions.
-        Sigma (angular half-width) is read from the nodes; pass ``sigma_grid``
-        explicitly to override.  Use :meth:`Grid.from_equispaced_fundamental_zone`
-        for an approximately equispaced cubic grid or
-        :meth:`Grid.from_euler_angles` to load MTEX-exported orientations.
+        Sigma (angular half-width) is read from the first node (all nodes share it); pass
+        ``sigma_grid`` explicitly to override.  E.g. :meth:`Grid.from_random_fundamental_zone`
+        followed by :meth:`Grid.prune_close_orientations`, or :meth:`Grid.from_rotation_matrices`.
     beam_angles : array_like, shape (N_Omega,) — degrees
         Tomographic sample angles.  The neutron beam direction for angle φ
-        is computed as :math:`R_z(\\phi) @ \\hat{y}`.
+        is :math:`R_z(\\phi) @ \\hat{y}` in the sample frame, for B and for the projection (see the
+        module docstring); the projector gets ``angles = deg2rad(beam_angles) + pi/2``.
     lam : np.ndarray, shape (N_lam,)
         Wavelength grid in Å.
     sigma_grid : float or None
@@ -776,27 +862,26 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         Use values below 1.0 for sharper edges and above 1.0 for broader
         edges.  Must be positive.
     powder_xs : np.ndarray or None, shape (N_lam,)
-        Powder-averaged cross-section spectrum.  Required if
-        ``include_powder=True``.
+        Powder-averaged attenuation spectrum, in the units of B (cm⁻¹ for the material's number
+        density).  Required if ``include_powder=True``.
     include_powder : bool
-        If True (default False), append ``powder_xs`` as the last column of
-        B, giving ``K = N_orient + 1`` basis functions.
+        If True (default False), append ``powder_xs`` (the same for every angle) as the last column
+        of B, giving ``K = N_orient + 1`` basis functions: channel K-1 is a texture-free component.
     h_max : int
         Maximum |Miller index| when enumerating reflections.
     threshold : float
         Minimum |F|² (barns) to include a reflection.
     use_gpu : bool
-        If True (default), dispatch OpenCL kernel; if False, fall back to the
-        pure-numpy CPU reference.  Note: the GPU path currently raises
-        ``NotImplementedError`` until the kernel is updated to match
-        ``xs_singlecrystal_2022.m``.  Set ``use_gpu=False`` for validated results.
+        If True (default), build B with the OpenCL kernel (RADEN pulse-tail model only); if False,
+        with the NumPy reference implementation (any ``pulse_tail_fn``).
 
     Additional keyword arguments
     ----------------------------
     All remaining keyword arguments are forwarded verbatim to
     :class:`~diffractom.operators.MatrixTomographicOperator`.  In particular
-    you must supply: ``angles`` (radians, shape N_Omega), ``N_Omega``, ``My``,
-    ``Nx``, ``Ny``.  ``K`` and ``N_seg`` are inferred automatically.
+    you must supply ``My``, ``Nx``, ``Ny``; optional ``cor_offset``, ``image_width_factor``,
+    ``projector``, ``angle_weights``, ``verbose``. ``angles``, ``N_Omega``, ``K`` and ``N_seg`` are
+    set from ``beam_angles``, the grid and ``lam``.
 
     Notes
     -----
@@ -841,6 +926,13 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         rotations = Rotation.concatenate([n.R for n in nodes])
         if sigma_grid is None:
             sigma_grid = nodes[0].sigma
+            sigmas = np.array([n.sigma for n in nodes], dtype=float)
+            if not np.allclose(sigmas, sigma_grid):
+                raise ValueError("the grid nodes have different sigma; B uses one value: pass sigma_grid")
+        for key in ("angles", "N_Omega", "K", "N_seg"):
+            if key in parent_kwargs:
+                raise TypeError(f"{key} is set by the operator (from beam_angles, the grid and lam); "
+                                f"do not pass it")
 
         beam_angles = np.asarray(beam_angles, dtype=np.float64)
         lam = np.asarray(lam, dtype=np.float64)
@@ -867,116 +959,17 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         # --- build neutron Bragg table from material ---
         # Material handles reflection enumeration, d-spacings, and |F|²;
         # the operator is not aware of lattice parameters or atom positions.
-        bragg_table = material.neutron_bragg_table(
-            lam_min   = float(lam.min()),
-            lam_max   = float(lam.max()),
-            h_max     = h_max,
-            threshold = threshold,
-        )
+        B = bragg_edge_matrix(material, rotations, beam_angles, lam, sigma_grid, e0=e0,
+                              pulse_tail_fn=pulse_tail_fn, edge_blur_scale=edge_blur_scale, h_max=h_max,
+                              threshold=threshold, use_gpu=use_gpu, ctx=ctx, queue=queue, N_quad=N_quad,
+                              sigma_distance=sigma_distance, quadrature_memory_gb=quadrature_memory_gb)
 
-
-        # --- build B ---
-        #
-        # If N_quad is None, retain the original behavior exactly:
-        #
-        #     one orientation -> one column of B
-        #
-        # If N_quad is provided, evaluate B at N_quad orientations
-        # around every grid orientation and integrate over the local
-        # SO(3) ball.
-
-        if N_quad is None:
-
-            # --------------------------------------------------------------
-            # Original implementation.
-            # --------------------------------------------------------------
-
-            if use_gpu:
-
-                B = build_bragg_matrix_gpu(
-                    bragg_table=bragg_table,
-                    rotations=rotations,
-                    beam_angles_deg=beam_angles,
-                    lam=lam,
-                    sig=sigma_grid,
-                    e0=e0,
-                    pulse_tail_fn=pulse_tail_fn,
-                    edge_blur_scale=edge_blur_scale,
-                    ctx=ctx,
-                    queue=queue,
-                )
-
-            else:
-
-                B = build_bragg_matrix_cpu(
-                    bragg_table=bragg_table,
-                    rotations=rotations,
-                    beam_angles_deg=beam_angles,
-                    lam=lam,
-                    sig=sigma_grid,
-                    e0=e0,
-                    pulse_tail_fn=pulse_tail_fn,
-                    edge_blur_scale=edge_blur_scale,
-                ).astype(np.float32)
-
-        else:
-
-            # --------------------------------------------------------------
-            # Quadrature implementation.
-            # --------------------------------------------------------------
-
-            if N_quad <= 0:
-                raise ValueError(
-                    "N_quad must be positive."
-                )
-
-            if sigma_distance is None:
-                raise ValueError(
-                    "sigma_distance must be provided when "
-                    "N_quad is specified."
-                )
-
-            if sigma_distance <= 0:
-                raise ValueError(
-                    "sigma_distance must be positive."
-                )
-
-            # --------------------------------------------------------------
-            # Generate quadrature orientations around every grid point.
-            #
-            # Normalized weights are used so that the result is an average
-            # over each local SO(3) ball and therefore remains on the same
-            # scale as the original B matrix.
-            # --------------------------------------------------------------
-
-            grid_mats = rotations.as_matrix()
-
-            quad_rots, weights = sample_so3_ball_quadrature(
-                rotations=grid_mats,
-                radius=sigma_distance,
-                n_samples=N_quad,
-                normalize_weights=True,
-            )
-
-            B = build_bragg_matrix_quadrature(
-                bragg_table=bragg_table,
-                quad_rots=quad_rots,
-                weights=weights,
-                K=N_orient,
-                beam_angles_deg=beam_angles,
-                lam=lam,
-                sig=1.2*sigma_distance/N_quad**(1/3),
-                e0=e0,
-                pulse_tail_fn=pulse_tail_fn,
-                edge_blur_scale=edge_blur_scale,
-                use_gpu=use_gpu,
-                ctx=ctx,
-                queue=queue,
-                quadrature_memory_gb=quadrature_memory_gb,
-            )
-
-            del quad_rots
-            del weights
+        # --- powder (texture-free) column ---
+        K = N_orient
+        if include_powder:
+            powder = np.broadcast_to(np.asarray(powder_xs, dtype=np.float32)[None, None, :], (N_Omega, 1, N_lam))
+            B = np.concatenate([np.asarray(B, dtype=np.float32), powder], axis=1)
+            K = N_orient + 1
 
         # --- store build metadata ---
         self.material = material
@@ -989,15 +982,16 @@ class BraggEdgeTomographicOperator(MatrixTomographicOperator):
         self.pulse_tail_fn = pulse_tail_fn
         self.edge_blur_scale = edge_blur_scale
         self.include_powder = include_powder
-        self.angles = beam_angles
+        # projector angles: the projection integrates along (cos a, sin a), the beam is
+        # (-sin phi, cos phi) = (cos(phi + 90), sin(phi + 90))
+        projector_angles = np.deg2rad(beam_angles) + 0.5 * np.pi
 
         # --- delegate to parent ---
-        print('N_Omega',N_Omega)
         super().__init__(
             B=B,
-            angles = self.angles,
+            angles=projector_angles,
             N_Omega=N_Omega,
-            K=N_orient,
+            K=K,
             N_seg=N_lam,
             ctx=ctx,
             queue=queue,
