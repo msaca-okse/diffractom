@@ -22,6 +22,12 @@ LABELS = {
     "5a402f0": "sparse PF matrix (`pf_mode=\"auto\"`)",
     "2b2b9b5": "field-of-view support constraint in FISTA",
     "cce2840": "64-bit indexing in the FISTA, prox and PF kernels",
+    "f1fafa0": "Gauss-Legendre quadrature over the (omega, eta) bins, the fewest nodes that keep every PF entry within "
+               "5 % of the peak (here 4 nodes at sigma 0.4 deg, 2 at 1 deg, 1 from 1.3 deg); candidate counts of "
+               "generated PF batches computed once",
+    "97c16a0": "PF Gaussians cut at 4 sigma (was 3; results change by ~0.8 %; 1.78 times the non-zeros)",
+    "6a38c0b": "main of 2026-10-26: pixel-footprint (trapezoid) projector kernel by default (results differ by ~2 %); "
+               "local basis, ODF basis, structure factors, Bragg-edge operator (not in these cases)",
     "18a7a06": "fused FISTA update: 2 coefficient arrays instead of 4",
     "56fe181": "FISTA coefficients streamed from host memory",
     "fbc8934": "NumPy API, (K, Ny, Nx) layout",
