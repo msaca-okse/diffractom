@@ -23,6 +23,14 @@
 #ifndef PF_CUT
 #define PF_CUT 6.0f
 #endif
+// QUAD_WEIGHTED: the PF entries are weighted sums over the quadrature nodes (Gauss-Legendre), whose offsets in an
+// eta bin lie in [QX_LO, QX_HI] (fractions of the bin); without it the nodes are equal sub-bins, averaged
+#ifndef QX_LO
+#define QX_LO 0.0f
+#endif
+#ifndef QX_HI
+#define QX_HI 1.0f
+#endif
 
 #define MARK(c) { int _c = (c); _Pragma("unroll") for (int _w = 0; _w < MAXWC; ++_w) if (_w == (_c >> 5)) mask[_w] |= 1u << (_c & 31); }
 
@@ -123,11 +131,13 @@ __kernel void pf_gen_candidates(
                     for (int sh = (full ? 0 : -1); sh <= (full ? 0 : 1); ++sh) {
                         float cc = center + sh * 6.283185307179586f;
 #ifdef QUAD_WEIGHTED
-                        // nodes anywhere inside the bins (Gauss-Legendre): mark every eta bin that meets the
-                        // window; bin c covers eta0 + [c, c + 1) * dbin (dsub is the bin width dbin here)
+                        // weighted (Gauss-Legendre) nodes: the nodes of eta bin c lie at eta0 + (c + x) * dbin with
+                        // QX_LO <= x <= QX_HI (dsub is the bin width dbin here); mark the bins whose node span meets
+                        // the window (a superset of the bins with a node inside it; for one node at x = 0.5 the
+                        // same bins as the midpoint rule)
                         float t1 = (cc - w - eta0) / dsub, t2 = (cc + w - eta0) / dsub;
-                        int m_lo = (int)floor(fmin(t1, t2));
-                        int m_hi = (int)floor(fmax(t1, t2));
+                        int m_lo = (int)ceil(fmin(t1, t2) - QX_HI);
+                        int m_hi = (int)floor(fmax(t1, t2) - QX_LO);
                         if (m_hi - m_lo >= C) { m_lo = 0; m_hi = C - 1; }
                         for (int m = m_lo; m <= m_hi; ++m) {
                             int mm = m;

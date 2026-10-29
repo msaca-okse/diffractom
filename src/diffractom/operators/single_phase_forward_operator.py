@@ -1008,14 +1008,16 @@ class SinglePhaseForwardOperator:
         else:
             store, n_store = "adjoint", None  # as many batches as fit
 
-        # the stored batches
+        # the stored batches; when only some fit, room is kept for the candidate offsets of the others
+        # (cache_counts: 4 bytes per row instead of ~6 per non-zero, saving a third of their generation)
         sparse_batches = [None] * nb
         nnz_stored = []
         used = 0
+        budget_store = budget - (gen.cache_bytes(self.batches) if n_store is None else 0)
         if store is not None:
             gen.allocate(max(n_cand))
             for ib, b in enumerate(self.batches):
-                if n_store is None and used + 6 * nnz_est[ib] + ptr_a[ib] > budget:
+                if n_store is None and used + 6 * nnz_est[ib] + ptr_a[ib] > budget_store:
                     break
                 try:
                     g = gen.generate(b["k_start"], b["K_batch"], forward=(store == "both"))
@@ -1060,6 +1062,13 @@ class SinglePhaseForwardOperator:
             gen.allocate(max([n_cand[ib] for ib in generated], default=0),
                          max(nnz_stored, default=0) if store == "adjoint" and self._pf_forward_csr else 0)
             self.pf_gen = gen
+            # precomputed once: the candidate offsets of the generated batches (generate() skips its counting pass)
+            gb = [self.batches[ib] for ib in generated]
+            if gb and gen.cache_bytes(gb) <= budget - used:
+                try:
+                    gen.cache_counts(gb)
+                except cl.MemoryError:
+                    gen.release_cache()
         else:
             gen.release()
             self.pf_gen = None
@@ -1075,7 +1084,9 @@ class SinglePhaseForwardOperator:
             print(f"Sparse PF matrix: {self.sparse_nnz} non-zeros{' (estimate)' if generated else ''} "
                   f"(fill {100 * self.sparse_fill:.3f} %), {nb} batches of up to {self.K_batch_max}; "
                   f"stored: {self.pf_storage} ({used / 1024**2:.1f} MB), {len(generated)} generated in every "
-                  f"call; scratch {scratch / 1024**2:.1f} MB; set up in {time.perf_counter() - t0:.1f} s")
+                  f"call; scratch {scratch / 1024**2:.1f} MB (counts cached: "
+                  f"{(self.pf_gen.cache_bytes() if self.pf_gen is not None else 0) / 1024**2:.1f} MB); "
+                  f"set up in {time.perf_counter() - t0:.1f} s")
 
 
 
