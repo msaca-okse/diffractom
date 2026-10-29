@@ -424,6 +424,12 @@ class SinglePhaseForwardOperator:
         # Stack over peaks → (N_Omega, N_Omega_sub, N_eta, S_eta, N_peaks, 3)
         coords_cpu = np.stack(coords_list, axis=-2)
         self.coords_cpu = np.asarray(coords_cpu, dtype=np.float32, order="C")
+        max_alloc = self.queue.device.max_mem_alloc_size
+        if self.coords_cpu.nbytes > max_alloc:
+            raise MemoryError(
+                f"the probed directions of the quadrature nodes ({self.coords_cpu.nbytes / 1024**3:.1f} GB for "
+                f"{self.N_Omega_subdivisions} x {self.N_eta_subdivisions} nodes per bin) exceed the largest GPU buffer "
+                f"({max_alloc / 1024**3:.1f} GB): use a larger quadrature_tol or a QuadratureRule with fewer nodes")
         self.coords_gpu = clarray.to_device(self.queue, self.coords_cpu)
 
 

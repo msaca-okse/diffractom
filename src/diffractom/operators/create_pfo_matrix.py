@@ -52,7 +52,7 @@ __kernel void pfmatrix_eval(
         // loop over eta subdivisions
         for (int se = 0; se < S_eta; ++se) {
             // --- load coordinate v = coords[r,s,c,se,p,:] ---
-            int coord_base = ((((r * S + s) * C + c) * S_eta + se) * P + p) * 3;
+            long coord_base = ((((long)(r * S + s) * C + c) * S_eta + se) * P + p) * 3;  // 64 bit: many nodes
             float vx = coords[coord_base + 0];
             float vy = coords[coord_base + 1];
             float vz = coords[coord_base + 2];
@@ -151,7 +151,7 @@ __kernel void pfmatrix_eval_poles(
     float w_total = 0.0f;
     for (int s = 0; s < S; ++s) {
         for (int se = 0; se < S_eta; ++se) {
-            int coord_base = ((((r * S + s) * C + c) * S_eta + se) * P + p) * 3;
+            long coord_base = ((((long)(r * S + s) * C + c) * S_eta + se) * P + p) * 3;  // 64 bit: many nodes
             float vx = coords[coord_base + 0];
             float vy = coords[coord_base + 1];
             float vz = coords[coord_base + 2];
