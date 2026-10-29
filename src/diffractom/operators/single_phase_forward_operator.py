@@ -57,7 +57,7 @@ class SinglePhaseForwardOperator:
         radon_kernel: str | None = None,
         fft_max_gb: float = 1.5,
         reserve_coefficient_arrays: int = 3,
-        pf_cutoff_sigma: float | None = 3.0,
+        pf_cutoff_sigma: float | None = 4.0,
         intensity_model=None,
         sparse_batch_max: int = SPARSE_BATCH_MAX,
         rings=None,
@@ -170,13 +170,16 @@ class SinglePhaseForwardOperator:
             Where the Gaussian of each pole is cut to zero, in units of its width sigma: the PF
             matrix entries are exp(-(1 - |cos a|) / sigma^2) of the angle a between pole and probed
             direction, set to zero where (1 - |cos a|) / sigma^2 >= pf_cutoff_sigma^2 / 2, i.e.
-            for a >= pf_cutoff_sigma * sigma (small angles). Default 3: the Gaussian is cut at
-            exp(-4.5) = 1.1 % of its peak, and 1.1 % of its mass lies beyond (the kept entries are
-            not rescaled). None: the threshold 6 of versions before 2026-10-02, a cut at
-            sqrt(12) = 3.46 sigma (0.25 %). Fewer non-zeros for smaller values, about
-            (pf_cutoff_sigma / 3.46)^2 as many (3 sigma: 0.75): faster, and more of the sparse
-            matrix fits. Measured change of the forward projection and a FISTA result against None:
-            3 sigma 0.9 %, 2.5 sigma 4.2 %, 2 sigma 13 %.
+            for a >= pf_cutoff_sigma * sigma (small angles). Default 4 (since 2026-10-29): the
+            Gaussian is cut at exp(-8) = 0.03 % of its peak, and 0.03 % of its mass lies beyond (the
+            kept entries are not rescaled). The jump at the cut is part of the quadrature error of a
+            PF entry (at most exp(-pf_cutoff_sigma^2 / 2) of the peak), so the cut has to stay well
+            below the error tolerance. 3 (the default from 2026-10-02 to 2026-10-28): cut at
+            exp(-4.5) = 1.1 %. None: the threshold 6 of versions before 2026-10-02, a cut at
+            sqrt(12) = 3.46 sigma (0.25 %). The number of non-zeros grows as pf_cutoff_sigma^2
+            (4 sigma: 1.78 times as many as 3 sigma, 1.33 times as many as None), so smaller values
+            are faster and more of the sparse matrix fits. Measured change of the forward
+            projection and a FISTA result against None: 3 sigma 0.9 %, 2.5 sigma 4.2 %, 2 sigma 13 %.
         reserve_coefficient_arrays : int
             Coefficient-sized (K, Ny, Nx) arrays the default sparse-PF budget leaves room for
             on the GPU: 3 (default) for FISTA with the fused update (2 arrays and a margin),

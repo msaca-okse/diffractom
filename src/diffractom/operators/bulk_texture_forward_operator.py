@@ -61,6 +61,7 @@ class BulkTextureForwardOperator:
         normalized: bool = False,
         ctx: cl.Context | None = None,
         queue: cl.CommandQueue | None = None,
+        pf_cutoff_sigma: float | None = 4.0,
         **kwargs,
     ):
         """Initialise the bulk-texture forward operator.
@@ -82,6 +83,10 @@ class BulkTextureForwardOperator:
             If True, skip intensity scaling of the PF matrix.
         ctx, queue : optional
             Existing OpenCL context/queue; created automatically if None.
+        pf_cutoff_sigma : float, optional
+            Where the Gaussian of each pole is cut to zero, in units of its width sigma (as in
+            SinglePhaseForwardOperator). Default 4: cut at exp(-8) = 0.03 % of the peak. None: the
+            kernels' built-in threshold (3.46 sigma), the behaviour before 2026-10-29.
         **kwargs
             Override any cfg key (e.g. ``N_Omega=50``).
         """
@@ -127,7 +132,9 @@ class BulkTextureForwardOperator:
 
         # --- build kernels ---
         self.prg, self.k, self.pf_prg = build_all_opencl(self.ctx, ts=16)
-        self.pf_prg = build_pf_program(self.ctx)
+        self.pf_cutoff_sigma = pf_cutoff_sigma
+        self.pf_cut_options = [] if pf_cutoff_sigma is None else [f"-DPF_CUT={float(pf_cutoff_sigma) ** 2 / 2!r}f"]
+        self.pf_prg = build_pf_program(self.ctx, self.pf_cut_options)
         self.pfmatrix_eval_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval")
 
         # Compile scatter-add helper
