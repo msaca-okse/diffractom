@@ -10,6 +10,7 @@ from pyclblast import gemmStridedBatched
 
 from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
+from .quadrature import DEFAULT_TOL, grid_sigma_min, setup_quadrature
 from .pf_kernels import build_all_opencl
 from ..utils.support import fov_support_mask
 from ..utils.arrays import check_device
@@ -35,6 +36,8 @@ class MultiPhaseForwardOperator:
         ctx=None,
         queue=None,
         pf_cutoff_sigma: float | None = 4.0,
+        quadrature="auto",
+        quadrature_tol: float = DEFAULT_TOL,
         **kwargs,
     ):
         """Initialise multi-material forward operator.
@@ -59,6 +62,9 @@ class MultiPhaseForwardOperator:
             Where the Gaussian of each pole is cut to zero, in units of its width sigma (as in
             SinglePhaseForwardOperator). Default 4: cut at exp(-8) = 0.03 % of the peak. None: the
             kernels' built-in threshold (3.46 sigma), the behaviour before 2026-10-29.
+        quadrature, quadrature_tol : optional
+            Quadrature over each (omega, eta) bin, as in SinglePhaseForwardOperator (default: the
+            Gauss-Legendre rule with the fewest nodes whose error bound is within 5 % of the peak).
         **kwargs
             Override any cfg key.
         """
@@ -89,22 +95,18 @@ class MultiPhaseForwardOperator:
         self.My = self.cfg['My']
         self.N_Omega = self.cfg['N_Omega']
         self.cor_offset = self.cfg['cor_offset']
-        self.N_Omega_subdivisions = self.cfg.get('N_Omega_subdivisions', 1)
-        self.angle_range = np.array(self.cfg['angle_range'])/180*np.pi
+        self.angle_range = np.array(self.cfg['angle_range']) / 180 * np.pi
         delta = (self.angle_range[1] - self.angle_range[0]) / self.N_Omega
-        sub_delta = delta / self.N_Omega_subdivisions
-        # Coarse angles centered in their intervals (for gratopy projection)
+        # Coarse angles centered in their intervals
         self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega, endpoint=False) + delta / 2
-        # Fine angles centered in sub-intervals (for PF coordinate generation)
-        self.angles_subdivided = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega * self.N_Omega_subdivisions, endpoint=False) + sub_delta / 2
-
-        # --- eta subdivisions ---
-        self.N_eta_subdivisions = self.cfg.get('N_eta_subdivisions', 1)
         self.eta_angle_range = np.array(self.cfg.get('eta_angle_range', [0, 360])) / 180 * np.pi
         eta_delta = (self.eta_angle_range[1] - self.eta_angle_range[0]) / self.N_eta
-        eta_sub_delta = eta_delta / self.N_eta_subdivisions
         self.eta_angles = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta, endpoint=False) + eta_delta / 2
-        self.eta_angles_subdivided = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta * self.N_eta_subdivisions, endpoint=False) + eta_sub_delta / 2
+        # --- quadrature over each (omega, eta) bin (nodes angles_subdivided, eta_angles_subdivided, weights) ---
+        self.pf_cutoff_sigma = pf_cutoff_sigma
+        setup_quadrature(self, quadrature, quadrature_tol, min(grid_sigma_min(g) for g in self.grids))
+        self.quad_weights_gpu = clarray.to_device(
+            self.queue, self.quad_weights_cpu if self.quad_weights_cpu is not None else np.ones(1, np.float32))
 
         self.N_mat = len(self.materials)
         self.pf_batch_max_gb = float(max_gb)
@@ -115,7 +117,7 @@ class MultiPhaseForwardOperator:
         self.prg, self.k, self.pf_prg = build_all_opencl(self.ctx, ts=16)
         self.pf_cutoff_sigma = pf_cutoff_sigma
         self.pf_cut_options = [] if pf_cutoff_sigma is None else [f"-DPF_CUT={float(pf_cutoff_sigma) ** 2 / 2!r}f"]
-        self.pf_prg = build_pf_program(self.ctx, self.pf_cut_options)
+        self.pf_prg = build_pf_program(self.ctx, self.pf_cut_options + self.quad_options)
         self.pfmatrix_eval_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval")
 
 
@@ -786,6 +788,7 @@ class MultiPhaseForwardOperator:
                     h_gpu_normed.data,
                     self._inv_sigma2_kmax.data,
                     self._norm_factor_kmax.data,
+                    self.quad_weights_gpu.data,
                     self._basis_batch_list[i_mat].data,
                     np.int32(R),
                     np.int32(Kmax),
@@ -911,6 +914,7 @@ class MultiPhaseForwardOperator:
                     h_gpu_normed.data,
                     self._inv_sigma2_kmax.data,
                     self._norm_factor_kmax.data,
+                    self.quad_weights_gpu.data,
                     self._basis_batch_list[i_mat].data,
                     np.int32(R),
                     np.int32(Kmax),

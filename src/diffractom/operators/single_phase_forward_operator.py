@@ -13,6 +13,7 @@ from ..crystallography.intensity import (as_intensity_model, group_reflections_i
                                          reflection_intensities, ring_intensities)
 from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
+from .quadrature import DEFAULT_TOL, QuadratureRule, grid_sigma_min, setup_quadrature  # noqa: F401
 from .pf_kernels import build_all_opencl
 from ..utils.device_memory import free_device_bytes
 from .pf_generate import CAND_BYTES, NNZ_BYTES, SparsePFGenerator
@@ -58,6 +59,8 @@ class SinglePhaseForwardOperator:
         fft_max_gb: float = 1.5,
         reserve_coefficient_arrays: int = 3,
         pf_cutoff_sigma: float | None = 4.0,
+        quadrature="auto",
+        quadrature_tol: float = DEFAULT_TOL,
         intensity_model=None,
         sparse_batch_max: int = SPARSE_BATCH_MAX,
         rings=None,
@@ -180,6 +183,19 @@ class SinglePhaseForwardOperator:
             (4 sigma: 1.78 times as many as 3 sigma, 1.33 times as many as None), so smaller values
             are faster and more of the sparse matrix fits. Measured change of the forward
             projection and a FISTA result against None: 3 sigma 0.9 %, 2.5 sigma 4.2 %, 2 sigma 13 %.
+        quadrature : "auto", "midpoint" or QuadratureRule
+            How a PF entry, the mean of the pole density over an (omega, eta) bin, is integrated.
+            "auto" (default): tensor-product Gauss-Legendre (k panels of p points per direction; p = 1
+            is the midpoint rule) with the fewest nodes per bin whose error bound is at most
+            quadrature_tol of the peak density, for the smallest sigma of the grid (bound and
+            derivation: operators/quadrature.py). Where one node per bin is enough, it is the midpoint
+            rule of earlier versions (identical results). "midpoint": equal sub-bins,
+            cfg["N_Omega_subdivisions"] x cfg["N_eta_subdivisions"] (default 1 x 1), the behaviour
+            before 2026-10-29. A QuadratureRule sets the rule explicitly. The chosen rule and its bound:
+            op.quadrature, op.quadrature_bound.
+        quadrature_tol : float
+            Tolerance of "auto": bound on the error of a PF entry relative to the peak of a pole's
+            density, including the cut of the Gaussian (exp(-pf_cutoff_sigma^2 / 2)). Default 0.05.
         reserve_coefficient_arrays : int
             Coefficient-sized (K, Ny, Nx) arrays the default sparse-PF budget leaves room for
             on the GPU: 3 (default) for FISTA with the fused update (2 arrays and a margin),
@@ -230,31 +246,26 @@ class SinglePhaseForwardOperator:
         self.My = self.cfg['My']
         self.N_Omega = self.cfg['N_Omega']
         self.cor_offset = self.cfg['cor_offset']
-        self.N_Omega_subdivisions = self.cfg.get('N_Omega_subdivisions', 1)
         self.angle_range = np.array(self.cfg['angle_range'])/180*np.pi
         delta = (self.angle_range[1] - self.angle_range[0]) / self.N_Omega
-        sub_delta = delta / self.N_Omega_subdivisions
         # Coarse angles centered in their intervals (for gratopy projection)
         self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega, endpoint=False) + delta / 2
-        # Fine angles centered in sub-intervals (for PF coordinate generation)
-        self.angles_subdivided = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega * self.N_Omega_subdivisions, endpoint=False) + sub_delta / 2
-
-        # --- eta subdivisions ---
-        self.N_eta_subdivisions = self.cfg.get('N_eta_subdivisions', 1)
         self.eta_angle_range = np.array(self.cfg.get('eta_angle_range', [0, 360])) / 180 * np.pi
         eta_delta = (self.eta_angle_range[1] - self.eta_angle_range[0]) / self.N_eta
-        eta_sub_delta = eta_delta / self.N_eta_subdivisions
         # Coarse eta bin centres
         self.eta_angles = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta, endpoint=False) + eta_delta / 2
-        # Fine eta sub-bin centres
-        self.eta_angles_subdivided = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta * self.N_eta_subdivisions, endpoint=False) + eta_sub_delta / 2
+        # --- quadrature over each (omega, eta) bin: the nodes angles_subdivided, eta_angles_subdivided
+        # (N_Omega_subdivisions, N_eta_subdivisions per bin) and their weights ---
+        setup_quadrature(self, quadrature, quadrature_tol, grid_sigma_min(self.grid))
+        self.quad_weights_gpu = clarray.to_device(
+            self.queue, self.quad_weights_cpu if self.quad_weights_cpu is not None else np.ones(1, np.float32))
 
         self.pf_batch_max_gb = float(max_gb)
 
 
         # --- build kernels ---
         self.prg, self.k, self.pf_prg = build_all_opencl(self.ctx, ts=16)
-        self.pf_prg = build_pf_program(self.ctx, self.pf_cut_options)
+        self.pf_prg = build_pf_program(self.ctx, self.pf_cut_options + self.quad_options)
         self.pfmatrix_eval_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval")
         self.pfpoles_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval_poles")
 
@@ -859,6 +870,7 @@ class SinglePhaseForwardOperator:
             self.axis_count_gpu.data,
             self.inv_sigma2_gpu.data,
             self.norm_factor_gpu.data,
+            self.quad_weights_gpu.data,
             self._basis_batch_kmax.data,
             np.int32(R),
             np.int32(Kmax),

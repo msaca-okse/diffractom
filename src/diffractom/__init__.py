@@ -6,6 +6,7 @@ from .utils.grid import Grid, MatrixGrid
 from .utils.support import fov_support_mask
 from .operators.single_phase_forward_operator import SinglePhaseForwardOperator, estimate_L_power
 from .operators.local_forward_operator import LocalSinglePhaseForwardOperator
+from .operators.quadrature import QuadratureRule
 from .operators.local_support import LocalSupport
 from .operators.multi_phase_forward_operator import MultiPhaseForwardOperator
 from .operators.bulk_texture_forward_operator import BulkTextureForwardOperator
@@ -35,6 +36,7 @@ __all__ = [
     "fov_support_mask",
     "SinglePhaseForwardOperator",
     "LocalSinglePhaseForwardOperator",
+    "QuadratureRule",
     "LocalSupport",
     "estimate_L_power",
     "MultiPhaseForwardOperator",

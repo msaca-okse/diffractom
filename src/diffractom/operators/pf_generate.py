@@ -53,7 +53,7 @@ class SparsePFGenerator:
         self.rpg = max(1, 128 // self.ppw)
         src = Path(__file__).with_name("pf_generate.cl").read_text()
         prg = cl.Program(op.ctx, src).build(options=[f"-DMAXWC={maxwc}", f"-DPPW={self.ppw}", f"-DRPG={self.rpg}",
-                                                     *op.pf_cut_options])
+                                                     *op.pf_cut_options, *op.quad_options])
         self.k = {n: cl.Kernel(prg, n) for n in ("pf_gen_candidates", "pf_gen_evaluate", "pf_gen_compact",
                                                   "pf_gen_count_fwd", "pf_gen_fill_fwd", "pf_gen_rank_rows",
                                                   "pf_gen_row_of")}
@@ -72,7 +72,9 @@ class SparsePFGenerator:
         self.frames, self.sin_th, self.cos_th = dev(frames), dev(np.sin(theta)), dev(np.cos(theta))
         e0, e1 = (float(v) for v in op.eta_angle_range)
         self.eta0 = np.float32(e0)
-        self.dsub = np.float32((e1 - e0) / (C * op.N_eta_subdivisions))
+        # eta sub-bin width of the midpoint rule; for weighted (Gauss) rules the candidate search works with
+        # whole bins (pf_generate.cl, QUAD_WEIGHTED)
+        self.dsub = np.float32((e1 - e0) / (C * (1 if op.quad_weights_cpu is not None else op.N_eta_subdivisions)))
         self.full = np.int32(abs((e1 - e0) - 2 * np.pi) < 1e-6)
         self.n_rows_max = R * int(k_batch_max)
         self.cnt = clarray.empty(q, (self.n_rows_max + 1,), np.int32)
@@ -157,7 +159,8 @@ class SparsePFGenerator:
         k["pf_gen_evaluate"](q, (_ceil(n_flags),), (_LOCAL,),
                              self.cand_j.data, self.cand_row.data, self.cand_ptr.data, op.coords_gpu.data,
                              op.poles_gpu.data, op.axis_start_gpu.data, op.axis_count_gpu.data,
-                             op.inv_sigma2_gpu.data, op.norm_factor_gpu.data, op.intens_gpu.data,
+                             op.inv_sigma2_gpu.data, op.norm_factor_gpu.data, op.quad_weights_gpu.data,
+                             op.intens_gpu.data,
                              self.cand_val.data, self.flag.data,
                              *self._ints(n_rows, n_flags, Kb, k0, C, P, op.N_axes, op.N_Omega_subdivisions,
                                          op.N_eta_subdivisions, op.normalized))

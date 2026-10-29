@@ -1,6 +1,7 @@
 """Forward and adjoint operators for pole-figure texture tomography."""
 
 from .single_phase_forward_operator import SinglePhaseForwardOperator
+from .quadrature import QuadratureRule
 from .multi_phase_forward_operator import MultiPhaseForwardOperator
 from .bulk_texture_forward_operator import BulkTextureForwardOperator
 from .matrix_tomographic_operator import MatrixTomographicOperator
@@ -12,6 +13,7 @@ from .bragg_edge_tomographic_operator import (
 
 __all__ = [
     "SinglePhaseForwardOperator",
+    "QuadratureRule",
     "MultiPhaseForwardOperator",
     "BulkTextureForwardOperator",
     "MatrixTomographicOperator",
