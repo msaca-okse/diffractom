@@ -13,6 +13,7 @@ from ..crystallography.intensity import (as_intensity_model, group_reflections_i
                                          reflection_intensities, ring_intensities)
 from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
+from .quadrature import DEFAULT_TOL, QuadratureRule, grid_sigma_min, setup_quadrature  # noqa: F401
 from .pf_kernels import build_all_opencl
 from ..utils.device_memory import free_device_bytes
 from .pf_generate import CAND_BYTES, NNZ_BYTES, SparsePFGenerator
@@ -58,6 +59,8 @@ class SinglePhaseForwardOperator:
         fft_max_gb: float = 1.5,
         reserve_coefficient_arrays: int = 3,
         pf_cutoff_sigma: float | None = 4.0,
+        quadrature="auto",
+        quadrature_tol: float = DEFAULT_TOL,
         intensity_model=None,
         sparse_batch_max: int = SPARSE_BATCH_MAX,
         rings=None,
@@ -180,6 +183,19 @@ class SinglePhaseForwardOperator:
             (4 sigma: 1.78 times as many as 3 sigma, 1.33 times as many as None), so smaller values
             are faster and more of the sparse matrix fits. Measured change of the forward
             projection and a FISTA result against None: 3 sigma 0.9 %, 2.5 sigma 4.2 %, 2 sigma 13 %.
+        quadrature : "auto", "midpoint" or QuadratureRule
+            How a PF entry, the mean of the pole density over an (omega, eta) bin, is integrated.
+            "auto" (default): tensor-product Gauss-Legendre (k panels of p points per direction; p = 1
+            is the midpoint rule) with the fewest nodes per bin whose error bound is at most
+            quadrature_tol of the peak density, for the smallest sigma of the grid (bound and
+            derivation: operators/quadrature.py). Where one node per bin is enough, it is the midpoint
+            rule of earlier versions (identical results). "midpoint": equal sub-bins,
+            cfg["N_Omega_subdivisions"] x cfg["N_eta_subdivisions"] (default 1 x 1), the behaviour
+            before 2026-10-29. A QuadratureRule sets the rule explicitly. The chosen rule and its bound:
+            op.quadrature, op.quadrature_bound.
+        quadrature_tol : float
+            Tolerance of "auto": bound on the error of a PF entry relative to the peak of a pole's
+            density, including the cut of the Gaussian (exp(-pf_cutoff_sigma^2 / 2)). Default 0.05.
         reserve_coefficient_arrays : int
             Coefficient-sized (K, Ny, Nx) arrays the default sparse-PF budget leaves room for
             on the GPU: 3 (default) for FISTA with the fused update (2 arrays and a margin),
@@ -230,31 +246,26 @@ class SinglePhaseForwardOperator:
         self.My = self.cfg['My']
         self.N_Omega = self.cfg['N_Omega']
         self.cor_offset = self.cfg['cor_offset']
-        self.N_Omega_subdivisions = self.cfg.get('N_Omega_subdivisions', 1)
         self.angle_range = np.array(self.cfg['angle_range'])/180*np.pi
         delta = (self.angle_range[1] - self.angle_range[0]) / self.N_Omega
-        sub_delta = delta / self.N_Omega_subdivisions
         # Coarse angles centered in their intervals (for gratopy projection)
         self.angles = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega, endpoint=False) + delta / 2
-        # Fine angles centered in sub-intervals (for PF coordinate generation)
-        self.angles_subdivided = np.linspace(self.angle_range[0], self.angle_range[1], self.N_Omega * self.N_Omega_subdivisions, endpoint=False) + sub_delta / 2
-
-        # --- eta subdivisions ---
-        self.N_eta_subdivisions = self.cfg.get('N_eta_subdivisions', 1)
         self.eta_angle_range = np.array(self.cfg.get('eta_angle_range', [0, 360])) / 180 * np.pi
         eta_delta = (self.eta_angle_range[1] - self.eta_angle_range[0]) / self.N_eta
-        eta_sub_delta = eta_delta / self.N_eta_subdivisions
         # Coarse eta bin centres
         self.eta_angles = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta, endpoint=False) + eta_delta / 2
-        # Fine eta sub-bin centres
-        self.eta_angles_subdivided = np.linspace(self.eta_angle_range[0], self.eta_angle_range[1], self.N_eta * self.N_eta_subdivisions, endpoint=False) + eta_sub_delta / 2
+        # --- quadrature over each (omega, eta) bin: the nodes angles_subdivided, eta_angles_subdivided
+        # (N_Omega_subdivisions, N_eta_subdivisions per bin) and their weights ---
+        setup_quadrature(self, quadrature, quadrature_tol, grid_sigma_min(self.grid))
+        self.quad_weights_gpu = clarray.to_device(
+            self.queue, self.quad_weights_cpu if self.quad_weights_cpu is not None else np.ones(1, np.float32))
 
         self.pf_batch_max_gb = float(max_gb)
 
 
         # --- build kernels ---
         self.prg, self.k, self.pf_prg = build_all_opencl(self.ctx, ts=16)
-        self.pf_prg = build_pf_program(self.ctx, self.pf_cut_options)
+        self.pf_prg = build_pf_program(self.ctx, self.pf_cut_options + self.quad_options)
         self.pfmatrix_eval_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval")
         self.pfpoles_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval_poles")
 
@@ -413,6 +424,12 @@ class SinglePhaseForwardOperator:
         # Stack over peaks → (N_Omega, N_Omega_sub, N_eta, S_eta, N_peaks, 3)
         coords_cpu = np.stack(coords_list, axis=-2)
         self.coords_cpu = np.asarray(coords_cpu, dtype=np.float32, order="C")
+        max_alloc = self.queue.device.max_mem_alloc_size
+        if self.coords_cpu.nbytes > max_alloc:
+            raise MemoryError(
+                f"the probed directions of the quadrature nodes ({self.coords_cpu.nbytes / 1024**3:.1f} GB for "
+                f"{self.N_Omega_subdivisions} x {self.N_eta_subdivisions} nodes per bin) exceed the largest GPU buffer "
+                f"({max_alloc / 1024**3:.1f} GB): use a larger quadrature_tol or a QuadratureRule with fewer nodes")
         self.coords_gpu = clarray.to_device(self.queue, self.coords_cpu)
 
 
@@ -859,6 +876,7 @@ class SinglePhaseForwardOperator:
             self.axis_count_gpu.data,
             self.inv_sigma2_gpu.data,
             self.norm_factor_gpu.data,
+            self.quad_weights_gpu.data,
             self._basis_batch_kmax.data,
             np.int32(R),
             np.int32(Kmax),
@@ -996,14 +1014,16 @@ class SinglePhaseForwardOperator:
         else:
             store, n_store = "adjoint", None  # as many batches as fit
 
-        # the stored batches
+        # the stored batches; when only some fit, room is kept for the candidate offsets of the others
+        # (cache_counts: 4 bytes per row instead of ~6 per non-zero, saving a third of their generation)
         sparse_batches = [None] * nb
         nnz_stored = []
         used = 0
+        budget_store = budget - (gen.cache_bytes(self.batches) if n_store is None else 0)
         if store is not None:
             gen.allocate(max(n_cand))
             for ib, b in enumerate(self.batches):
-                if n_store is None and used + 6 * nnz_est[ib] + ptr_a[ib] > budget:
+                if n_store is None and used + 6 * nnz_est[ib] + ptr_a[ib] > budget_store:
                     break
                 try:
                     g = gen.generate(b["k_start"], b["K_batch"], forward=(store == "both"))
@@ -1048,6 +1068,13 @@ class SinglePhaseForwardOperator:
             gen.allocate(max([n_cand[ib] for ib in generated], default=0),
                          max(nnz_stored, default=0) if store == "adjoint" and self._pf_forward_csr else 0)
             self.pf_gen = gen
+            # precomputed once: the candidate offsets of the generated batches (generate() skips its counting pass)
+            gb = [self.batches[ib] for ib in generated]
+            if gb and gen.cache_bytes(gb) <= budget - used:
+                try:
+                    gen.cache_counts(gb)
+                except cl.MemoryError:
+                    gen.release_cache()
         else:
             gen.release()
             self.pf_gen = None
@@ -1063,7 +1090,9 @@ class SinglePhaseForwardOperator:
             print(f"Sparse PF matrix: {self.sparse_nnz} non-zeros{' (estimate)' if generated else ''} "
                   f"(fill {100 * self.sparse_fill:.3f} %), {nb} batches of up to {self.K_batch_max}; "
                   f"stored: {self.pf_storage} ({used / 1024**2:.1f} MB), {len(generated)} generated in every "
-                  f"call; scratch {scratch / 1024**2:.1f} MB; set up in {time.perf_counter() - t0:.1f} s")
+                  f"call; scratch {scratch / 1024**2:.1f} MB (counts cached: "
+                  f"{(self.pf_gen.cache_bytes() if self.pf_gen is not None else 0) / 1024**2:.1f} MB); "
+                  f"set up in {time.perf_counter() - t0:.1f} s")
 
 
 

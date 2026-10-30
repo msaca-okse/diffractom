@@ -12,6 +12,7 @@ __kernel void pfmatrix_eval(
 
     __global const float *inv_sigma2,  // (K,) 1 / sigma_k^2
     __global const float *norm_factor, // (K,) 1 / (8*pi*sigma_k^2)
+    __global const float *qw,          // (S_omega * S_eta,) quadrature weights (used with QUAD_WEIGHTED)
 
     __global float *out,               // (R, K, C, P) flattened
 
@@ -51,7 +52,7 @@ __kernel void pfmatrix_eval(
         // loop over eta subdivisions
         for (int se = 0; se < S_eta; ++se) {
             // --- load coordinate v = coords[r,s,c,se,p,:] ---
-            int coord_base = ((((r * S + s) * C + c) * S_eta + se) * P + p) * 3;
+            long coord_base = ((((long)(r * S + s) * C + c) * S_eta + se) * P + p) * 3;  // 64 bit: many nodes
             float vx = coords[coord_base + 0];
             float vy = coords[coord_base + 1];
             float vz = coords[coord_base + 2];
@@ -81,11 +82,19 @@ __kernel void pfmatrix_eval(
                 if (arg2 > -PF_CUT) w += exp(arg2);
             }
 
+#ifdef QUAD_WEIGHTED
+            w_total += qw[s * S_eta + se] * w;
+#else
             w_total += w;
+#endif
         }
     }
 
+#ifdef QUAD_WEIGHTED
+    out[gid] = w_total * norm_factor[k];
+#else
     out[gid] = (w_total / (float)(S * S_eta)) * norm_factor[k];
+#endif
 }
 
 
@@ -103,6 +112,7 @@ __kernel void pfmatrix_eval_poles(
     __global const float *axis_count,  // (A,): number of symmetry images on each axis
     __global const float *inv_sigma2,  // (Ktot,) 1 / sigma_k^2
     __global const float *norm_factor, // (Ktot,) 1 / (8*pi*sigma_k^2)
+    __global const float *qw,          // (S_omega * S_eta,) quadrature weights (used with QUAD_WEIGHTED)
 
     __global float *out,               // (R, Kmax, C, P) flattened
 
@@ -141,11 +151,13 @@ __kernel void pfmatrix_eval_poles(
     float w_total = 0.0f;
     for (int s = 0; s < S; ++s) {
         for (int se = 0; se < S_eta; ++se) {
-            int coord_base = ((((r * S + s) * C + c) * S_eta + se) * P + p) * 3;
+            long coord_base = ((((long)(r * S + s) * C + c) * S_eta + se) * P + p) * 3;  // 64 bit: many nodes
             float vx = coords[coord_base + 0];
             float vy = coords[coord_base + 1];
             float vz = coords[coord_base + 2];
-
+#ifdef QUAD_WEIGHTED
+            float w_node = 0.0f;
+#endif
             for (int a = a0; a < a1; ++a) {
                 int b = pole_base + a * 3;
                 float d = fabs(poles[b + 0]*vx + poles[b + 1]*vy + poles[b + 2]*vz);
@@ -154,12 +166,23 @@ __kernel void pfmatrix_eval_poles(
                 if (e1 < PF_CUT) t += exp(-e1);
                 float e2 = (1.0f + d) * inv_sig2;
                 if (e2 < PF_CUT) t += exp(-e2);
+#ifdef QUAD_WEIGHTED
+                w_node += axis_count[a] * t;
+#else
                 w_total += axis_count[a] * t;
+#endif
             }
+#ifdef QUAD_WEIGHTED
+            w_total += qw[s * S_eta + se] * w_node;
+#endif
         }
     }
 
+#ifdef QUAD_WEIGHTED
+    out[gid] = w_total * norm_factor[kg];
+#else
     out[gid] = (w_total / (float)(S * S_eta)) * norm_factor[kg];
+#endif
 }
 """
 
@@ -520,6 +543,7 @@ def pfmatrix_eval_gpu(
     sigma,                      # array-like, shape (K,)
     out_gpu: clarray.Array = None,
     S_eta: int = 1,             # number of eta subdivisions
+    quad_weights_gpu: clarray.Array = None,  # (S * S_eta,) weights, for a program built with -DQUAD_WEIGHTED
 ):
     """Evaluate the dense PF matrix on GPU.
 
@@ -546,6 +570,8 @@ def pfmatrix_eval_gpu(
 
     inv_sigma2_gpu = clarray.to_device(queue, inv_sigma2)
     norm_factor_gpu = clarray.to_device(queue, norm_factor)
+    if quad_weights_gpu is None:
+        quad_weights_gpu = clarray.to_device(queue, np.ones(1, dtype=np.float32))
 
     # --- launch ---
     total = R * K * C * P
@@ -559,6 +585,7 @@ def pfmatrix_eval_gpu(
         hvecs_gpu.data,
         inv_sigma2_gpu.data,
         norm_factor_gpu.data,
+        quad_weights_gpu.data,
         out_gpu.data,
         np.int32(R),
         np.int32(K),

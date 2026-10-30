@@ -19,6 +19,8 @@ import pyopencl.tools as cltools
 from pyopencl.scan import ExclusiveScanKernel
 from scipy.spatial.transform import Rotation
 
+from .quadrature import nodes_weights
+
 # the candidate test assumes the second term of the PF kernel, exp(-(1 + |n.v|) / sigma^2), is
 # cut off, i.e. 1 / sigma^2 >= the threshold (6 by default: sigma below 23 degrees); with a margin
 MAX_SIGMA = np.deg2rad(20.0)  # for the default threshold
@@ -52,8 +54,12 @@ class SparsePFGenerator:
         self.ppw = max(1 << (P - 1).bit_length(), maxwc)
         self.rpg = max(1, 128 // self.ppw)
         src = Path(__file__).with_name("pf_generate.cl").read_text()
+        quad = list(op.quad_options)
+        if op.quad_weights_cpu is not None:     # the span of the nodes in an eta bin, for the candidate search
+            x, _ = nodes_weights(op.quadrature.p_eta, op.quadrature.k_eta)
+            quad += [f"-DQX_LO={float(x.min())!r}f", f"-DQX_HI={float(x.max())!r}f"]
         prg = cl.Program(op.ctx, src).build(options=[f"-DMAXWC={maxwc}", f"-DPPW={self.ppw}", f"-DRPG={self.rpg}",
-                                                     *op.pf_cut_options])
+                                                     *op.pf_cut_options, *quad])
         self.k = {n: cl.Kernel(prg, n) for n in ("pf_gen_candidates", "pf_gen_evaluate", "pf_gen_compact",
                                                   "pf_gen_count_fwd", "pf_gen_fill_fwd", "pf_gen_rank_rows",
                                                   "pf_gen_row_of")}
@@ -72,13 +78,16 @@ class SparsePFGenerator:
         self.frames, self.sin_th, self.cos_th = dev(frames), dev(np.sin(theta)), dev(np.cos(theta))
         e0, e1 = (float(v) for v in op.eta_angle_range)
         self.eta0 = np.float32(e0)
-        self.dsub = np.float32((e1 - e0) / (C * op.N_eta_subdivisions))
+        # eta sub-bin width of the midpoint rule; for weighted (Gauss) rules the candidate search works with
+        # whole bins (pf_generate.cl, QUAD_WEIGHTED)
+        self.dsub = np.float32((e1 - e0) / (C * (1 if op.quad_weights_cpu is not None else op.N_eta_subdivisions)))
         self.full = np.int32(abs((e1 - e0) - 2 * np.pi) < 1e-6)
         self.n_rows_max = R * int(k_batch_max)
         self.cnt = clarray.empty(q, (self.n_rows_max + 1,), np.int32)
         self.cand_ptr = clarray.empty(q, (self.n_rows_max + 1,), np.int32)
         self.n_cap = self.nnz_cap = 0
         self._names = []
+        self.ptr_cache = {}   # k0 -> (Kb, candidate offsets of the batch's rows), see cache_counts
 
     @staticmethod
     def usable(op):
@@ -88,15 +97,16 @@ class SparsePFGenerator:
     def _ints(self, *v):
         return [np.int32(x) for x in v]
 
-    def _candidates(self, k0, Kb, mode, cand_j=None, cand_row=None):
+    def _candidates(self, k0, Kb, mode, cand_j=None, cand_row=None, cand_ptr=None):
         op = self.op
         n_rows = op.N_Omega * Kb
         groups = -(-(n_rows + 1) // self.rpg)
         dummy = self.cnt.data
+        cand_ptr = self.cand_ptr if cand_ptr is None else cand_ptr
         self.k["pf_gen_candidates"](
             self.q, (groups * self.rpg * self.ppw,), (self.rpg * self.ppw,),
             op.poles_gpu.data, op.axis_start_gpu.data, op.inv_sigma2_gpu.data, self.frames.data,
-            self.sin_th.data, self.cos_th.data, self.cnt.data, self.cand_ptr.data,
+            self.sin_th.data, self.cos_th.data, self.cnt.data, cand_ptr.data,
             cand_j.data if cand_j is not None else dummy, cand_row.data if cand_row is not None else dummy,
             *self._ints(op.N_Omega, Kb, k0, op.N_eta, op.N_peaks, op.N_axes, op.N_Omega_subdivisions,
                         op.N_eta_subdivisions),
@@ -108,6 +118,29 @@ class SparsePFGenerator:
         self._candidates(k0, Kb, 0)
         self.scan(self.cnt[:n_rows + 1], self.cand_ptr[:n_rows + 1], allocator=self.pool)
         return n_rows
+
+    def cache_counts(self, batches):
+        """Keep the candidate offsets of these batches (4 bytes per row (omega bin, orientation)), computed once:
+        generate() then skips the counting pass, about a third of the generation time. Their size: cache_bytes."""
+        for b in batches:
+            k0, Kb = int(b["k_start"]), int(b["K_batch"])
+            if k0 in self.ptr_cache:
+                continue
+            n_rows = self._count(k0, Kb)
+            self.ptr_cache[k0] = (Kb, self.cand_ptr[:n_rows + 1].copy())
+        self.q.finish()
+
+    def cache_bytes(self, batches=None):
+        """Bytes of the cached candidate offsets (of the given batches if they were cached)."""
+        if batches is not None:
+            return sum(4 * (self.op.N_Omega * int(b["K_batch"]) + 1) for b in batches)
+        return sum(a.nbytes for _, a in self.ptr_cache.values())
+
+    def release_cache(self):
+        for _, a in self.ptr_cache.values():
+            if a.base_data is not None:
+                a.base_data.release()
+        self.ptr_cache = {}
 
     def count_candidates(self, batches):
         """Number of candidates of every batch (reads them back; for sizing)."""
@@ -143,7 +176,7 @@ class SparsePFGenerator:
         self.n_cap, self.nnz_cap = int(n_cap), nnz_cap
 
     def nbytes(self):
-        return sum(getattr(self, n).nbytes for n in self._names)
+        return sum(getattr(self, n).nbytes for n in self._names) + self.cache_bytes()
 
     def generate(self, k0, Kb, forward=True):
         """Enqueue the sparse PF matrix of orientations k0 .. k0+Kb-1: a dict with the adjoint
@@ -151,20 +184,25 @@ class SparsePFGenerator:
         views of the scratch buffers. Its candidates must not exceed allocate()'s n_cap."""
         op, q, k = self.op, self.q, self.k
         C, P = op.N_eta, op.N_peaks
-        n_rows = self._count(k0, Kb)
-        self._candidates(k0, Kb, 1, self.cand_j, self.cand_row)
+        cached = self.ptr_cache.get(int(k0))
+        if cached is not None and cached[0] == int(Kb):
+            n_rows, cand_ptr = op.N_Omega * Kb, cached[1]     # counted once (cache_counts)
+        else:
+            n_rows, cand_ptr = self._count(k0, Kb), self.cand_ptr
+        self._candidates(k0, Kb, 1, self.cand_j, self.cand_row, cand_ptr)
         n_flags = self.n_cap + 1
         k["pf_gen_evaluate"](q, (_ceil(n_flags),), (_LOCAL,),
-                             self.cand_j.data, self.cand_row.data, self.cand_ptr.data, op.coords_gpu.data,
+                             self.cand_j.data, self.cand_row.data, cand_ptr.data, op.coords_gpu.data,
                              op.poles_gpu.data, op.axis_start_gpu.data, op.axis_count_gpu.data,
-                             op.inv_sigma2_gpu.data, op.norm_factor_gpu.data, op.intens_gpu.data,
+                             op.inv_sigma2_gpu.data, op.norm_factor_gpu.data, op.quad_weights_gpu.data,
+                             op.intens_gpu.data,
                              self.cand_val.data, self.flag.data,
                              *self._ints(n_rows, n_flags, Kb, k0, C, P, op.N_axes, op.N_Omega_subdivisions,
                                          op.N_eta_subdivisions, op.normalized))
         self.scan(self.flag, self.pos, allocator=self.pool)
         k["pf_gen_compact"](q, (_ceil(max(self.n_cap, n_rows + 1)),), (_LOCAL,),
                             self.cand_j.data, self.cand_row.data, self.cand_val.data, self.flag.data,
-                            self.pos.data, self.cand_ptr.data, self.row_ptr_a.data, self.col_j.data,
+                            self.pos.data, cand_ptr.data, self.row_ptr_a.data, self.col_j.data,
                             self.val_a.data, self.row_of.data, np.int32(n_rows))
         out = dict(row_ptr_a=self.row_ptr_a[:n_rows + 1], col_j=self.col_j, val_a=self.val_a)
         if forward:
@@ -207,6 +245,7 @@ class SparsePFGenerator:
 
     def release(self):
         self.release_scratch()
+        self.release_cache()
         for n in ("cnt", "cand_ptr", "frames", "sin_th", "cos_th"):
             a = getattr(self, n)
             if a is not None and a.base_data is not None:

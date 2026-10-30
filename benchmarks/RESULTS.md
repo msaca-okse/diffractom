@@ -10,6 +10,9 @@ Speed and peak memory of diffractom's texture-tomography reconstruction across v
 
 | version | date | what changed |
 |---|---|---|
+| `f1fafa0` | 2026-10-29 | Gauss-Legendre quadrature over the (omega, eta) bins, the fewest nodes that keep every PF entry within 5 % of the peak (here 4 nodes at sigma 0.4 deg, 2 at 1 deg, 1 from 1.3 deg); candidate counts of generated PF batches computed once |
+| `97c16a0` | 2026-10-29 | PF Gaussians cut at 4 sigma (was 3; results change by ~0.8 %; 1.78 times the non-zeros) |
+| `6a38c0b` | 2026-10-26 | main of 2026-10-26: pixel-footprint (trapezoid) projector kernel by default (results differ by ~2 %); local basis, ODF basis, structure factors, Bragg-edge operator (not in these cases) |
 | `868c372` | 2026-10-02 | FISTA (GPU arrays and streamed): next forward pass inside the adjoint pass; fused residual/norm/clip; PF forward skips empty rows (iterates unchanged) |
 | `43e744c` | 2026-10-02 | streamed FISTA: next forward pass inside the adjoint pass; fused residual/norm/clip; PF forward skips empty rows (iterates unchanged) |
 | `2c5f3f3` | 2026-10-02 | Fourier-slice projector (projector="fft"), the default above 400 x 400 pixels (results differ by ~1 %) |
@@ -25,47 +28,38 @@ Speed and peak memory of diffractom's texture-tomography reconstruction across v
 | `5a402f0` | 2026-09-28 | sparse PF matrix (`pf_mode="auto"`) |
 | `bec0dc7` | 2026-09-28 | before the speed-ups: dense PF matrix only |
 
-## Newest (`868c372`) against the version before it (`43e744c`)
+## Newest (`f1fafa0`) against the version before it (`97c16a0`)
 
 Seconds per FISTA iteration, steady state (without the first iteration, which includes the setup) where both versions recorded it (marked s), else the average of the two iterations; speed-up = previous / newest (below 1: slower). Single short runs: differences within about 10 % are noise.
 
 | case | mode | previous | newest | speed-up |
 |---|---|---:|---:|---:|
-| K = 1000, 120 x 120, sigma = 0.4 | gpu | 0.0685 | 0.0504 | 1.36x s |
-| K = 3000, 120 x 120, sigma = 0.4 | gpu | 0.143 | 0.105 | 1.37x s |
-| K = 10000, 64 x 64, sigma = 0.4 | gpu | 0.192 | 0.139 | 1.38x s |
-| K = 10000, 120 x 120, sigma = 0.4 | gpu | 0.443 | 0.326 | 1.36x s |
-| K = 10000, 120 x 120, sigma = 1 | gpu | 0.506 | 0.375 | 1.35x s |
-| K = 10000, 120 x 120, sigma = 2 | gpu | 0.829 | 0.6 | 1.38x s |
-| K = 10000, 120 x 120, sigma = 4 | gpu | 4.44 | 3.32 | 1.34x s |
-| K = 10000, 200 x 200, sigma = 0.4 | gpu | 1.03 | 0.755 | 1.36x s |
-| K = 10000, 400 x 400, sigma = 0.4 | gpu | 3.47 | 2.45 | 1.42x s |
-| K = 10000, 400 x 400, sigma = 2 | gpu | 4.77 | 3.45 | 1.38x s |
-| K = 10000, 400 x 400, sigma = 4 | gpu | 11.1 | 8.13 | 1.36x s |
+| K = 1000, 120 x 120, sigma = 0.4 | gpu | 0.055 | 0.0559 | 0.98x s |
+| K = 3000, 120 x 120, sigma = 0.4 | gpu | 0.11 | 0.112 | 0.99x s |
+| K = 10000, 64 x 64, sigma = 0.4 | gpu | 0.148 | 0.151 | 0.98x s |
+| K = 10000, 120 x 120, sigma = 0.4 | gpu | 0.356 | 0.363 | 0.98x s |
+| K = 10000, 120 x 120, sigma = 1 | gpu | 0.473 | 0.483 | 0.98x s |
+| K = 10000, 120 x 120, sigma = 2 | gpu | 0.904 | 0.904 | 1.00x s |
+| K = 10000, 120 x 120, sigma = 4 | gpu | 3.4 | 3.4 | 1.00x s |
+| K = 10000, 200 x 200, sigma = 0.4 | gpu | 0.82 | 0.832 | 0.98x s |
+| K = 10000, 400 x 400, sigma = 0.4 | gpu | 2.76 | 2.75 | 1.00x s |
 | K = 10000, 600 x 600, sigma = 0.4 | gpu | *array > largest GPU buffer* | *array > largest GPU buffer* |  |
-| K = 10000, 600 x 600, sigma = 2 | gpu | *array > largest GPU buffer* | *array > largest GPU buffer* |  |
-| K = 10000, 600 x 600, sigma = 4 | gpu | *skipped* | *skipped* |  |
-| K = 30000, 120 x 120, sigma = 0.4 | gpu | 1.31 | 0.961 | 1.36x s |
-| K = 100000, 120 x 120, sigma = 0.4 | gpu | 4.3 | 3.14 | 1.37x s |
-| K = 100000, 120 x 120, sigma = 1 | gpu | 5.6 | 4.03 | 1.39x s |
-| K = 1000, 120 x 120, sigma = 0.4 | stream | 0.0583 | 0.0579 | 1.01x s |
-| K = 3000, 120 x 120, sigma = 0.4 | stream | 0.115 | 0.114 | 1.00x s |
-| K = 10000, 64 x 64, sigma = 0.4 | stream | 0.144 | 0.145 | 1.00x s |
-| K = 10000, 120 x 120, sigma = 0.4 | stream | 0.337 | 0.337 | 1.00x s |
-| K = 10000, 120 x 120, sigma = 1 | stream | 0.386 | 0.385 | 1.00x s |
-| K = 10000, 120 x 120, sigma = 2 | stream | 0.608 | 0.61 | 1.00x s |
-| K = 10000, 120 x 120, sigma = 4 | stream | 3.36 | 3.34 | 1.01x s |
-| K = 10000, 200 x 200, sigma = 0.4 | stream | 0.779 | 0.779 | 1.00x s |
-| K = 10000, 400 x 400, sigma = 0.4 | stream | 2.49 | 2.49 | 1.00x s |
-| K = 10000, 400 x 400, sigma = 2 | stream | 3.4 | 3.39 | 1.00x s |
-| K = 10000, 400 x 400, sigma = 4 | stream | 8.28 | 8.24 | 1.01x s |
-| K = 10000, 600 x 600, sigma = 0.4 | stream | 3.49 | 3.42 | 1.02x s |
-| K = 10000, 600 x 600, sigma = 2 | stream | 4.45 | 4.44 | 1.00x s |
-| K = 10000, 600 x 600, sigma = 4 | stream | 10.6 | 10.5 | 1.01x s |
-| K = 20000, 1200 x 1200, sigma = 0.4 | stream | *out of memory* | 44.4 |  |
-| K = 30000, 120 x 120, sigma = 0.4 | stream | 0.977 | 0.974 | 1.00x s |
-| K = 100000, 120 x 120, sigma = 0.4 | stream | 3.18 | 3.18 | 1.00x s |
-| K = 100000, 120 x 120, sigma = 1 | stream | 3.9 | 3.89 | 1.00x s |
+| K = 30000, 120 x 120, sigma = 0.4 | gpu | 1.06 | 1.07 | 0.98x s |
+| K = 100000, 120 x 120, sigma = 0.4 | gpu | 3.47 | 3.53 | 0.98x s |
+| K = 100000, 120 x 120, sigma = 1 | gpu | 6.57 | 6.38 | 1.03x s |
+| K = 1000, 120 x 120, sigma = 0.4 | stream | 0.0619 | 0.0632 | 0.98x s |
+| K = 3000, 120 x 120, sigma = 0.4 | stream | 0.121 | 0.123 | 0.98x s |
+| K = 10000, 64 x 64, sigma = 0.4 | stream | 0.154 | 0.157 | 0.98x s |
+| K = 10000, 120 x 120, sigma = 0.4 | stream | 0.399 | 0.375 | 1.06x s |
+| K = 10000, 120 x 120, sigma = 1 | stream | 0.483 | 0.488 | 0.99x s |
+| K = 10000, 120 x 120, sigma = 2 | stream | 0.912 | 0.913 | 1.00x s |
+| K = 10000, 120 x 120, sigma = 4 | stream | 3.42 | 3.42 | 1.00x s |
+| K = 10000, 200 x 200, sigma = 0.4 | stream | 0.845 | 0.854 | 0.99x s |
+| K = 10000, 400 x 400, sigma = 0.4 | stream | 2.82 | 2.78 | 1.01x s |
+| K = 10000, 600 x 600, sigma = 0.4 | stream | 3.74 | 3.66 | 1.02x s |
+| K = 30000, 120 x 120, sigma = 0.4 | stream | 1.07 | 1.12 | 0.95x s |
+| K = 100000, 120 x 120, sigma = 0.4 | stream | 3.49 | 3.55 | 0.98x s |
+| K = 100000, 120 x 120, sigma = 1 | stream | 5.44 | 5.61 | 0.97x s |
 
 ## Every version on the base case
 
@@ -256,6 +250,81 @@ The time per iteration above includes a one-time setup in the first of the two F
 | `868c372` | K = 10000, 600 x 600, sigma = 2 | stream | 11.7 | 4.44 |
 | `868c372` | K = 10000, 600 x 600, sigma = 4 | stream | 23.6 | 10.5 |
 | `868c372` | K = 20000, 1200 x 1200, sigma = 0.4 | stream | 55.9 | 32.7 |
+| `6a38c0b` | K = 10000, 64 x 64, sigma = 0.4 | gpu | 0.309 | 0.143 |
+| `6a38c0b` | K = 10000, 64 x 64, sigma = 0.4 | stream | 0.465 | 0.149 |
+| `6a38c0b` | K = 1000, 120 x 120, sigma = 0.4 | gpu | 0.112 | 0.0537 |
+| `6a38c0b` | K = 1000, 120 x 120, sigma = 0.4 | stream | 0.264 | 0.0621 |
+| `6a38c0b` | K = 3000, 120 x 120, sigma = 0.4 | gpu | 0.231 | 0.109 |
+| `6a38c0b` | K = 3000, 120 x 120, sigma = 0.4 | stream | 0.427 | 0.118 |
+| `6a38c0b` | K = 10000, 120 x 120, sigma = 0.4 | gpu | 0.726 | 0.35 |
+| `6a38c0b` | K = 10000, 120 x 120, sigma = 0.4 | stream | 1.22 | 0.361 |
+| `6a38c0b` | K = 10000, 120 x 120, sigma = 1 | gpu | 0.817 | 0.4 |
+| `6a38c0b` | K = 10000, 120 x 120, sigma = 1 | stream | 1.16 | 0.412 |
+| `6a38c0b` | K = 10000, 120 x 120, sigma = 2 | gpu | 1.32 | 0.627 |
+| `6a38c0b` | K = 10000, 120 x 120, sigma = 2 | stream | 1.66 | 0.633 |
+| `6a38c0b` | K = 10000, 120 x 120, sigma = 4 | gpu | 6.71 | 3.38 |
+| `6a38c0b` | K = 10000, 120 x 120, sigma = 4 | stream | 6.99 | 3.4 |
+| `6a38c0b` | K = 30000, 120 x 120, sigma = 0.4 | gpu | 2.15 | 1.03 |
+| `6a38c0b` | K = 30000, 120 x 120, sigma = 0.4 | stream | 2.89 | 1.04 |
+| `6a38c0b` | K = 100000, 120 x 120, sigma = 0.4 | gpu | 7.08 | 3.39 |
+| `6a38c0b` | K = 100000, 120 x 120, sigma = 0.4 | stream | 9.06 | 3.41 |
+| `6a38c0b` | K = 100000, 120 x 120, sigma = 1 | gpu | 9.25 | 4.32 |
+| `6a38c0b` | K = 100000, 120 x 120, sigma = 1 | stream | 10.9 | 4.17 |
+| `6a38c0b` | K = 10000, 200 x 200, sigma = 0.4 | gpu | 1.69 | 0.805 |
+| `6a38c0b` | K = 10000, 200 x 200, sigma = 0.4 | stream | 2.5 | 0.84 |
+| `6a38c0b` | K = 10000, 400 x 400, sigma = 0.4 | gpu | 5.94 | 2.76 |
+| `6a38c0b` | K = 10000, 400 x 400, sigma = 0.4 | stream | 8.49 | 2.79 |
+| `6a38c0b` | K = 10000, 600 x 600, sigma = 0.4 | stream | 10.9 | 3.87 |
+| `97c16a0` | K = 10000, 64 x 64, sigma = 0.4 | gpu | 0.316 | 0.148 |
+| `97c16a0` | K = 10000, 64 x 64, sigma = 0.4 | stream | 0.517 | 0.154 |
+| `97c16a0` | K = 1000, 120 x 120, sigma = 0.4 | gpu | 0.115 | 0.055 |
+| `97c16a0` | K = 1000, 120 x 120, sigma = 0.4 | stream | 0.263 | 0.0619 |
+| `97c16a0` | K = 3000, 120 x 120, sigma = 0.4 | gpu | 0.235 | 0.11 |
+| `97c16a0` | K = 3000, 120 x 120, sigma = 0.4 | stream | 0.45 | 0.121 |
+| `97c16a0` | K = 10000, 120 x 120, sigma = 0.4 | gpu | 0.739 | 0.356 |
+| `97c16a0` | K = 10000, 120 x 120, sigma = 0.4 | stream | 1.1 | 0.399 |
+| `97c16a0` | K = 10000, 120 x 120, sigma = 1 | gpu | 0.959 | 0.473 |
+| `97c16a0` | K = 10000, 120 x 120, sigma = 1 | stream | 1.32 | 0.483 |
+| `97c16a0` | K = 10000, 120 x 120, sigma = 2 | gpu | 1.71 | 0.904 |
+| `97c16a0` | K = 10000, 120 x 120, sigma = 2 | stream | 2.03 | 0.912 |
+| `97c16a0` | K = 10000, 120 x 120, sigma = 4 | gpu | 6.7 | 3.4 |
+| `97c16a0` | K = 10000, 120 x 120, sigma = 4 | stream | 7.05 | 3.42 |
+| `97c16a0` | K = 30000, 120 x 120, sigma = 0.4 | gpu | 2.19 | 1.06 |
+| `97c16a0` | K = 30000, 120 x 120, sigma = 0.4 | stream | 3.23 | 1.07 |
+| `97c16a0` | K = 100000, 120 x 120, sigma = 0.4 | gpu | 7.21 | 3.47 |
+| `97c16a0` | K = 100000, 120 x 120, sigma = 0.4 | stream | 9.18 | 3.49 |
+| `97c16a0` | K = 100000, 120 x 120, sigma = 1 | gpu | 14.0 | 6.57 |
+| `97c16a0` | K = 100000, 120 x 120, sigma = 1 | stream | 13.8 | 5.44 |
+| `97c16a0` | K = 10000, 200 x 200, sigma = 0.4 | gpu | 1.71 | 0.82 |
+| `97c16a0` | K = 10000, 200 x 200, sigma = 0.4 | stream | 2.79 | 0.845 |
+| `97c16a0` | K = 10000, 400 x 400, sigma = 0.4 | gpu | 5.96 | 2.76 |
+| `97c16a0` | K = 10000, 400 x 400, sigma = 0.4 | stream | 8.45 | 2.82 |
+| `97c16a0` | K = 10000, 600 x 600, sigma = 0.4 | stream | 11.8 | 3.74 |
+| `f1fafa0` | K = 10000, 64 x 64, sigma = 0.4 | gpu | 0.321 | 0.151 |
+| `f1fafa0` | K = 10000, 64 x 64, sigma = 0.4 | stream | 0.475 | 0.157 |
+| `f1fafa0` | K = 1000, 120 x 120, sigma = 0.4 | gpu | 0.116 | 0.0559 |
+| `f1fafa0` | K = 1000, 120 x 120, sigma = 0.4 | stream | 0.265 | 0.0632 |
+| `f1fafa0` | K = 3000, 120 x 120, sigma = 0.4 | gpu | 0.237 | 0.112 |
+| `f1fafa0` | K = 3000, 120 x 120, sigma = 0.4 | stream | 0.457 | 0.123 |
+| `f1fafa0` | K = 10000, 120 x 120, sigma = 0.4 | gpu | 0.748 | 0.363 |
+| `f1fafa0` | K = 10000, 120 x 120, sigma = 0.4 | stream | 1.13 | 0.375 |
+| `f1fafa0` | K = 10000, 120 x 120, sigma = 1 | gpu | 0.963 | 0.483 |
+| `f1fafa0` | K = 10000, 120 x 120, sigma = 1 | stream | 1.29 | 0.488 |
+| `f1fafa0` | K = 10000, 120 x 120, sigma = 2 | gpu | 1.71 | 0.904 |
+| `f1fafa0` | K = 10000, 120 x 120, sigma = 2 | stream | 2.05 | 0.913 |
+| `f1fafa0` | K = 10000, 120 x 120, sigma = 4 | gpu | 6.71 | 3.4 |
+| `f1fafa0` | K = 10000, 120 x 120, sigma = 4 | stream | 7.02 | 3.42 |
+| `f1fafa0` | K = 30000, 120 x 120, sigma = 0.4 | gpu | 2.22 | 1.07 |
+| `f1fafa0` | K = 30000, 120 x 120, sigma = 0.4 | stream | 2.93 | 1.12 |
+| `f1fafa0` | K = 100000, 120 x 120, sigma = 0.4 | gpu | 7.3 | 3.53 |
+| `f1fafa0` | K = 100000, 120 x 120, sigma = 0.4 | stream | 9.78 | 3.55 |
+| `f1fafa0` | K = 100000, 120 x 120, sigma = 1 | gpu | 13.5 | 6.38 |
+| `f1fafa0` | K = 100000, 120 x 120, sigma = 1 | stream | 14.0 | 5.61 |
+| `f1fafa0` | K = 10000, 200 x 200, sigma = 0.4 | gpu | 1.83 | 0.832 |
+| `f1fafa0` | K = 10000, 200 x 200, sigma = 0.4 | stream | 2.56 | 0.854 |
+| `f1fafa0` | K = 10000, 400 x 400, sigma = 0.4 | gpu | 6.07 | 2.75 |
+| `f1fafa0` | K = 10000, 400 x 400, sigma = 0.4 | stream | 8.42 | 2.78 |
+| `f1fafa0` | K = 10000, 600 x 600, sigma = 0.4 | stream | 11.1 | 3.66 |
 
 ## Arrays on the GPU
 
@@ -270,6 +339,9 @@ Seconds per FISTA iteration; the fastest version per column in bold; * the base 
 
 | version | 1000 | 3000 | 10000 * | 30000 | 100000 |
 |---|---:|---:|---:|---:|---:|
+| `f1fafa0` | 0.0877 | 0.166 | 0.507 | 1.48 | 4.83 |
+| `97c16a0` | 0.0857 | 0.168 | 0.499 | 1.46 | 4.75 |
+| `6a38c0b` | 0.0849 | 0.176 | 0.5 | 1.43 | 4.66 |
 | `868c372` | **0.0807** | **0.159** | 0.471 | 1.35 | 4.37 |
 | `43e744c` | 0.0843 | 0.161 | **0.467** | **1.34** | 4.35 |
 | `2c5f3f3` | 0.0895 | 0.164 | 0.47 | 1.35 | **4.35** |
@@ -289,6 +361,9 @@ Seconds per FISTA iteration; the fastest version per column in bold; * the base 
 
 | version | 64 | 120 * | 200 | 400 |
 |---|---:|---:|---:|---:|
+| `f1fafa0` | 0.223 | 0.507 | 1.19 | 3.88 |
+| `97c16a0` | 0.224 | 0.499 | 1.14 | 3.85 |
+| `6a38c0b` | 0.216 | 0.5 | 1.12 | 3.84 |
 | `868c372` | **0.211** | 0.471 | 1.05 | 3.5 |
 | `43e744c` | 0.215 | **0.467** | **1.05** | 3.49 |
 | `2c5f3f3` | 0.214 | 0.47 | 1.06 | 3.58 |
@@ -308,6 +383,9 @@ Seconds per FISTA iteration; the fastest version per column in bold; * the base 
 
 | version | 0.4 deg * | 1 deg | 2 deg | 4 deg |
 |---|---:|---:|---:|---:|
+| `f1fafa0` | 0.507 | 0.665 | 1.2 | 4.52 |
+| `97c16a0` | 0.499 | 0.651 | 1.19 | 4.52 |
+| `6a38c0b` | 0.5 | 0.564 | 0.883 | 4.51 |
 | `868c372` | 0.471 | **0.524** | **0.842** | 4.43 |
 | `43e744c` | **0.467** | 0.528 | 0.85 | 4.43 |
 | `2c5f3f3` | 0.47 | 0.527 | 0.931 | **4.42** |
@@ -336,8 +414,11 @@ Seconds per FISTA iteration; the fastest version per column in bold; * the base 
 
 | version | 1000 | 3000 | 10000 * | 30000 | 100000 |
 |---|---:|---:|---:|---:|---:|
-| `868c372` | 0.146 | **0.244** | 0.603 | **1.57** | **4.95** |
-| `43e744c` | **0.146** | 0.262 | **0.593** | 1.68 | 5.15 |
+| `f1fafa0` | 0.149 | 0.277 | 0.65 | 1.76 | 5.7 |
+| `97c16a0` | **0.145** | 0.259 | 0.661 | 1.83 | 5.46 |
+| `6a38c0b` | 0.145 | **0.239** | 0.696 | 1.7 | 5.41 |
+| `868c372` | 0.146 | 0.244 | 0.603 | **1.57** | **4.95** |
+| `43e744c` | 0.146 | 0.262 | **0.593** | 1.68 | 5.15 |
 | `2c5f3f3` | 0.173 | 0.268 | 0.661 | 1.86 | 5.34 |
 | `8540fc1` | 0.28 | 0.3 | 0.728 | 1.84 | 5.53 |
 | `9702663` | 0.224 | 0.322 | 0.721 | 1.97 | 5.93 |
@@ -349,6 +430,9 @@ Seconds per FISTA iteration; the fastest version per column in bold; * the base 
 
 | version | 64 | 120 * | 200 | 400 |
 |---|---:|---:|---:|---:|
+| `f1fafa0` | 0.285 | 0.65 | 1.45 | 4.7 |
+| `97c16a0` | 0.32 | 0.661 | 1.54 | 4.75 |
+| `6a38c0b` | 0.273 | 0.696 | 1.43 | 4.73 |
 | `868c372` | 0.27 | 0.603 | **1.36** | **4.38** |
 | `43e744c` | **0.269** | **0.593** | 1.37 | 4.43 |
 | `2c5f3f3` | 0.297 | 0.661 | 1.5 | 4.76 |
@@ -362,6 +446,9 @@ Seconds per FISTA iteration; the fastest version per column in bold; * the base 
 
 | version | 0.4 deg * | 1 deg | 2 deg | 4 deg |
 |---|---:|---:|---:|---:|
+| `f1fafa0` | 0.65 | 0.784 | 1.32 | 4.65 |
+| `97c16a0` | 0.661 | 0.81 | 1.31 | 4.66 |
+| `6a38c0b` | 0.696 | 0.684 | 1.01 | 4.63 |
 | `868c372` | 0.603 | **0.664** | 0.972 | **4.56** |
 | `43e744c` | **0.593** | 0.668 | **0.965** | 4.58 |
 | `2c5f3f3` | 0.661 | 0.702 | 1.06 | 4.56 |
@@ -382,6 +469,9 @@ Seconds per FISTA iteration; the fastest version per column in bold; * the base 
 
 | version | 1000 | 3000 | 10000 * | 30000 | 100000 |
 |---|---:|---:|---:|---:|---:|
+| `f1fafa0` | 3.1 | 3.6 | 5.2 | 10.3 | 29.3 |
+| `97c16a0` | 3.0 | 3.5 | 4.9 | 9.6 | 27.0 |
+| `6a38c0b` | 3.0 | 3.4 | 4.6 | **8.6** | **23.5** |
 | `868c372` | 3.0 | 3.4 | 4.6 | **8.6** | **23.5** |
 | `43e744c` | **2.2** | **2.7** | **4.3** | **8.6** | **23.5** |
 | `2c5f3f3` | **2.2** | **2.7** | **4.3** | **8.6** | **23.5** |
@@ -401,6 +491,9 @@ Seconds per FISTA iteration; the fastest version per column in bold; * the base 
 
 | version | 1000 | 3000 | 10000 * | 30000 | 100000 |
 |---|---:|---:|---:|---:|---:|
+| `f1fafa0` | 1.5 | 1.8 | 2.9 | 6.2 | 17.8 |
+| `97c16a0` | 1.4 | 1.7 | 2.9 | 6.2 | 17.8 |
+| `6a38c0b` | 1.4 | 1.7 | 2.9 | 6.2 | 17.8 |
 | `868c372` | 1.3 | 1.7 | 2.8 | 6.2 | 17.8 |
 | `43e744c` | 1.3 | 1.7 | 2.8 | 6.2 | 17.8 |
 | `2c5f3f3` | 1.3 | 1.7 | 2.8 | 6.1 | 17.8 |
@@ -420,6 +513,9 @@ Seconds per FISTA iteration; the fastest version per column in bold; * the base 
 
 | version | 1000 | 3000 | 10000 * | 30000 | 100000 |
 |---|---:|---:|---:|---:|---:|
+| `f1fafa0` | 3.2 | 3.8 | 4.8 | 7.0 | 14.8 |
+| `97c16a0` | 3.1 | 3.7 | 4.6 | 6.3 | 12.4 |
+| `6a38c0b` | 3.1 | 3.6 | 4.2 | 5.3 | 9.0 |
 | `868c372` | 3.1 | 3.6 | 4.2 | 5.3 | 9.0 |
 | `43e744c` | 3.1 | 3.6 | 4.2 | 5.3 | 9.0 |
 | `2c5f3f3` | **2.3** | 2.8 | 3.4 | **4.5** | **8.2** |
@@ -433,6 +529,9 @@ Seconds per FISTA iteration; the fastest version per column in bold; * the base 
 
 | version | 1000 | 3000 | 10000 * | 30000 | 100000 |
 |---|---:|---:|---:|---:|---:|
+| `f1fafa0` | 2.2 | 2.5 | 4.9 | 7.5 | 14.9 |
+| `97c16a0` | 2.1 | 2.4 | 4.9 | 7.4 | 14.9 |
+| `6a38c0b` | 2.1 | 2.4 | 4.9 | 7.3 | 14.8 |
 | `868c372` | 2.1 | 2.4 | 4.8 | 7.4 | 14.8 |
 | `43e744c` | 2.1 | 2.4 | 4.8 | 7.3 | 14.8 |
 | `2c5f3f3` | 2.1 | 2.4 | 4.8 | 7.4 | 14.8 |
@@ -448,6 +547,9 @@ Seconds per FISTA iteration (and how the PF matrix was applied: dense; sparse wi
 
 | version | K = 10000, 400 x 400, sigma = 2, gpu | K = 10000, 400 x 400, sigma = 2, stream | K = 10000, 400 x 400, sigma = 4, gpu | K = 10000, 400 x 400, sigma = 4, stream | K = 10000, 600 x 600, sigma = 0.4, gpu | K = 10000, 600 x 600, sigma = 0.4, stream | K = 10000, 600 x 600, sigma = 2, gpu | K = 10000, 600 x 600, sigma = 2, stream | K = 10000, 600 x 600, sigma = 4, gpu | K = 10000, 600 x 600, sigma = 4, stream | K = 20000, 1200 x 1200, sigma = 0.4, gpu | K = 20000, 1200 x 1200, sigma = 0.4, stream | K = 100000, 120 x 120, sigma = 1, gpu | K = 100000, 120 x 120, sigma = 1, stream |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `f1fafa0` |  |  |  |  | *array > largest GPU buffer* | 6.2 (sparse, both) |  |  |  |  |  |  | 8.82 (generated, adjoint, 53 of 113 batches) | 8.47 (generated, adjoint, 91 of 113 batches) |
+| `97c16a0` |  |  |  |  | *array > largest GPU buffer* | 6.46 (sparse, both) |  |  |  |  |  |  | 9.1 (generated, adjoint, 55 of 106 batches) | 8.31 (generated, adjoint, 93 of 106 batches) |
+| `6a38c0b` |  |  |  |  | *array > largest GPU buffer* | 6.25 (sparse, both) |  |  |  |  |  |  | 6.02 (generated, adjoint, 90 of 98 batches) | 6.53 (sparse, adjoint) |
 | `868c372` | 4.78 (sparse, adjoint) | 5.49 (sparse, both) | 10.9 (dense) | 11.6 (dense) | *array > largest GPU buffer* | 5.56 (sparse, both) | *array > largest GPU buffer* | 6.9 (sparse, both) | *skipped* | 14.9 (dense) |  | 44.4 (sparse, both) | 5.67 (generated, adjoint, 92 of 98 batches) | 6.25 (sparse, adjoint) |
 | `43e744c` | 4.77 (sparse, adjoint) | 5.5 (sparse, both) | 11.0 (dense) | 11.9 (dense) | *array > largest GPU buffer* | 5.62 (sparse, both) | *array > largest GPU buffer* | 6.9 (sparse, both) | *skipped* | 15.0 (dense) |  | *out of memory* | 5.65 (generated, adjoint, 92 of 98 batches) | 6.27 (sparse, adjoint) |
 | `2c5f3f3` | 4.74 (sparse, adjoint) | 5.69 (sparse, both) | 11.0 (dense) | 11.8 (dense) | *array > largest GPU buffer* | 6.7 (sparse, both) | *array > largest GPU buffer* | 7.41 (sparse, both) | *skipped* | 15.3 (dense) |  | 50.5 (sparse, both) | 5.63 (generated, adjoint, 92 of 98 batches) | 6.1 (sparse, adjoint) |
@@ -463,6 +565,84 @@ Seconds per FISTA iteration (and how the PF matrix was applied: dense; sparse wi
 
 | version | mode | K | N | sigma | status | PF | build (s) | forward (s) | adjoint (s) | FISTA / it (s) | GPU (GiB) | host (GiB) |
 |---|---|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|
+| `f1fafa0` | gpu | 1000 | 120 | 0.4 | ok | sparse, both | 2.24 | 0.0684 | 0.0317 | 0.0877 | 3.11 | 1.49 |
+| `f1fafa0` | gpu | 3000 | 120 | 0.4 | ok | sparse, both | 1.94 | 0.108 | 0.0644 | 0.166 | 3.63 | 1.77 |
+| `f1fafa0` | gpu | 10000 | 64 | 0.4 | ok | sparse, both | 2.37 | 0.141 | 0.0903 | 0.223 | 3.17 | 1.39 |
+| `f1fafa0` | gpu | 10000 | 120 | 0.4 | ok | sparse, both | 2.51 | 0.283 | 0.221 | 0.507 | 5.24 | 2.92 |
+| `f1fafa0` | gpu | 10000 | 120 | 1 | ok | sparse, both | 2.06 | 0.337 | 0.309 | 0.665 | 9.04 | 2.88 |
+| `f1fafa0` | gpu | 10000 | 120 | 2 | ok | sparse, both | 3.31 | 0.557 | 0.622 | 1.2 | 22.0 | 2.91 |
+| `f1fafa0` | gpu | 10000 | 120 | 4 | ok | dense | 1.38 | 2.21 | 2.26 | 4.52 | 5.89 | 2.86 |
+| `f1fafa0` | gpu | 10000 | 200 | 0.4 | ok | sparse, both | 2.38 | 0.615 | 0.497 | 1.19 | 9.07 | 6.32 |
+| `f1fafa0` | gpu | 10000 | 400 | 0.4 | ok | sparse, both | 2.25 | 2.02 | 1.61 | 3.88 | 25.4 | 21.1 |
+| `f1fafa0` | gpu | 10000 | 600 | 0.4 | oom | generated, none | 2.79 |  |  |  | 0.373 | 4.61 |
+| `f1fafa0` | gpu | 30000 | 120 | 0.4 | ok | sparse, both | 3.47 | 0.781 | 0.662 | 1.48 | 10.3 | 6.23 |
+| `f1fafa0` | gpu | 100000 | 120 | 0.4 | ok | sparse, both | 7.15 | 2.47 | 2.18 | 4.83 | 29.3 | 17.8 |
+| `f1fafa0` | gpu | 100000 | 120 | 1 | ok | generated, adjoint, 53 of 113 batches | 7.04 | 4.71 | 3.87 | 8.82 | 31.6 | 17.8 |
+| `f1fafa0` | stream | 1000 | 120 | 0.4 | ok | sparse, both | 1.72 | 0.383 | 0.175 | 0.149 | 3.21 | 2.21 |
+| `f1fafa0` | stream | 3000 | 120 | 0.4 | ok | sparse, both | 2.05 | 0.496 | 0.174 | 0.277 | 3.8 | 2.49 |
+| `f1fafa0` | stream | 10000 | 64 | 0.4 | ok | sparse, both | 2.59 | 0.353 | 0.151 | 0.285 | 3.05 | 1.92 |
+| `f1fafa0` | stream | 10000 | 120 | 0.4 | ok | sparse, both | 2.23 | 0.723 | 0.333 | 0.65 | 4.84 | 4.93 |
+| `f1fafa0` | stream | 10000 | 120 | 1 | ok | sparse, both | 2.28 | 0.77 | 0.416 | 0.784 | 8.55 | 4.73 |
+| `f1fafa0` | stream | 10000 | 120 | 2 | ok | sparse, both | 2.55 | 0.866 | 0.766 | 1.32 | 21.1 | 4.56 |
+| `f1fafa0` | stream | 10000 | 120 | 4 | ok | dense | 1.55 | 2.7 | 2.39 | 4.65 | 5.48 | 4.55 |
+| `f1fafa0` | stream | 10000 | 200 | 0.4 | ok | sparse, both | 2.32 | 1.58 | 0.683 | 1.45 | 7.94 | 8.23 |
+| `f1fafa0` | stream | 10000 | 400 | 0.4 | ok | sparse, both | 2.4 | 3.83 | 2.33 | 4.7 | 13.7 | 19.7 |
+| `f1fafa0` | stream | 10000 | 600 | 0.4 | ok | sparse, both | 3.15 | 4.47 | 2.56 | 6.2 | 20.8 | 37.0 |
+| `f1fafa0` | stream | 30000 | 120 | 0.4 | ok | sparse, both | 3.41 | 1.23 | 0.834 | 1.76 | 7.05 | 7.47 |
+| `f1fafa0` | stream | 100000 | 120 | 0.4 | ok | sparse, both | 7.11 | 2.88 | 2.29 | 5.7 | 14.8 | 14.9 |
+| `f1fafa0` | stream | 100000 | 120 | 1 | ok | generated, adjoint, 91 of 113 batches | 7.39 | 4.7 | 3.44 | 8.47 | 25.2 | 14.8 |
+| `97c16a0` | gpu | 1000 | 120 | 0.4 | ok | sparse, both | 1.6 | 0.0636 | 0.0309 | 0.0857 | 3.03 | 1.41 |
+| `97c16a0` | gpu | 3000 | 120 | 0.4 | ok | sparse, both | 1.29 | 0.108 | 0.0632 | 0.168 | 3.52 | 1.7 |
+| `97c16a0` | gpu | 10000 | 64 | 0.4 | ok | sparse, both | 1.57 | 0.133 | 0.0876 | 0.224 | 2.88 | 1.32 |
+| `97c16a0` | gpu | 10000 | 120 | 0.4 | ok | sparse, both | 1.53 | 0.276 | 0.217 | 0.499 | 4.95 | 2.86 |
+| `97c16a0` | gpu | 10000 | 120 | 1 | ok | sparse, both | 1.85 | 0.343 | 0.299 | 0.651 | 8.63 | 2.86 |
+| `97c16a0` | gpu | 10000 | 120 | 2 | ok | sparse, both | 2.99 | 0.548 | 0.622 | 1.19 | 22.0 | 2.86 |
+| `97c16a0` | gpu | 10000 | 120 | 4 | ok | dense | 1.3 | 2.21 | 2.26 | 4.52 | 5.89 | 2.86 |
+| `97c16a0` | gpu | 10000 | 200 | 0.4 | ok | sparse, both | 1.55 | 0.615 | 0.49 | 1.14 | 8.78 | 6.26 |
+| `97c16a0` | gpu | 10000 | 400 | 0.4 | ok | sparse, both | 1.49 | 2.09 | 1.6 | 3.85 | 25.1 | 21.0 |
+| `97c16a0` | gpu | 10000 | 600 | 0.4 | oom | generated, none | 2.48 |  |  |  | 0.312 | 4.55 |
+| `97c16a0` | gpu | 30000 | 120 | 0.4 | ok | sparse, both | 2.55 | 0.772 | 0.648 | 1.46 | 9.58 | 6.17 |
+| `97c16a0` | gpu | 100000 | 120 | 0.4 | ok | sparse, both | 5.66 | 2.45 | 2.13 | 4.75 | 27.0 | 17.8 |
+| `97c16a0` | gpu | 100000 | 120 | 1 | ok | generated, adjoint, 55 of 106 batches | 6.41 | 4.9 | 3.97 | 9.1 | 31.7 | 17.8 |
+| `97c16a0` | stream | 1000 | 120 | 0.4 | ok | sparse, both | 1.24 | 0.365 | 0.138 | 0.145 | 3.13 | 2.15 |
+| `97c16a0` | stream | 3000 | 120 | 0.4 | ok | sparse, both | 1.3 | 0.51 | 0.18 | 0.259 | 3.69 | 2.42 |
+| `97c16a0` | stream | 10000 | 64 | 0.4 | ok | sparse, both | 1.54 | 0.33 | 0.169 | 0.32 | 2.76 | 1.86 |
+| `97c16a0` | stream | 10000 | 120 | 0.4 | ok | sparse, both | 1.64 | 0.741 | 0.331 | 0.661 | 4.55 | 4.87 |
+| `97c16a0` | stream | 10000 | 120 | 1 | ok | sparse, both | 1.84 | 0.773 | 0.424 | 0.81 | 8.19 | 4.84 |
+| `97c16a0` | stream | 10000 | 120 | 2 | ok | sparse, both | 2.66 | 0.862 | 0.728 | 1.31 | 21.1 | 4.55 |
+| `97c16a0` | stream | 10000 | 120 | 4 | ok | dense | 1.33 | 2.52 | 2.37 | 4.66 | 5.48 | 4.56 |
+| `97c16a0` | stream | 10000 | 200 | 0.4 | ok | sparse, both | 1.57 | 1.56 | 0.675 | 1.54 | 7.65 | 8.17 |
+| `97c16a0` | stream | 10000 | 400 | 0.4 | ok | sparse, both | 1.69 | 3.83 | 2.01 | 4.75 | 13.5 | 19.7 |
+| `97c16a0` | stream | 10000 | 600 | 0.4 | ok | sparse, both | 2.45 | 4.74 | 2.61 | 6.46 | 20.5 | 36.9 |
+| `97c16a0` | stream | 30000 | 120 | 0.4 | ok | sparse, both | 2.63 | 1.49 | 0.758 | 1.83 | 6.3 | 7.38 |
+| `97c16a0` | stream | 100000 | 120 | 0.4 | ok | sparse, both | 5.63 | 2.93 | 2.24 | 5.46 | 12.4 | 14.9 |
+| `97c16a0` | stream | 100000 | 120 | 1 | ok | generated, adjoint, 93 of 106 batches | 6.95 | 4.62 | 3.3 | 8.31 | 25.2 | 14.8 |
+| `6a38c0b` | gpu | 1000 | 120 | 0.4 | ok | sparse, both | 1.54 | 0.0634 | 0.03 | 0.0849 | 3.01 | 1.37 |
+| `6a38c0b` | gpu | 3000 | 120 | 0.4 | ok | sparse, both | 1.23 | 0.108 | 0.0618 | 0.176 | 3.43 | 1.7 |
+| `6a38c0b` | gpu | 10000 | 64 | 0.4 | ok | sparse, both | 1.51 | 0.184 | 0.0844 | 0.216 | 2.54 | 1.32 |
+| `6a38c0b` | gpu | 10000 | 120 | 0.4 | ok | sparse, both | 1.51 | 0.277 | 0.212 | 0.5 | 4.61 | 2.85 |
+| `6a38c0b` | gpu | 10000 | 120 | 1 | ok | sparse, both | 1.8 | 0.303 | 0.248 | 0.564 | 6.7 | 2.85 |
+| `6a38c0b` | gpu | 10000 | 120 | 2 | ok | sparse, both | 2.18 | 0.49 | 0.382 | 0.883 | 14.1 | 2.85 |
+| `6a38c0b` | gpu | 10000 | 120 | 4 | ok | dense | 1.34 | 2.19 | 2.24 | 4.51 | 5.89 | 2.86 |
+| `6a38c0b` | gpu | 10000 | 200 | 0.4 | ok | sparse, both | 1.58 | 0.602 | 0.478 | 1.12 | 8.44 | 6.26 |
+| `6a38c0b` | gpu | 10000 | 400 | 0.4 | ok | sparse, both | 1.59 | 2.07 | 1.61 | 3.84 | 24.8 | 21.0 |
+| `6a38c0b` | gpu | 10000 | 600 | 0.4 | oom | generated, none | 2.24 |  |  |  | 0.312 | 4.55 |
+| `6a38c0b` | gpu | 30000 | 120 | 0.4 | ok | sparse, both | 2.42 | 0.761 | 0.63 | 1.43 | 8.56 | 6.17 |
+| `6a38c0b` | gpu | 100000 | 120 | 0.4 | ok | sparse, both | 5.42 | 2.41 | 2.08 | 4.66 | 23.5 | 17.8 |
+| `6a38c0b` | gpu | 100000 | 120 | 1 | ok | generated, adjoint, 90 of 98 batches | 6.57 | 3.25 | 2.58 | 6.02 | 31.2 | 17.8 |
+| `6a38c0b` | stream | 1000 | 120 | 0.4 | ok | sparse, both | 1.15 | 0.503 | 0.138 | 0.145 | 3.11 | 2.14 |
+| `6a38c0b` | stream | 3000 | 120 | 0.4 | ok | sparse, both | 1.28 | 0.502 | 0.173 | 0.239 | 3.6 | 2.42 |
+| `6a38c0b` | stream | 10000 | 64 | 0.4 | ok | sparse, both | 1.56 | 0.322 | 0.148 | 0.273 | 2.42 | 1.86 |
+| `6a38c0b` | stream | 10000 | 120 | 0.4 | ok | sparse, both | 1.54 | 0.72 | 0.322 | 0.696 | 4.21 | 4.87 |
+| `6a38c0b` | stream | 10000 | 120 | 1 | ok | sparse, both | 1.68 | 0.747 | 0.359 | 0.684 | 6.31 | 4.79 |
+| `6a38c0b` | stream | 10000 | 120 | 2 | ok | sparse, both | 2.19 | 0.841 | 0.499 | 1.01 | 13.3 | 4.63 |
+| `6a38c0b` | stream | 10000 | 120 | 4 | ok | dense | 1.3 | 2.53 | 2.35 | 4.63 | 5.03 | 4.56 |
+| `6a38c0b` | stream | 10000 | 200 | 0.4 | ok | sparse, both | 1.52 | 1.57 | 0.717 | 1.43 | 7.31 | 8.17 |
+| `6a38c0b` | stream | 10000 | 400 | 0.4 | ok | sparse, both | 1.5 | 3.91 | 2.29 | 4.73 | 13.3 | 19.8 |
+| `6a38c0b` | stream | 10000 | 600 | 0.4 | ok | sparse, both | 2.39 | 4.54 | 2.5 | 6.25 | 20.3 | 36.9 |
+| `6a38c0b` | stream | 30000 | 120 | 0.4 | ok | sparse, both | 2.46 | 1.22 | 0.742 | 1.7 | 5.28 | 7.32 |
+| `6a38c0b` | stream | 100000 | 120 | 0.4 | ok | sparse, both | 5.49 | 2.9 | 2.19 | 5.41 | 8.98 | 14.8 |
+| `6a38c0b` | stream | 100000 | 120 | 1 | ok | sparse, adjoint | 6.46 | 3.58 | 2.56 | 6.53 | 17.1 | 14.9 |
 | `868c372` | gpu | 1000 | 120 | 0.4 | ok | sparse, both | 1.46 | 0.0585 | 0.0271 | 0.0807 | 3.01 | 1.34 |
 | `868c372` | gpu | 3000 | 120 | 0.4 | ok | sparse, both | 1.66 | 0.102 | 0.0582 | 0.159 | 3.43 | 1.68 |
 | `868c372` | gpu | 10000 | 64 | 0.4 | ok | sparse, both | 1.39 | 0.124 | 0.0815 | 0.211 | 2.54 | 1.3 |
@@ -805,4 +985,4 @@ Seconds per FISTA iteration (and how the PF matrix was applied: dense; sparse wi
 
 </details>
 
-Results files: `2026-10-02_1026_A40_n-62-18-4.jsonl`, `2026-10-02_1251_A40_n-62-18-4.jsonl`, `2026-10-02_1310_A40_n-62-18-4.jsonl`, `2026-10-02_1344_A40_n-62-18-4.jsonl`, `2026-10-02_1420_A40_n-62-18-4.jsonl`, `2026-10-02_1503_A40_n-62-18-4.jsonl`, `2026-10-02_1530_A40_n-62-18-4.jsonl`, `2026-10-02_1607_A40_n-62-18-4.jsonl`, `2026-10-02_1637_A40_n-62-18-4.jsonl`, `2026-10-02_1722_A40_n-62-18-4.jsonl`, `2026-10-02_1759_A40_n-62-18-4.jsonl`, `2026-10-02_1844_A40_n-62-18-4.jsonl`, `2026-10-02_1913_A40_n-62-18-4.jsonl`, `2026-10-02_1922_A40_n-62-18-4.jsonl`
+Results files: `2026-10-02_1026_A40_n-62-18-4.jsonl`, `2026-10-02_1251_A40_n-62-18-4.jsonl`, `2026-10-02_1310_A40_n-62-18-4.jsonl`, `2026-10-02_1344_A40_n-62-18-4.jsonl`, `2026-10-02_1420_A40_n-62-18-4.jsonl`, `2026-10-02_1503_A40_n-62-18-4.jsonl`, `2026-10-02_1530_A40_n-62-18-4.jsonl`, `2026-10-02_1607_A40_n-62-18-4.jsonl`, `2026-10-02_1637_A40_n-62-18-4.jsonl`, `2026-10-02_1722_A40_n-62-18-4.jsonl`, `2026-10-02_1759_A40_n-62-18-4.jsonl`, `2026-10-02_1844_A40_n-62-18-4.jsonl`, `2026-10-02_1913_A40_n-62-18-4.jsonl`, `2026-10-02_1922_A40_n-62-18-4.jsonl`, `2026-10-29_1745_A40_n-62-18-4.jsonl`

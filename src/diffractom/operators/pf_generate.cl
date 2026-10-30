@@ -23,12 +23,20 @@
 #ifndef PF_CUT
 #define PF_CUT 6.0f
 #endif
+// QUAD_WEIGHTED: the PF entries are weighted sums over the quadrature nodes (Gauss-Legendre), whose offsets in an
+// eta bin lie in [QX_LO, QX_HI] (fractions of the bin); without it the nodes are equal sub-bins, averaged
+#ifndef QX_LO
+#define QX_LO 0.0f
+#endif
+#ifndef QX_HI
+#define QX_HI 1.0f
+#endif
 
 #define MARK(c) { int _c = (c); _Pragma("unroll") for (int _w = 0; _w < MAXWC; ++_w) if (_w == (_c >> 5)) mask[_w] |= 1u << (_c & 31); }
 
 inline float pf_entry(__global const float *coords, __global const float *poles, __global const int *axis_start,
-                      __global const float *axis_count, float inv_sig2, float norm, int r, int kg, int c, int p,
-                      int S, int C, int S_eta, int P, int A)
+                      __global const float *axis_count, __global const float *qw, float inv_sig2, float norm, int r,
+                      int kg, int c, int p, int S, int C, int S_eta, int P, int A)
 {
     // the loop body of pfmatrix_eval_poles
     int a0 = axis_start[p], a1 = axis_start[p + 1];
@@ -36,10 +44,13 @@ inline float pf_entry(__global const float *coords, __global const float *poles,
     float w_total = 0.0f;
     for (int s = 0; s < S; ++s) {
         for (int se = 0; se < S_eta; ++se) {
-            int coord_base = ((((r * S + s) * C + c) * S_eta + se) * P + p) * 3;
+            long coord_base = ((((long)(r * S + s) * C + c) * S_eta + se) * P + p) * 3;  // 64 bit: many nodes
             float vx = coords[coord_base + 0];
             float vy = coords[coord_base + 1];
             float vz = coords[coord_base + 2];
+#ifdef QUAD_WEIGHTED
+            float w_node = 0.0f;
+#endif
             for (int a = a0; a < a1; ++a) {
                 int b = pole_base + a * 3;
                 float d = fabs(poles[b + 0]*vx + poles[b + 1]*vy + poles[b + 2]*vz);
@@ -48,11 +59,22 @@ inline float pf_entry(__global const float *coords, __global const float *poles,
                 if (e1 < PF_CUT) t += exp(-e1);
                 float e2 = (1.0f + d) * inv_sig2;
                 if (e2 < PF_CUT) t += exp(-e2);
+#ifdef QUAD_WEIGHTED
+                w_node += axis_count[a] * t;
+#else
                 w_total += axis_count[a] * t;
+#endif
             }
+#ifdef QUAD_WEIGHTED
+            w_total += qw[s * S_eta + se] * w_node;
+#endif
         }
     }
+#ifdef QUAD_WEIGHTED
+    return w_total * norm;
+#else
     return (w_total / (float)(S * S_eta)) * norm;
+#endif
 }
 
 // Candidates of rows k0 .. k0+Kb-1 (all omegas). One work-item per (row, ring) marks its ring's
@@ -108,6 +130,22 @@ __kernel void pf_gen_candidates(
                     float center = phi + (sg ? 3.14159265358979f : 0.0f);
                     for (int sh = (full ? 0 : -1); sh <= (full ? 0 : 1); ++sh) {
                         float cc = center + sh * 6.283185307179586f;
+#ifdef QUAD_WEIGHTED
+                        // weighted (Gauss-Legendre) nodes: the nodes of eta bin c lie at eta0 + (c + x) * dbin with
+                        // QX_LO <= x <= QX_HI (dsub is the bin width dbin here); mark the bins whose node span meets
+                        // the window (a superset of the bins with a node inside it; for one node at x = 0.5 the
+                        // same bins as the midpoint rule)
+                        float t1 = (cc - w - eta0) / dsub, t2 = (cc + w - eta0) / dsub;
+                        int m_lo = (int)ceil(fmin(t1, t2) - QX_HI);
+                        int m_hi = (int)floor(fmax(t1, t2) - QX_LO);
+                        if (m_hi - m_lo >= C) { m_lo = 0; m_hi = C - 1; }
+                        for (int m = m_lo; m <= m_hi; ++m) {
+                            int mm = m;
+                            if (full) mm = ((m % C) + C) % C;
+                            else if (m < 0 || m >= C) continue;
+                            MARK(mm);
+                        }
+#else
                         // eta sub-bin m has its centre at eta0 + (m + 0.5) * dsub
                         int m_lo = (int)ceil((cc - w - eta0) / dsub - 0.5f);
                         int m_hi = (int)floor((cc + w - eta0) / dsub - 0.5f);
@@ -118,6 +156,7 @@ __kernel void pf_gen_candidates(
                             else if (m < 0 || m >= Msub) continue;
                             MARK(mm / S_eta);
                         }
+#endif
                     }
                 }
             }
@@ -176,7 +215,7 @@ __kernel void pf_gen_evaluate(
     __global const ushort *cand_j, __global const int *cand_row, __global const int *cand_ptr,
     __global const float *coords, __global const float *poles, __global const int *axis_start,
     __global const float *axis_count, __global const float *inv_sigma2, __global const float *norm_factor,
-    __global const float *intens, __global float *cand_val, __global int *flag,
+    __global const float *qw, __global const float *intens, __global float *cand_val, __global int *flag,
     const int n_rows, const int n_flags, const int Kb, const int k0, const int C, const int P, const int A,
     const int S, const int S_eta, const int normalized)
 {
@@ -185,7 +224,7 @@ __kernel void pf_gen_evaluate(
     if (i >= cand_ptr[n_rows]) { flag[i] = 0; return; }
     int row = cand_row[i], j = cand_j[i];
     int r = row / Kb, kg = k0 + row % Kb, c = j / P, p = j % P;
-    float v = pf_entry(coords, poles, axis_start, axis_count, inv_sigma2[kg], norm_factor[kg], r, kg, c, p,
+    float v = pf_entry(coords, poles, axis_start, axis_count, qw, inv_sigma2[kg], norm_factor[kg], r, kg, c, p,
                        S, C, S_eta, P, A);
     if (!normalized) v *= intens[p];   // as SCALE_PF_BY_INTENSITY_INPLACE
     cand_val[i] = v;
