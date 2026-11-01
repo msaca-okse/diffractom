@@ -211,10 +211,22 @@ them through the GPU (build the operator with `reserve_coefficient_arrays=0`);
 a pyopencl `x0` keeps everything on the GPU.
 
 `PDHGPoisson` solves the same problem with the Chambolle-Pock primal-dual
-method (diagonally preconditioned; no line search). It reached good fits in
-fewer iterations in our tests, but its step balance `rho` matters by orders of
-magnitude: the default `"auto"` is calibrated for `SinglePhaseForwardOperator`,
-and its coefficients stay on the GPU.
+method (diagonally preconditioned; no line search; also streamed with a NumPy
+`x0`). It reached good fits in fewer iterations in our tests, but its step
+balance `rho` matters by orders of magnitude: the default `"auto"` is calibrated
+for `SinglePhaseForwardOperator`.
+
+### Subsets of the rotation angles
+
+`op.set_omega_subsets(M)` splits the angles into `M` interleaved subsets (or
+takes a list of index arrays); `op.direct_cl(x, data, subset=m)` and
+`op.adjoint_cl(data, x, subset=m)` then compute only the data rows of subset `m`,
+at the cost of those angles (native projector, sparse PF modes).
+`SPDHGPoisson(op, subsets=M)` uses them for stochastic primal-dual
+(Chambolle, Ehrhardt, Richtárik & Schönlieb): every iteration updates the dual
+variables of one subset, so an epoch over all subsets costs about one full
+iteration, and good fits took several times fewer epochs than PDHGPoisson's or
+FISTAPoisson's iterations (`run(x0, b, n_epochs, ...)`; coefficients on the GPU).
 
 ### Ring intensities from structure factors
 
