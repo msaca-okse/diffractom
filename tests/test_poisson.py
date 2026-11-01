@@ -182,3 +182,22 @@ def test_fista_poisson_streamed_equals_gpu():
     np.testing.assert_allclose(runs["streamed"][1], runs["gpu"][1], rtol=1e-4)
     xg, xs = runs["gpu"][0], runs["streamed"][0]
     assert np.linalg.norm(xs - xg) <= 1e-3 * np.linalg.norm(xg)
+
+
+def test_pdhg_poisson_reaches_the_minimiser():
+    """Chambolle-Pock reaches the L-BFGS-B minimiser for a reasonable step balance (the best of three; the automatic
+    balance is calibrated for the diffraction operators, not for this small dense matrix)."""
+    from diffractom.optimization.pdhg_poisson import PDHGPoisson
+    ctx, queue = _context()
+    A, cs, ds, gain, g_all, b = _problem()
+    op = _HostOperator(ctx, queue, A.astype(np.float32), cs, ds)
+    x_ref, f_ref = None, None
+    best = None
+    for rho in (1e-4, 1e-2, 1.0):
+        solver = PDHGPoisson(op, support=None, rho=rho)
+        x = solver.run(np.zeros(cs, np.float32), b.reshape(ds), niter=4000, gain=gain)
+        if best is None or solver.final_stats["final_f"] < best[0]:
+            best = (solver.final_stats["final_f"], x)
+    x_ref, f_ref = _reference(A, b, g_all, solver.eps_counts)
+    assert best[0] <= f_ref * (1 + 1e-3) + 1e-6
+    np.testing.assert_allclose(best[1].ravel(), x_ref, atol=3e-2 * x_ref.max())
