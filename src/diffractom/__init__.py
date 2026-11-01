@@ -4,6 +4,7 @@ from .crystallography.material import Material
 from .crystallography.intensity import IntensityModel
 from .utils.grid import Grid, MatrixGrid
 from .utils.support import fov_support_mask
+from .utils.counting import pyfai_gain, gain_from_pairs
 from .operators.single_phase_forward_operator import SinglePhaseForwardOperator, estimate_L_power
 from .operators.local_forward_operator import LocalSinglePhaseForwardOperator
 from .operators.quadrature import QuadratureRule
@@ -14,6 +15,8 @@ from .operators.matrix_tomographic_operator import MatrixTomographicOperator
 from .operators.bragg_edge_tomographic_operator import BraggEdgeTomographicOperator, bragg_edge_matrix
 from .optimization.fista_huber import FISTAHuber
 from .optimization.fista_l2 import FISTAL2
+from .optimization.fista_poisson import FISTAPoisson
+from .optimization.pdhg_poisson import PDHGPoisson
 from .optimization.fista_sum import FISTASum, estimate_L_sum
 from .optimization.streaming import estimate_L_power_streamed
 
@@ -34,6 +37,8 @@ __all__ = [
     "Grid",
     "MatrixGrid",
     "fov_support_mask",
+    "pyfai_gain",
+    "gain_from_pairs",
     "SinglePhaseForwardOperator",
     "LocalSinglePhaseForwardOperator",
     "QuadratureRule",
@@ -42,6 +47,8 @@ __all__ = [
     "MultiPhaseForwardOperator",
     "FISTAHuber",
     "FISTAL2",
+    "FISTAPoisson",
+    "PDHGPoisson",
     "FISTASum",
     "estimate_L_sum",
     "estimate_L_power_streamed",
