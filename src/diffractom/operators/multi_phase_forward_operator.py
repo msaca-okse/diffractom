@@ -141,6 +141,8 @@ class MultiPhaseForwardOperator:
             image_width=self.Nx,
             detector_width=self.My,
             detector_shift=self.cor_offset,
+            # the adjoint is the transpose for any angle range (gratopy's own weights are the angular gaps)
+            angle_weights=np.full(len(self.angles), np.pi / len(self.angles)),
         )
         assert self.queue.context.int_ptr == self.ctx.int_ptr
 

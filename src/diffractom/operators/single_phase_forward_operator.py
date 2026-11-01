@@ -290,6 +290,11 @@ class SinglePhaseForwardOperator:
         self.radon_kernel = radon_kernel
         self.projector = projector
         self.fradon = None
+        # angle weights of the backprojection: pi / N_Omega makes the adjoint the transpose of the forward
+        # projection for any angle range (the projectors' own default). The angular width |delta| (used before
+        # 2026-11) made it (angle range / pi) x the transpose, so the effective weight of a regulariser and any
+        # test that combines function values with gradients depended on the angle range and on the projector.
+        angle_weight = np.pi / self.N_Omega
         if projector == "fft":
             self.fradon = fourier_radon.FourierRadon(
                 self.queue,
@@ -299,14 +304,11 @@ class SinglePhaseForwardOperator:
                 image_width=self.Nx,
                 detector_width=self.My,
                 detector_shift=self.cor_offset,
-                angle_weights=abs(delta),
+                angle_weights=angle_weight,
                 max_gb=fft_max_gb,
             )
             self.PS = None
         elif projector == "native":
-            # angle weight = angular width of a projection (for a 180 degree range this
-            # equals gratopy's default weights, so both projectors agree); positive also when
-            # the angles decrease (angle_range[1] < angle_range[0]), else the adjoint changes sign
             self.radon = ParallelRadon(
                 self.queue,
                 (self.Nx, self.Ny),
@@ -315,7 +317,7 @@ class SinglePhaseForwardOperator:
                 image_width=self.Nx,
                 detector_width=self.My,
                 detector_shift=self.cor_offset,
-                angle_weights=abs(delta),
+                angle_weights=angle_weight,
                 bins_per_item=3,
                 kernel=radon_kernel,
             )
@@ -361,6 +363,7 @@ class SinglePhaseForwardOperator:
             image_width=self.Nx,
             detector_width=self.My,
             detector_shift=self.cor_offset,
+            angle_weights=np.full(len(self.angles), np.pi / len(self.angles)),  # adjoint = transpose (see above)
         )
 
 
