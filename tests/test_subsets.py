@@ -14,7 +14,7 @@ def _context():
     return ctx, cl.CommandQueue(ctx)
 
 
-def _operator(ctx, queue, pf_mode, angle_range=(0, 360)):
+def _operator(ctx, queue, pf_mode, angle_range=(0, 360), sparse_max_gb=None, max_gb=0.2, **kw):
     from diffractom import Grid, Material, SinglePhaseForwardOperator
     mat = Material.from_lattice_parameters(a=4.05, b=4.05, c=4.05, alpha=90, beta=90, gamma=90, symmetry_group="cubic",
                                            wavelength_A=0.35, hkl_list=np.array([[1, 1, 1], [2, 0, 0], [2, 2, 0]]))
@@ -24,17 +24,38 @@ def _operator(ctx, queue, pf_mode, angle_range=(0, 360)):
            "detector_direction_positive_90": [0, 0, -1]}
     np.random.seed(5)
     grid = Grid.from_random_fundamental_zone(30, "cubic", np.deg2rad(4.0))
-    return SinglePhaseForwardOperator(cfg=cfg, material=mat, grid=grid, max_gb=0.2, normalized=True, pf_mode=pf_mode,
-                                      sparse_batch_max=8, ctx=ctx, queue=queue)
+    return SinglePhaseForwardOperator(cfg=cfg, material=mat, grid=grid, max_gb=max_gb, normalized=True, pf_mode=pf_mode,
+                                      sparse_batch_max=8, sparse_max_gb=sparse_max_gb, ctx=ctx, queue=queue, **kw)
 
 
-@pytest.mark.parametrize("pf_mode", ["sparse", "generated"])
+def _storage_operator(ctx, queue, form):
+    """An operator whose sparse PF matrix is stored as `form`: "sparse" (both CSRs), "adjoint" (the adjoint CSR of
+    every batch, the forward one transposed in every call), "partial" (the adjoint CSRs of some batches, the others
+    generated in every call) or "generated" (nothing stored)."""
+    small = 1e-4  # batches of 8 orientations (4 batches)
+    if form in ("sparse", "generated"):
+        return _operator(ctx, queue, form, max_gb=small)
+    probe = _operator(ctx, queue, "sparse", max_gb=small)
+    sizes = [(sum(a.nbytes for a in sb.values()),
+              sum(sb[n].nbytes for n in ("row_ptr_a", "col_j", "val_a"))) for sb in probe.sparse_batches]
+    both, adj = sum(b for b, _ in sizes), sum(a for _, a in sizes)
+    del probe
+    if form == "adjoint":
+        return _operator(ctx, queue, "sparse", sparse_max_gb=0.5 * (adj + both) / 1024**3, max_gb=small)
+    return _operator(ctx, queue, "auto", sparse_max_gb=0.5 * adj / 1024**3, max_gb=small, sparse_max_fill=1.0,
+                     sparse_max_fill_partial=1.0)
+
+
+@pytest.mark.parametrize("pf_mode", ["sparse", "adjoint", "partial", "generated"])
 @pytest.mark.parametrize("subsets", [4, "blocks"])
 def test_subset_forward_and_adjoint(pf_mode, subsets):
     import pyopencl.array as clarray
     ctx, queue = _context()
-    op = _operator(ctx, queue, pf_mode)
-    assert op.pf_mode == pf_mode
+    op = _storage_operator(ctx, queue, pf_mode)
+    expect = {"sparse": ("sparse", "both"), "adjoint": ("sparse", "adjoint"), "partial": ("generated", "adjoint, "),
+              "generated": ("generated", "none")}[pf_mode]
+    assert op.pf_mode == expect[0] and op.pf_storage.startswith(expect[1]), (op.pf_mode, op.pf_storage)
+    assert len(op.batches) > 1
     R = op.N_Omega
     subs = op.set_omega_subsets(4 if subsets == 4 else [np.arange(0, 7), np.arange(7, 20), np.arange(20, R)])
     rng = np.random.default_rng(6)
