@@ -25,6 +25,108 @@ from ..utils.arrays import as_host, check_device
 
 AUTO_FFT_PIXELS = 400 * 400  # projector="auto": the FFT projector for grids of more pixels
 SPMM_TY = 24  # detector positions per work-group of the sparse products (pf_kernels.cl)
+
+# The sparse PF products of pf_kernels.cl restricted to a subset of the rotation angles: work-group dimension 2 runs
+# over the subset; the sinogram is compact (subset angle s at row s), the CSR rows and the data rows are those of the
+# full operator (angle omegas[s]). The arithmetic is that of spmm_pf_forward_c / spmm_pf_adjoint_c.
+SUBSET_KERNELS = r"""
+#ifndef SPMM_TY
+#define SPMM_TY 24
+#endif
+__kernel void spmm_pf_forward_sub(
+    __global const float *sino, __global const int *row_ptr, __global const ushort *col_k, __global const float *val,
+    __global float *data, __global const int *omegas, const int My, const int CP, const int Kstride, const int Kb,
+    const int KC, __local float *lsino)
+{
+    const int lid = get_local_id(0), ls = get_local_size(0);
+    const int j = get_group_id(0) * ls + lid;
+    const int y0 = get_group_id(1) * SPMM_TY;
+    const int rs = get_group_id(2);
+    const int r = omegas[rs];
+    const int ny = min(SPMM_TY, My - y0);
+    const size_t sline0 = (size_t)rs * My + y0, dline0 = (size_t)r * My + y0;
+    int i = 0, e = 0;
+    if (j < CP) { i = row_ptr[r * CP + j]; e = row_ptr[r * CP + j + 1]; }
+    const int nonempty = i < e;
+    float acc[SPMM_TY];
+    #pragma unroll
+    for (int t = 0; t < SPMM_TY; ++t) acc[t] = 0.0f;
+    for (int k0 = 0; k0 < Kb; k0 += KC) {
+        const int kn = min(KC, Kb - k0);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int t = 0; t < ny; ++t) {
+            __global const float *src = sino + (sline0 + t) * Kstride + k0;
+            for (int kk = lid; kk < kn; kk += ls) lsino[t * KC + kk] = src[kk];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const int k1 = k0 + kn;
+        for (; i < e; ++i) {
+            const int k = col_k[i];
+            if (k >= k1) break;
+            const float v = val[i];
+            #pragma unroll
+            for (int t = 0; t < SPMM_TY; ++t)
+                if (t < ny) acc[t] += v * lsino[t * KC + (k - k0)];
+        }
+    }
+    if (j < CP && nonempty) {
+        #pragma unroll
+        for (int t = 0; t < SPMM_TY; ++t)
+            if (t < ny) data[(dline0 + t) * CP + j] += acc[t];
+    }
+}
+
+__kernel void spmm_pf_adjoint_sub(
+    __global const float *data, __global const int *row_ptr, __global const ushort *col_j, __global const float *val,
+    __global float *sino, __global const int *omegas, const int My, const int Kb, const int CP, const int Kstride,
+    const float alpha, const int JC, __local float *ldata)
+{
+    const int lid = get_local_id(0), ls = get_local_size(0);
+    const int k = get_group_id(0) * ls + lid;
+    const int y0 = get_group_id(1) * SPMM_TY;
+    const int rs = get_group_id(2);
+    const int r = omegas[rs];
+    const int ny = min(SPMM_TY, My - y0);
+    const size_t sline0 = (size_t)rs * My + y0, dline0 = (size_t)r * My + y0;
+    int i = 0, e = 0;
+    if (k < Kb) { i = row_ptr[r * Kb + k]; e = row_ptr[r * Kb + k + 1]; }
+    float acc[SPMM_TY];
+    #pragma unroll
+    for (int t = 0; t < SPMM_TY; ++t) acc[t] = 0.0f;
+    for (int j0 = 0; j0 < CP; j0 += JC) {
+        const int jn = min(JC, CP - j0);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int t = 0; t < ny; ++t) {
+            __global const float *src = data + (dline0 + t) * CP + j0;
+            for (int jj = lid; jj < jn; jj += ls) ldata[t * JC + jj] = src[jj];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const int j1 = j0 + jn;
+        for (; i < e; ++i) {
+            const int j = col_j[i];
+            if (j >= j1) break;
+            const float v = val[i];
+            #pragma unroll
+            for (int t = 0; t < SPMM_TY; ++t)
+                if (t < ny) acc[t] += v * ldata[t * JC + (j - j0)];
+        }
+    }
+    if (k < Kb) {
+        #pragma unroll
+        for (int t = 0; t < SPMM_TY; ++t)
+            if (t < ny) sino[(sline0 + t) * Kstride + k] = alpha * acc[t];
+    }
+}
+
+// data rows omegas[s] (each My * CP values) <- 0
+__kernel void zero_rows(__global float *data, __global const int *omegas, const ulong row, const ulong n)
+{
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        const size_t s = i / row;
+        data[(size_t)omegas[s] * row + (i - s * row)] = 0.0f;
+    }
+}
+"""
 SPARSE_BATCH_MAX = 1024  # largest batch of the sparse modes (sparse_batch_size)
 SPARSE_MIN_BATCHES = 4   # sparse modes: at least this many batches, if they hold at least the dense batch
 
@@ -1248,24 +1350,84 @@ class SinglePhaseForwardOperator:
 
 
 
-    def direct_cl(self, coeffs, data):
+    def set_omega_subsets(self, subsets):
+        """
+        Subsets of the rotation angles for the subset forms of the operator (direct_cl / adjoint_cl with subset=m):
+        A_m is A restricted to the data rows of the angles in subset m, computed at the cost of those angles only
+        (the projection and the PF product of the other angles are skipped), for ordered-subset and stochastic
+        solvers.
+
+        subsets : int M (M interleaved subsets, angle i in subset i % M: every subset spans the whole rotation) or a
+            list of arrays of angle indices. Returns the list of index arrays (sorted).
+
+        Needs the native projector and the sparse PF modes ("sparse", "generated"; in "generated" every batch's PF
+        matrix is still generated for all angles). The adjoint of subset m is the transpose of A_m, and the subset
+        adjoints of a partition sum to the full adjoint.
+        """
+        if self.projector != "native":
+            raise NotImplementedError(f"omega subsets need projector='native' (this operator: {self.projector!r})")
+        if self.pf_mode not in ("sparse", "generated"):
+            raise NotImplementedError(f"omega subsets need pf_mode 'sparse' or 'generated' (this operator: "
+                                      f"{self.pf_mode!r})")
+        R = int(self.N_Omega)
+        if np.isscalar(subsets):
+            M = int(subsets)
+            if not 1 <= M <= R:
+                raise ValueError(f"the number of subsets must be between 1 and N_Omega = {R}")
+            subsets = [np.arange(m, R, M) for m in range(M)]
+        out = []
+        for s in subsets:
+            s = np.unique(np.asarray(s, dtype=np.int64))
+            if s.size == 0 or s[0] < 0 or s[-1] >= R:
+                raise ValueError(f"every subset must hold angle indices in 0 .. {R - 1}")
+            out.append(s)
+        self.omega_subsets = out
+        self._sub_omegas = [clarray.to_device(self.queue, s.astype(np.int32)) for s in out]
+        self._sub_radon = [ParallelRadon(self.queue, (self.Nx, self.Ny), self.angles[s], self.My, image_width=self.Nx,
+                                         detector_width=self.My, detector_shift=self.cor_offset,
+                                         angle_weights=np.pi / R, bins_per_item=3, kernel=self.radon_kernel)
+                           for s in out]
+        self._sub_prg = cl.Program(self.ctx, SUBSET_KERNELS).build(options=[f"-DSPMM_TY={SPMM_TY}"])
+        self._sub_k = {n: cl.Kernel(self._sub_prg, n) for n in ("spmm_pf_forward_sub", "spmm_pf_adjoint_sub",
+                                                                "zero_rows")}
+        return out
+
+    def _subset(self, subset):
+        if not hasattr(self, "omega_subsets"):
+            raise ValueError("no omega subsets defined: call set_omega_subsets first")
+        return int(subset)
+
+    def zero_subset_rows(self, data, subset):
+        """data rows of the angles of subset m <- 0."""
+        m = self._subset(subset)
+        row = int(self.My) * int(self.N_eta * self.N_peaks)
+        n = len(self.omega_subsets[m]) * row
+        g = (min(n, 1 << 24),)
+        self._sub_k["zero_rows"](self.queue, g, None, data.data, self._sub_omegas[m].data, np.uint64(row), np.uint64(n))
+
+    def direct_cl(self, coeffs, data, subset=None):
         """In-place forward operator: data = PF @ Radon(coeffs).
 
         Parameters
         ----------
         coeffs : clarray, (K, Ny, Nx), C-contiguous float32
-        data : clarray, (N_Omega, My, N_seg), C-contiguous float32 — overwritten.
+        data : clarray, (N_Omega, My, N_seg), C-contiguous float32 — overwritten (with subset=m: only the rows of
+            the angles of subset m, see set_omega_subsets; the other rows are left as they are).
         """
         check_device(coeffs, self.coeff_shape, "coeffs")
         check_device(data, self.data_shape, "data")
-        data.fill(0.0)
+        if subset is None:
+            data.fill(0.0)
+        else:
+            self.zero_subset_rows(data, subset)
         for ib, b in enumerate(self.batches):
-            self._direct_batch(coeffs, b["k_start"], self.K, ib, data)
+            self._direct_batch(coeffs, b["k_start"], self.K, ib, data, subset)
 
-    def _direct_batch(self, src, k_src, K_src, ib, data):
+    def _direct_batch(self, src, k_src, K_src, ib, data, subset=None):
         """Add the forward projection of orientation batch ib to data. The batch's coefficients
         are orientations k_src .. k_src+Kb-1 of src, a (K_src, Ny, Nx) C-order array (the full
-        coefficient array, or a batch-sized staging buffer with k_src = 0)."""
+        coefficient array, or a batch-sized staging buffer with k_src = 0). subset=m: only the
+        rows of the angles of subset m."""
         b = self.batches[ib]
         k0 = b["k_start"]
         Kb = b["K_batch"]
@@ -1273,6 +1435,20 @@ class SinglePhaseForwardOperator:
         CP = int(self.N_eta * self.N_peaks)
         Kmax = self.K_batch_max
         My = self.My
+        if subset is not None:
+            m = self._subset(subset)
+            Rm = len(self.omega_subsets[m])
+            self.radon.gather(src, self._img_k, k_src, Kb, Kmax)
+            self._sub_radon[m].forward(self._img_k, self.coeffs_sino_C, Kmax)  # compact (Rm, My, Kmax)
+            sb = self._pf_batch(ib, forward=True)
+            ls, chunk = self._spmm_setup()
+            kc = min(Kb, chunk)
+            self._sub_k["spmm_pf_forward_sub"](
+                self.queue, (-(-CP // ls) * ls, -(-My // SPMM_TY), Rm), (ls, 1, 1), self.coeffs_sino_C.data,
+                sb["row_ptr_f"].data, sb["col_k"].data, sb["val_f"].data, data.data, self._sub_omegas[m].data,
+                np.int32(My), np.int32(CP), np.int32(Kmax), np.int32(Kb), np.int32(kc),
+                cl.LocalMemory(4 * SPMM_TY * kc))
+            return
 
         # 1) Radon transform of this batch -> coeffs_sino_C (R, My, Kmax)
         if self.projector == "fft":
@@ -1380,14 +1556,15 @@ class SinglePhaseForwardOperator:
 
 
 
-    def adjoint_cl(self, data, coeffs):
+    def adjoint_cl(self, data, coeffs, subset=None):
         """
         In-place OpenCL adjoint operator.
 
         Parameters
         ----------
         data : clarray
-            Shape (N_Omega, My, N_seg), C-contiguous float32
+            Shape (N_Omega, My, N_seg), C-contiguous float32 (with subset=m only the rows of the angles of subset m
+            are read, see set_omega_subsets)
         coeffs : clarray
             Shape (K, Ny, Nx), C-contiguous float32; overwritten
         """
@@ -1396,7 +1573,7 @@ class SinglePhaseForwardOperator:
 
         # every orientation is written by exactly one batch
         for ib, b in enumerate(self.batches):
-            self._adjoint_batch(data, ib, coeffs, b["k_start"], self.K)
+            self._adjoint_batch(data, ib, coeffs, b["k_start"], self.K, subset)
 
     def adjoint_batches_cl(self, data, out_batch, update):
         """
@@ -1419,9 +1596,10 @@ class SinglePhaseForwardOperator:
             self._adjoint_batch(data, ib, out_batch, 0, self.K_batch_max)
             update(b["k_start"], b["K_batch"])
 
-    def _adjoint_batch(self, data, ib, target, k_target, K_target):
+    def _adjoint_batch(self, data, ib, target, k_target, K_target, subset=None):
         """A^T data for orientation batch ib, written to orientations k_target .. k_target+Kb-1
-        of target, a (K_target, Ny, Nx) C-order array."""
+        of target, a (K_target, Ny, Nx) C-order array. subset=m: A_m^T (the rows of the angles of
+        subset m)."""
         b = self.batches[ib]
         k0 = b["k_start"]
         Kb = b["K_batch"]
@@ -1430,6 +1608,20 @@ class SinglePhaseForwardOperator:
         CP = int(self.N_eta * self.N_peaks)
         My = self.My
         alpha = R / np.pi
+        if subset is not None:
+            m = self._subset(subset)
+            Rm = len(self.omega_subsets[m])
+            sb = self._pf_batch(ib, forward=False)
+            ls, chunk = self._spmm_setup()
+            jc = min(CP, chunk)
+            self._sub_k["spmm_pf_adjoint_sub"](
+                self.queue, (-(-Kb // ls) * ls, -(-My // SPMM_TY), Rm), (ls, 1, 1), data.data, sb["row_ptr_a"].data,
+                sb["col_j"].data, sb["val_a"].data, self.coeffs_sino_C.data, self._sub_omegas[m].data, np.int32(My),
+                np.int32(Kb), np.int32(CP), np.int32(Kmax), np.float32(alpha), np.int32(jc),
+                cl.LocalMemory(4 * SPMM_TY * jc))
+            self._sub_radon[m].backward(self.coeffs_sino_C, self._img_k, Kmax)
+            self.radon.scatter(self._img_k, target, k_target, Kb, Kmax)
+            return
 
         # 1) PF^T product -> coeffs_sino_C (R, My, Kmax)
         if self.pf_mode in ("sparse", "generated"):
