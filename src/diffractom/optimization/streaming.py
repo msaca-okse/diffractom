@@ -252,6 +252,66 @@ class Streamer:
         return sum(a.nbytes for a in self.xs + self.ys) + sum(p.buf.size for p in pins)
 
 
+def batch_pass(st, ups, dns, compute):
+    """One pass over the operator's orientation batches with coefficient arrays in host memory (used by the Poisson
+    solvers). ups and dns: lists of (host flat array, two pinned buffers, two device slots); batch ib uses slot
+    ib % 2. Uploads run in the streamer's upload thread, downloads in its download thread (see
+    Streamer.adjoint_update); compute(ib, s, n) enqueues the batch's kernels on the operator's queue (n: the batch's
+    number of elements), reading the upload slots and writing the download slots. Returns when all downloads are done."""
+    op, q = st.op, st.q
+    nb = len(op.batches)
+    up, dn = [None] * nb, [None] * nb
+    start = cl.enqueue_marker(q)
+    q.flush()
+
+    def size(ib):
+        return st.npix * op.batches[ib]["K_batch"]
+
+    def upload(ib):
+        s = ib % 2
+        if ib >= 2 and dn[ib - 2] is not None:
+            dn[ib - 2].result()  # slot s has been downloaded
+        else:
+            start.wait()
+        n = size(ib)
+        for flat, pins, slots in ups:
+            st._pcopy(pins[s].arr[:n], st.view(flat, ib))
+            cl.enqueue_copy(st.tq_up, slots[s].data, pins[s].arr[:n], is_blocking=True)
+
+    def download(ib, ev):
+        s = ib % 2
+        ev.wait()
+        n = size(ib)
+        for flat, pins, slots in dns:
+            cl.enqueue_copy(st.tq_dn, pins[s].arr[:n], slots[s].data, is_blocking=True)
+            st._pcopy(st.view(flat, ib), pins[s].arr[:n])
+
+    if ups:
+        up[0] = st.io_up.submit(upload, 0)
+    for ib in range(nb):
+        s = ib % 2
+        if ups:
+            if ib + 1 < nb:
+                up[ib + 1] = st.io_up.submit(upload, ib + 1)
+            up[ib].result()
+        elif ib >= 2 and dn[ib - 2] is not None:
+            dn[ib - 2].result()
+        compute(ib, s, size(ib))
+        ev = cl.enqueue_marker(q)
+        q.flush()
+        if dns:
+            dn[ib] = st.io_dn.submit(download, ib, ev)
+    for f in dn:
+        if f is not None:
+            f.result()
+    q.finish()
+
+
+def host_map(st, f, n, chunk=1 << 24):
+    """f(a, b) on chunks [a, b) of range(n), on the streamer's thread pool."""
+    list(st.pool.map(lambda c: f(c, min(c + chunk, n)), range(0, n, chunk)))
+
+
 def fits_next_forward(op, streamer, extra_bytes, margin_gb=1.5):
     """Whether one more data-sized array fits on the GPU (for the forward_into of adjoint_update or
     FusedUpdate.step), given the operator's buffers, the streamer's (None: no streaming) and

@@ -13,8 +13,10 @@ with T_j = tau0 / (A^T 1)_j (column sums) and Sigma_i = sigma0 / (A 1_S)_i (row 
 tau0 balances the primal and dual steps). The dual step handles the likelihood's barrier at mu = 0 exactly, so there
 is no line search and no Lipschitz constant; a positive multiple of the transpose as the adjoint cancels in T A^T.
 One forward (A x_bar) and one adjoint (A^T y) per iteration; A x of the iterate, for the objective, follows from
-A x_k = (A x_bar_k + A x_(k-1)) / 2. Memory (GPU): four coefficient-sized arrays (x, x_bar, T, A^T y) and five
-data-sized ones (data, dual, Sigma, A x_bar, A x).
+A x_k = (A x_bar_k + A x_(k-1)) / 2. Memory: on the GPU (pyopencl x0) four coefficient-sized arrays (x, x_bar, T,
+A^T y) and five data-sized ones (data, dual, Sigma, A x_bar, A x). Streamed (NumPy x0): x and T in host memory, one
+pass over the orientation batches per iteration (x and T up, x down; A^T y, the update and the forward of the new
+x_bar on the GPU, so x_bar is never stored), the data-sized arrays on the GPU.
 """
 import time
 
@@ -25,7 +27,8 @@ import pyopencl.array as clarray
 from .fista_poisson import KERNELS as POISSON_KERNELS, _periodic
 from .launch import elementwise, reduction
 from .prox import support_mask_to_gpu
-from ..utils.arrays import as_host, check_device
+from .streaming import batch_pass, host_map, streamer_for
+from ..utils.arrays import as_host, check_device, supports_streaming
 
 RHO_AUTO = 3e4
 
@@ -155,14 +158,18 @@ class PDHGPoisson:
 
     def run(self, x0, b, niter, weights=None, gain=None, background=None, verbose=0, diagnostics_interval=10,
             callback=None, state=None):
-        """As FISTAPoisson.run (GPU-resident: a NumPy x0 is uploaded and the result copied back). state: the
-        solver.state of an earlier run (x_bar and the dual variable) to continue it."""
+        """As FISTAPoisson.run. A NumPy x0 is streamed (operators with orientation batches; x and the steps T in host
+        memory, x updated in place and returned), a pyopencl x0 stays on the GPU. state: the solver.state of an
+        earlier run of the same kind (streamed or not) to continue it (the dual variable and A x_bar, A x, or x_bar)."""
         t_start = time.perf_counter()
         q, op = self.queue, self.op
         cshape, dshape = tuple(op.coeff_shape), tuple(op.data_shape)
         uploaded, host_x0 = [], None
+        streamed = not isinstance(x0, clarray.Array) and supports_streaming(op)
         if isinstance(x0, clarray.Array):
             x = check_device(x0, cshape, "x0")
+        elif streamed:
+            x = as_host(x0, cshape, "x0")
         else:
             host_x0 = as_host(x0, cshape, "x0")
             x = clarray.to_device(q, host_x0)
@@ -184,13 +191,6 @@ class PDHGPoisson:
         gx, nx = elementwise(x.size)
         gd, nd = elementwise(int(np.prod(dshape)))
 
-        xb = clarray.empty(q, cshape, np.float32)
-        T = clarray.empty(q, cshape, np.float32)
-        grad = clarray.empty(q, cshape, np.float32)
-        ydual = clarray.zeros(q, dshape, np.float32)
-        sig = clarray.empty(q, dshape, np.float32)
-        Axb = clarray.empty(q, dshape, np.float32)
-        Ax = clarray.empty(q, dshape, np.float32)
         rho = self.rho
         if rho == "auto":
             rg, rl, rn, rng_ = reduction(int(np.prod(dshape)))
@@ -201,6 +201,16 @@ class PDHGPoisson:
             rho = RHO_AUTO / mean_b ** 2 if mean_b > 0 else 1.0
         self.rho_used = float(rho)
         tau0, sigma0 = 1.0 / np.sqrt(rho), np.sqrt(rho)
+        if streamed:
+            return self._run_streamed(x, niter, verbose, diagnostics_interval, callback, state, t_start, tau0, sigma0,
+                                      npix, supp, uploaded)
+        xb = clarray.empty(q, cshape, np.float32)
+        T = clarray.empty(q, cshape, np.float32)
+        grad = clarray.empty(q, cshape, np.float32)
+        ydual = clarray.zeros(q, dshape, np.float32)
+        sig = clarray.empty(q, dshape, np.float32)
+        Axb = clarray.empty(q, dshape, np.float32)
+        Ax = clarray.empty(q, dshape, np.float32)
         # row sums A 1_S (Sigma) and column sums A^T 1 over the counted data points (T)
         self.pk.support_ones(q, gx, None, xb.data, supp, npix, nx)
         op.direct_cl(xb, Axb)
@@ -215,19 +225,20 @@ class PDHGPoisson:
         else:
             self.pk.copy_buf(q, gx, None, x.data, xb.data, nx)
         op.direct_cl(x, Ax)
+        op.direct_cl(xb, Axb)
         t_setup = time.perf_counter() - t_start
         it0 = int(state["it"]) if state is not None else 0
         self.iter_stats = []
         f = self._deviance(Ax)
         for k in range(niter):
             it = it0 + k + 1
-            op.direct_cl(xb, Axb)
             self.prg.dual_update(q, gd, None, ydual.data, Axb.data, sig.data, self.b.data, self.w.data,
                                  np.uint64(self.pw), self.g.data, np.uint64(self.pg), self.bg.data, np.uint64(self.pbg),
                                  np.float32(self.eps_counts), nd)
             op.adjoint_cl(ydual, grad)
             self.prg.primal_update(q, gx, None, x.data, xb.data, grad.data, T.data, np.float32(self.lam), nx)
-            self.prg.average(q, gd, None, Ax.data, Axb.data, nd)  # A x of the new iterate
+            op.direct_cl(xb, Axb)  # A x_bar of the next iteration
+            self.prg.average(q, gd, None, Ax.data, Axb.data, nd)  # A x_(k+1) = (A x_bar_(k+1) + A x_k) / 2
             if it % 50 == 0:  # float32 drift of the recursion
                 op.direct_cl(x, Ax)
             f = self._deviance(Ax)
@@ -248,4 +259,94 @@ class PDHGPoisson:
         if host_x0 is not None:
             x.get(ary=host_x0)
             return host_x0
+        return x
+
+    def _run_streamed(self, x, niter, verbose, diagnostics_interval, callback, state, t_start, tau0, sigma0, npix,
+                      supp, uploaded):
+        """run() with x and the primal steps T in host memory. A pass over the orientation batches per iteration:
+        x and T up; A^T y, the primal update and the forward of the batch's new x_bar on the GPU; x down. x_bar is
+        never stored: the next iteration needs only A x_bar, accumulated in the same pass."""
+        q, op = self.queue, self.op
+        st = streamer_for(op)
+        kmax, npx = op.K_batch_max, st.npix
+        dshape = tuple(op.data_shape)
+        xf = x.reshape(-1)
+        n = xf.size
+        Tf = np.empty(n, np.float32)
+        nslot = npx * kmax
+        gs = [clarray.empty(q, (nslot,), np.float32) for _ in range(2)]
+        ns = [clarray.empty(q, (nslot,), np.float32) for _ in range(2)]
+        ydual = clarray.zeros(q, dshape, np.float32)
+        sig = clarray.empty(q, dshape, np.float32)
+        Axb = clarray.empty(q, dshape, np.float32)
+        Ax = clarray.empty(q, dshape, np.float32)
+        gd, nd = elementwise(int(np.prod(dshape)))
+        mask_host = None if self.support_gpu is None else self.support_gpu.get().astype(bool)
+
+        def proj(a, b_):
+            seg = xf[a:b_]
+            np.maximum(seg, 0, out=seg)
+        host_map(st, proj, n)
+        if mask_host is not None and not mask_host.all():
+            x.reshape(op.K, npx)[:, ~mask_host.ravel()] = 0.0
+        # Sigma from the row sums A 1_S (the batch of ones made on the GPU), T from the column sums A^T 1_counted
+        Axb.fill(0.0)
+        for ib in range(len(op.batches)):
+            g1, n1 = elementwise(npx * op.batches[ib]["K_batch"])
+            self.pk.support_ones(q, g1, None, ns[0].data, supp, npix, n1)
+            op._direct_batch(ns[0], 0, kmax, ib, Axb)
+        self.prg.dual_steps(q, gd, None, sig.data, Axb.data, self.w.data, np.uint64(self.pw), np.float32(sigma0), nd)
+        self.prg.set_mask_ones(q, gd, None, Axb.data, self.w.data, np.uint64(self.pw), nd)
+
+        def steps(ib, s, nb_):
+            op._adjoint_batch(Axb, ib, gs[s], 0, kmax)
+            g1, n1 = elementwise(nb_)
+            self.prg.primal_steps(q, g1, None, ns[s].data, gs[s].data, supp, npix, np.float32(tau0), n1)
+        batch_pass(st, [], [(Tf, st.pin_dn["x"], ns)], steps)
+        if state is not None:
+            ydual.set(np.ascontiguousarray(state["y"], np.float32).reshape(dshape))
+            Axb.set(np.ascontiguousarray(state["Ax_bar"], np.float32).reshape(dshape))
+            Ax.set(np.ascontiguousarray(state["Ax"], np.float32).reshape(dshape))
+        else:
+            st.forward(xf, Ax)
+            cl.enqueue_copy(q, Axb.data, Ax.data)  # x_bar_0 = x_0
+        t_setup = time.perf_counter() - t_start
+        it0 = int(state["it"]) if state is not None else 0
+        lam = np.float32(self.lam)
+
+        def primal(ib, s, nb_):  # x, T in the slots st.xs[s], st.ys[s]
+            op._adjoint_batch(ydual, ib, gs[s], 0, kmax)
+            g1, n1 = elementwise(nb_)
+            self.prg.primal_update(q, g1, None, st.xs[s].data, ns[s].data, gs[s].data, st.ys[s].data, lam, n1)
+            op._direct_batch(ns[s], 0, kmax, ib, Axb)  # A x_bar of the next iteration
+        self.iter_stats = []
+        f = self._deviance(Ax)
+        for k in range(niter):
+            it = it0 + k + 1
+            self.prg.dual_update(q, gd, None, ydual.data, Axb.data, sig.data, self.b.data, self.w.data,
+                                 np.uint64(self.pw), self.g.data, np.uint64(self.pg), self.bg.data, np.uint64(self.pbg),
+                                 np.float32(self.eps_counts), nd)
+            Axb.fill(0.0)
+            batch_pass(st, [(xf, st.pin_up["x"], st.xs), (Tf, st.pin_up["y"], st.ys)],
+                       [(xf, st.pin_dn["x"], st.xs)], primal)
+            self.prg.average(q, gd, None, Ax.data, Axb.data, nd)  # A x of the new iterate
+            if it % 50 == 0:  # float32 drift of the recursion
+                st.forward(xf, Ax)
+            f = self._deviance(Ax)
+            stats = {"iter": it, "f": f, "rho": self.rho_used, "time": time.perf_counter() - t_start}
+            self.iter_stats.append(stats)
+            stop = bool(callback(it, x, stats)) if callback is not None else False
+            if verbose and (k == 0 or (k + 1) % diagnostics_interval == 0 or k + 1 == niter or stop):
+                print(f"[pdhg {it:5d}] f={f:.8e} {time.perf_counter() - t_start:.1f} s (streamed)", flush=True)
+            if stop:
+                break
+        q.finish()
+        self.state = {"it": it0 + len(self.iter_stats), "y": ydual.get(), "Ax_bar": Axb.get(), "Ax": Ax.get(),
+                      "streamed": True}
+        self.final_stats = {"niter": len(self.iter_stats), "final_f": f, "setup_s": t_setup, "rho": self.rho_used,
+                            "streamed": True, "time": time.perf_counter() - t_start}
+        for a in gs + ns + [ydual, sig, Axb, Ax]:
+            a.base_data.release()
+        del uploaded
+        self.b = self.w = self.g = self.bg = self._part = self._part2 = None
         return x

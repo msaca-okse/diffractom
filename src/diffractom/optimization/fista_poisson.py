@@ -55,7 +55,7 @@ import pyopencl.array as clarray
 
 from .launch import elementwise, reduction
 from .prox import support_mask_to_gpu
-from .streaming import _Pinned, streamer_for
+from .streaming import _Pinned, batch_pass, host_map, streamer_for
 from ..utils.arrays import as_host, check_device, supports_streaming
 
 KERNELS = r"""
@@ -616,64 +616,6 @@ class FISTAPoisson:
         return x
 
     # ------------------------------------------------------------------ streamed coefficients
-    def _pass(self, st, ups, dns, compute):
-        """One pass over the operator's orientation batches with the coefficients in host memory. ups and dns: lists
-        of (host flat array, two pinned buffers, two device slots); batch ib uses slot ib % 2. Uploads run in the
-        streamer's upload thread, downloads in its download thread, compute(ib, s, n) enqueues the batch's kernels
-        on the operator's queue (n: the batch's number of elements)."""
-        op, q = self.op, st.q
-        nb = len(op.batches)
-        up, dn = [None] * nb, [None] * nb
-        start = cl.enqueue_marker(q)
-        q.flush()
-
-        def size(ib):
-            return st.npix * op.batches[ib]["K_batch"]
-
-        def upload(ib):
-            s = ib % 2
-            if ib >= 2 and dn[ib - 2] is not None:
-                dn[ib - 2].result()  # slot s has been downloaded
-            else:
-                start.wait()
-            n = size(ib)
-            for flat, pins, slots in ups:
-                st._pcopy(pins[s].arr[:n], st.view(flat, ib))
-                cl.enqueue_copy(st.tq_up, slots[s].data, pins[s].arr[:n], is_blocking=True)
-
-        def download(ib, ev):
-            s = ib % 2
-            ev.wait()
-            n = size(ib)
-            for flat, pins, slots in dns:
-                cl.enqueue_copy(st.tq_dn, pins[s].arr[:n], slots[s].data, is_blocking=True)
-                st._pcopy(st.view(flat, ib), pins[s].arr[:n])
-
-        if ups:
-            up[0] = st.io_up.submit(upload, 0)
-        for ib in range(nb):
-            s = ib % 2
-            if ups:
-                if ib + 1 < nb:
-                    up[ib + 1] = st.io_up.submit(upload, ib + 1)
-                up[ib].result()
-            elif ib >= 2 and dn[ib - 2] is not None:
-                dn[ib - 2].result()
-            compute(ib, s, size(ib))
-            ev = cl.enqueue_marker(q)
-            q.flush()
-            if dns:
-                dn[ib] = st.io_dn.submit(download, ib, ev)
-        for f in dn:
-            if f is not None:
-                f.result()
-        q.finish()
-
-    def _host_map(self, st, f, n):
-        """f(a, b) on chunks [a, b) of n elements, on the streamer's thread pool."""
-        chunk = 1 << 24
-        list(st.pool.map(lambda c: f(c, min(c + chunk, n)), range(0, n, chunk)))
-
     def _run_streamed(self, x, niter, verbose, diagnostics_interval, state, callback, t_start, uploaded):
         """run() with x (the caller's host array) and the solver's coefficient arrays in host memory."""
         q, op = self.queue, self.op
@@ -735,7 +677,7 @@ class FISTAPoisson:
                 accumulate(parts[s], ng2, 1)
                 g1, n1 = elementwise(n)
                 self.k["invert_metric"](q, g1, None, ns[s].data, gs[s].data, supp, npix_u, n1)
-            self._pass(st, [], [(Df, st.pin_dn["x"], ns)], compute)
+            batch_pass(st, [], [(Df, st.pin_dn["x"], ns)], compute)
             at_u = float(acc.get()[0])
             if u_r > 0 and at_u > 0:
                 self.adjoint_scale = at_u / u_r
@@ -767,14 +709,14 @@ class FISTAPoisson:
                 dns.append((Gf, st.pin_dn["y"], gs))
             else:
                 ups.append((Gf, pin_g, gs))
-            self._pass(st, ups, dns, compute)
+            batch_pass(st, ups, dns, compute)
             return acc.get()
 
         # ---- start
         def proj(a, b_):
             seg = xf[a:b_]
             np.maximum(seg, 0, out=seg)
-        self._host_map(st, proj, nflat)
+        host_map(st, proj, nflat)
         if mask_host is not None and not mask_host.all():
             x.reshape(op.K, npix)[:, ~mask_host.ravel()] = 0.0
         zero_start = state is None and float(xf.max()) == 0.0
@@ -850,7 +792,7 @@ class FISTAPoisson:
             def ext(a, b_, beta=beta):  # y = xn + beta (xn - x)
                 xn_ = xnf[a:b_]
                 yf[a:b_] = xn_ + beta * (xn_ - xf[a:b_])
-            self._host_map(st, ext, nflat)
+            host_map(st, ext, nflat)
             self.k["extrapolate"](q, gd, None, Ay.data, Axn.data, Ax.data, beta, nd)
             xf, xnf = xnf, xf  # x <- the candidate (the host arrays swap)
             Ax, Axn = Axn, Ax
