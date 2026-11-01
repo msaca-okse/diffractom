@@ -205,8 +205,16 @@ x = solver.run(np.zeros(op.coeff_shape, np.float32), b, niter=200, gain=gain, we
 The gain may be given per segment, per (translation, segment) or per data
 point, and a known background can be added to the prediction (`background`).
 The solver runs FISTA in a diagonal (separable quadratic surrogate) metric with
-backtracking, because the likelihood has no global Lipschitz constant; its
-coefficients stay on the GPU (five coefficient-sized arrays).
+backtracking, because the likelihood has no global Lipschitz constant. As with
+`FISTAHuber`, a NumPy `x0` keeps the coefficients in host memory and streams
+them through the GPU (build the operator with `reserve_coefficient_arrays=0`);
+a pyopencl `x0` keeps everything on the GPU.
+
+`PDHGPoisson` solves the same problem with the Chambolle-Pock primal-dual
+method (diagonally preconditioned; no line search). It reached good fits in
+fewer iterations in our tests, but its step balance `rho` matters by orders of
+magnitude: the default `"auto"` is calibrated for `SinglePhaseForwardOperator`,
+and its coefficients stay on the GPU.
 
 ### Ring intensities from structure factors
 
