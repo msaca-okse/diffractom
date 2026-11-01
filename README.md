@@ -181,6 +181,33 @@ accept `prox_kind` values `"nonneg"`, `"l1"`, `"nonneg_l1"` and `"nonneg_tv"`
 translations, where zero weight excludes the segment. See
 [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) for the full API.
 
+### Poisson likelihood
+
+Photon-counting data are Poisson distributed. `FISTAPoisson` minimises the
+Poisson deviance instead of a least-squares or Huber misfit, so that every
+data point is weighted by its own counting statistics. It needs the counting
+gain of the data (variance / mean, in data units per detected photon), which
+`pyfai_gain` computes from the integration's pyFAI geometry and settings
+(`gain_from_pairs` estimates it from data recorded twice):
+
+```python
+from diffractom import FISTAPoisson, pyfai_gain
+
+# gain per (eta bin, ring) of ring-window sums of pyFAI integrate2d bins, with the integration's settings
+gain, _ = pyfai_gain(ai, mask, npt_rad, N_eta, ring_windows, unit="q_nm^-1", radial_range=radial_range,
+                     polarization_factor=polarization_factor)
+gain = gain * ring_scale  # if the data were rescaled per ring (averaging n repeats: divide by n)
+
+solver = FISTAPoisson(op)  # nonnegative, field-of-view support
+x = solver.run(np.zeros(op.coeff_shape, np.float32), b, niter=200, gain=gain, weights=weights)
+```
+
+The gain may be given per segment, per (translation, segment) or per data
+point, and a known background can be added to the prediction (`background`).
+The solver runs FISTA in a diagonal (separable quadratic surrogate) metric with
+backtracking, because the likelihood has no global Lipschitz constant; its
+coefficients stay on the GPU (five coefficient-sized arrays).
+
 ### Ring intensities from structure factors
 
 With `normalized=True` the operator predicts every ring up to a scale, so the

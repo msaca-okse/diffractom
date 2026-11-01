@@ -49,15 +49,16 @@ def test_pyfai_gain_matches_poisson_frames():
 class _HostOperator:
     """A dense nonnegative matrix as an operator with direct_cl / adjoint_cl (via the host), for the solver tests."""
 
-    def __init__(self, ctx, queue, A, coeff_shape, data_shape):
+    def __init__(self, ctx, queue, A, coeff_shape, data_shape, adjoint_scale=1.0):
         self.ctx, self.queue, self.A = ctx, queue, A
         self.coeff_shape, self.data_shape = coeff_shape, data_shape
+        self.adjoint_scale = adjoint_scale  # like the native projector's angle weights: adjoint = scale x transpose
 
     def direct_cl(self, x, out):
         out.set((self.A @ x.get().ravel()).astype(np.float32).reshape(self.data_shape))
 
     def adjoint_cl(self, y, out):
-        out.set((self.A.T @ y.get().ravel()).astype(np.float32).reshape(self.coeff_shape))
+        out.set((self.adjoint_scale * (self.A.T @ y.get().ravel())).astype(np.float32).reshape(self.coeff_shape))
 
 
 def _context():
@@ -127,3 +128,21 @@ def test_fista_poisson_resume_and_scale():
     x_s = FISTAPoisson(op, support=None).run(np.zeros(cs, np.float32), (s * b).reshape(ds), niter=600,
                                             gain=s * gain)
     np.testing.assert_allclose(x_s, s * x_one, rtol=1e-3, atol=1e-3 * s * x_one.max())
+
+
+def test_fista_poisson_scaled_adjoint():
+    """An adjoint that is a multiple of the transpose (the native projector's over a full turn: 2) changes nothing."""
+    from diffractom.optimization.fista_poisson import FISTAPoisson
+    ctx, queue = _context()
+    A, cs, ds, gain, g_all, b = _problem(2)
+    xs, fs = [], []
+    for scale in (1.0, 2.0):
+        op = _HostOperator(ctx, queue, A.astype(np.float32), cs, ds, adjoint_scale=scale)
+        solver = FISTAPoisson(op, support=None)
+        xs.append(solver.run(np.zeros(cs, np.float32), b.reshape(ds), niter=800, gain=gain))
+        fs.append(solver.final_stats["final_f"])
+        assert solver.final_stats["backtracks"] < 40
+        if solver.final_stats["adjoint_scale"] is not None:
+            assert abs(solver.final_stats["adjoint_scale"] - scale) < 0.05 * scale
+    assert abs(fs[1] - fs[0]) <= 1e-4 * fs[0]
+    np.testing.assert_allclose(xs[1], xs[0], atol=1e-2 * xs[0].max())

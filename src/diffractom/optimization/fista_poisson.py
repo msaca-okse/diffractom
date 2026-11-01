@@ -26,9 +26,13 @@ metric D, the separable quadratic surrogate (SQS) of CT reconstruction (Erdogan 
 c is the Poisson curvature b / m^2 where the prediction mu is below the data and its Pearson value 1 / m above (at
 least one count); for A >= 0 the metric majorizes the quadratic model with curvature c. It needs one forward and
 one adjoint pass and is computed at the starting prediction and again at the iterations in `refresh` (the momentum
-restarts there). Because c is the curvature at one point only, each step is checked for sufficient decrease: a
-rejected step first recomputes the metric at the extrapolated point and is retried, then the step factor theta
-(x <- prox(y - theta D grad)) halves until it holds; theta doubles again per iteration up to 1. The momentum
+restarts there). Because c is the curvature at one point only, each step is checked for sufficient decrease (the
+descent lemma of backtracking FISTA, f(x_new) <= f(y) + <grad f(y), x_new - y> + |x_new - y|^2_(theta D)^-1 / 2).
+The operator's adjoint may be a positive multiple of the transpose (the native projector's is (angle range / pi)
+A^T: its backprojection weights each angle by its width); the step D * A^T(...) does not depend on it, the test
+does, so the solver measures the multiple with every metric (<A^T u, 1> / <u, A 1>, from the passes the metric
+needs anyway). A rejected step first recomputes the metric at the extrapolated point and is retried, then the step factor theta (x <- prox(y - theta D grad)) halves until it holds;
+theta doubles again per iteration up to 1. The momentum
 restarts when the objective increases (O'Donoghue & Candes). The prediction at the extrapolated point is formed
 from the two last predictions (A is linear), so an iteration costs one forward and one adjoint pass, as in
 FISTAHuber, plus one forward per rejected step (and one forward and adjoint per metric update).
@@ -104,21 +108,53 @@ __kernel void poisson_value_grad(
 // u <- u * c, c = w / g * max(b, m) / max(m, floor g)^2 with m = max(mu, 0) + bg: the Poisson curvature
 // b / m^2 where the model is below the data, its Pearson value 1 / m above (m at least floor counts)
 // (mode 1: the curvature of the weighted least squares of the start, w / (g max(b, floor g)))
+// also the partial sums of u_new * u_old (= <c A1, A1>, for the scale of the adjoint)
 __kernel void times_curvature(
     __global float *u, __global const float *mu, __global const float *b,
     __global const float *w, const ulong pw, __global const float *g, const ulong pg,
-    __global const float *bg, const ulong pbg, const float floor_counts, const int mode, const ulong n)
+    __global const float *bg, const ulong pbg, const float floor_counts, const int mode, const ulong n,
+    __global double *partial, __local double *scratch)
 {
+    double s = 0.0;
     for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
         const float wi = wv(w, pw, i, 1.0f);
         const float gi = wv(g, pg, i, 1.0f);
+        const float r = u[i];
+        float c;
         if (mode == 0) {
             const float m = fmax(fmax(mu[i], 0.0f) + wv(bg, pbg, i, 0.0f), floor_counts * gi);
-            u[i] = wi != 0.0f ? u[i] * wi / gi * fmax(b[i], m) / (m * m) : 0.0f;
+            c = wi != 0.0f ? wi / gi * fmax(b[i], m) / (m * m) : 0.0f;
         } else {
-            u[i] = wi != 0.0f ? u[i] * wi / (gi * fmax(b[i], floor_counts * gi)) : 0.0f;
+            c = wi != 0.0f ? wi / (gi * fmax(b[i], floor_counts * gi)) : 0.0f;
         }
+        u[i] = r * c;
+        s += (double)c * (double)r * (double)r;
     }
+    const int lid = get_local_id(0);
+    scratch[lid] = s;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int h = get_local_size(0) / 2; h > 0; h >>= 1) {
+        if (lid < h) scratch[lid] += scratch[lid + h];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) partial[get_group_id(0)] = scratch[0];
+}
+
+// partial sums of x over the support (npix 0: everywhere)
+__kernel void support_sum(__global const float *x, __global const uchar *supp, const ulong npix, const ulong n,
+                          __global double *partial, __local double *scratch)
+{
+    double s = 0.0;
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0))
+        if (!npix || supp[i % npix]) s += (double)x[i];
+    const int lid = get_local_id(0);
+    scratch[lid] = s;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int h = get_local_size(0) / 2; h > 0; h >>= 1) {
+        if (lid < h) scratch[lid] += scratch[lid + h];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) partial[get_group_id(0)] = scratch[0];
 }
 
 // partial sums of w b and w mu (the uniform start: x0 = sum w b / sum w A 1)
@@ -275,8 +311,8 @@ class FISTAPoisson:
             than floor_counts counts (default one).
         refresh : iterations (1-based) after which the metric is recomputed at the current prediction and the
             momentum restarts; () keeps the starting metric (updates on rejected steps aside).
-        refresh_on_failure : when a step is rejected, first recompute the metric at the extrapolated point (one
-            more forward and adjoint) and retry the full step, before halving it.
+        refresh_on_failure : when a step is rejected, first recompute the metric at the extrapolated point (two more
+            forward passes and one adjoint) and retry the full step, before halving it.
         max_backtracks : rejected steps per iteration before giving up (an error).
         start, n_start : at x = 0 the prediction is eps, where the likelihood has its barrier (curvature b / eps^2): a
             gradient method from there needs tiny steps. "wls" (default): a zero x0 is first fitted for n_start
@@ -302,11 +338,12 @@ class FISTAPoisson:
         self.start = start
         self.n_start = int(n_start)
         self._mode = 0
+        self.adjoint_scale = 1.0
         self.support_gpu = support_mask_to_gpu(self.queue, operator, support)
         self.prg = cl.Program(self.ctx, KERNELS).build()
         self.k = {name: cl.Kernel(self.prg, name) for name in (
             "poisson_value_grad", "times_curvature", "invert_metric", "support_ones", "metric_step", "step_sums",
-            "extrapolate", "copy_buf", "project_support", "weighted_sums", "scale_buf")}
+            "extrapolate", "copy_buf", "project_support", "weighted_sums", "scale_buf", "support_sum")}
         self.state = None
 
     # ---- small helpers ----
@@ -337,12 +374,19 @@ class FISTAPoisson:
         q = self.queue
         npix, supp = self._npix()
         gx, nx = elementwise(x_tmp.size)
-        gd, nd = elementwise(scratch.size)
         self._ones_forward(scratch, x_tmp)
-        self.k["times_curvature"](q, gd, None, scratch.data, mu.data, self.b.data, self.w.data,
+        rg, rl, rn, rng_ = reduction(scratch.size)
+        self.k["times_curvature"](q, rg, rl, scratch.data, mu.data, self.b.data, self.w.data,
                                   np.uint64(self.pw), self.g.data, np.uint64(self.pg), self.bg.data,
-                                  np.uint64(self.pbg), np.float32(self.floor_counts), np.int32(self._mode), nd)
+                                  np.uint64(self.pbg), np.float32(self.floor_counts), np.int32(self._mode), rn,
+                                  self._part.data, cl.LocalMemory(8 * rl[0]))
+        u_r = float(self._part[:rng_].get().sum())  # <u, A 1_S>
         self.op.adjoint_cl(scratch, x_tmp)
+        cg, cl_, cn, cng = reduction(x_tmp.size)
+        self.k["support_sum"](q, cg, cl_, x_tmp.data, supp, npix, cn, self._part.data, cl.LocalMemory(8 * cl_[0]))
+        at_u = float(self._part[:cng].get().sum())  # <A^T u, 1_S>
+        if u_r > 0 and at_u > 0:
+            self.adjoint_scale = at_u / u_r  # the operator's adjoint is adjoint_scale x A^T
         self.k["invert_metric"](q, gx, None, D.data, x_tmp.data, supp, npix, nx)
 
     def run(self, x0, b, niter, weights=None, gain=None, background=None, verbose=0, diagnostics_interval=10,
@@ -449,7 +493,7 @@ class FISTAPoisson:
         for k in range(niter):
             it = it0 + k + 1
             # gradient at y: df/dmu in place of A y, then A^T
-            f_y = self._data_term(Ay, True)
+            f_y = self._data_term(Ay, True)  # Ay now holds df/dmu at y
             op.adjoint_cl(Ay, grad)
             theta = min(1.0, 2.0 * theta)
             n_bt = 0
@@ -462,12 +506,17 @@ class FISTAPoisson:
                 self.k["step_sums"](q, red_g, red_l, xn.data, y.data, grad.data, D.data, red_n, self._part.data,
                                     cl.LocalMemory(3 * 8 * red_l[0]))
                 p = self._part[:3 * red_ng].get().reshape(3, red_ng).sum(axis=1)
-                lin, quad, xsum = float(p[0]), float(p[1]) / theta, float(p[2])
+                lin_adj, xsum = float(p[0]), float(p[2])
+                # <grad f(y), xn - y> and the quadratic term in the true metric: grad and 1 / D scale with the adjoint
+                # (the native projector's adjoint is (angle range / pi) A^T), D * grad does not
+                lin = lin_adj / self.adjoint_scale
+                quad = float(p[1]) / (theta * self.adjoint_scale)
+                # descent lemma of the backtracking FISTA (holds for any theta <= 1 where the metric majorizes)
                 if f_n <= f_y + lin + 0.5 * quad + 1e-6 * abs(f_y) or quad == 0.0:
                     break
                 n_bt += 1
                 if not local and self.refresh_on_failure:
-                    # the metric is the curvature at one point: first take it at y (where the step starts), then halve
+                    # the metric is the curvature at one point: first take it at y, where the step starts, then halve
                     # (free here: the candidate xn, its prediction Axn, and Ay, whose gradient is already in grad)
                     op.direct_cl(y, Axn)
                     self._metric(Axn, Ay, xn, D)
@@ -476,7 +525,9 @@ class FISTAPoisson:
                     continue
                 theta *= 0.5
                 if n_bt > self.max_backtracks:
-                    raise RuntimeError(f"FISTAPoisson: no sufficient decrease after {n_bt} step reductions")
+                    raise RuntimeError(f"FISTAPoisson: no sufficient decrease after {n_bt} step reductions (iteration "
+                                       f"{it}, mode {self._mode}: f(y) {f_y:.10e}, f(x_new) {f_n:.10e}, derivative "
+                                       f"{lin:.4e}, quadratic term {quad:.4e}, theta {theta:.3g})")
             n_bt_total += n_bt
             F_n = f_n + self.lam * xsum
             restarted = F_n > F_x
@@ -523,6 +574,7 @@ class FISTAPoisson:
         self.state = {"it": it0 + done, "t": t_mom, "theta": theta, "y": y.get(), "wls_until": wls_until}
         self.final_stats = {"niter": done, "final_f": f_x, "final_obj": F_x, "backtracks": n_bt_total,
                             "metric_updates_on_failure": n_metric,
+                            "adjoint_scale": self.adjoint_scale,
                             "restarts": n_restart, "metric_setup_s": t_metric,
                             "time": time.perf_counter() - t_start}
         del xn, grad, D, Ax, Axn, Ay, y, uploaded
