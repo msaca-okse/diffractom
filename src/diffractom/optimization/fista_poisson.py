@@ -28,11 +28,11 @@ least one count); for A >= 0 the metric majorizes the quadratic model with curva
 one adjoint pass and is computed at the starting prediction and again at the iterations in `refresh` (the momentum
 restarts there). Because c is the curvature at one point only, each step is checked for sufficient decrease (the
 descent lemma of backtracking FISTA, f(x_new) <= f(y) + <grad f(y), x_new - y> + |x_new - y|^2_(theta D)^-1 / 2).
-The operator's adjoint may be a positive multiple of the transpose (the native projector's is (angle range / pi)
-A^T: its backprojection weights each angle by its width); the step D * A^T(...) does not depend on it, the test
-does, so the solver measures the multiple with every metric (<A^T u, 1> / <u, A 1>, from the passes the metric
-needs anyway). A rejected step first recomputes the metric at the extrapolated point and is retried, then the step factor theta (x <- prox(y - theta D grad)) halves until it holds;
-theta doubles again per iteration up to 1. The momentum
+The operator's adjoint may be a positive multiple of the transpose (before the exact-adjoint change the native and
+FFT projectors' was (angle range / pi) A^T); the step D * A^T(...) does not depend on it, the test does, so the
+solver measures the multiple with every metric (<A^T u, 1> / <u, A 1>, from the passes the metric needs anyway).
+A rejected step first recomputes the metric at the extrapolated point and is retried, then the step factor theta
+(x <- prox(y - theta D grad)) halves until it holds; theta doubles again per iteration up to 1. The momentum
 restarts when the objective increases (O'Donoghue & Candes). The prediction at the extrapolated point is formed
 from the two last predictions (A is linear), so an iteration costs one forward and one adjoint pass, as in
 FISTAHuber, plus one forward per rejected step (and one forward and adjoint per metric update).
@@ -42,8 +42,10 @@ iterations (20) fit the quadratic approximation of the deviance at the data inst
 weights w / (g max(b, g)), the chi-square of the data: no barrier, the metric is an exact majorizer), then the
 deviance takes over.
 
-Memory (GPU): five coefficient-sized arrays (x, x_new, y, gradient, D) and four data-sized arrays (data,
-three predictions); the coefficients are not streamed from host memory (FISTAHuber can stream them).
+Memory: on the GPU (pyopencl x0) five coefficient-sized arrays (x, x_new, y, gradient, D) and four data-sized
+arrays (data, three predictions). Streamed (NumPy x0): the five coefficient arrays in host memory, the GPU holds the
+data-sized arrays and batch-sized staging buffers; an iteration is one pass over the orientation batches (y and D
+up, the candidate and the gradient down), a rejected step one more (y, D and the gradient up, the candidate down).
 """
 import time
 
@@ -53,7 +55,8 @@ import pyopencl.array as clarray
 
 from .launch import elementwise, reduction
 from .prox import support_mask_to_gpu
-from ..utils.arrays import as_host, check_device
+from .streaming import _Pinned, streamer_for
+from ..utils.arrays import as_host, check_device, supports_streaming
 
 KERNELS = r"""
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
@@ -176,6 +179,25 @@ __kernel void weighted_sums(__global const float *mu, __global const float *b, _
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     if (lid == 0) { partial[get_group_id(0)] = scratch[0]; partial[get_num_groups(0) + get_group_id(0)] = scratch[ls]; }
+}
+
+// acc[k] += sum of partial[k * ng + i], i < ng, for k < nsums (one work-group)
+__kernel void accumulate(__global const double *partial, const uint ng, const uint nsums, __global double *acc,
+                         __local double *scratch)
+{
+    const int lid = get_local_id(0), ls = get_local_size(0);
+    for (uint k = 0; k < nsums; k++) {
+        double s = 0.0;
+        for (uint i = lid; i < ng; i += ls) s += partial[k * ng + i];
+        scratch[lid] = s;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int h = ls / 2; h > 0; h >>= 1) {
+            if (lid < h) scratch[lid] += scratch[lid + h];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0) acc[k] += scratch[0];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
 }
 
 __kernel void scale_buf(__global float *x, const float a, const ulong n)
@@ -343,7 +365,7 @@ class FISTAPoisson:
         self.prg = cl.Program(self.ctx, KERNELS).build()
         self.k = {name: cl.Kernel(self.prg, name) for name in (
             "poisson_value_grad", "times_curvature", "invert_metric", "support_ones", "metric_step", "step_sums",
-            "extrapolate", "copy_buf", "project_support", "weighted_sums", "scale_buf", "support_sum")}
+            "extrapolate", "copy_buf", "project_support", "weighted_sums", "scale_buf", "support_sum", "accumulate")}
         self.state = None
 
     # ---- small helpers ----
@@ -393,8 +415,11 @@ class FISTAPoisson:
             state=None, callback=None):
         """
         x0 : starting point (NumPy or pyopencl, the operator's coeff_shape, float32; zeros are fine). A NumPy array is
-            uploaded and the result copied back into it (or into a converted copy) and returned; a pyopencl array is
-            updated in place and returned.
+            streamed: the coefficient arrays stay in host memory and go through the GPU batch by batch (operators with
+            orientation batches, e.g. SinglePhaseForwardOperator; build it with reserve_coefficient_arrays=0), and x0
+            is updated in place if it is C-contiguous float32 (else a converted copy) and returned. For other
+            operators it is uploaded and the result copied back. A pyopencl array: everything on the GPU, x0 updated
+            in place and returned.
         b : the data (N_Omega, My, N_seg), NumPy or pyopencl (in the units of the gain).
         weights : as in FISTAHuber (N_seg, My * N_seg or the data shape); 0 excludes a data point.
         gain : counting gain g = var / mean in data units per count (N_seg, My * N_seg or the data shape; a scalar
@@ -402,7 +427,8 @@ class FISTAPoisson:
         background : known additive background bg >= 0 of the prediction (same shapes), None: 0.
         state : the solver.state of an earlier run to continue it (y, momentum, step factor, iteration count), e.g.
             in chunks on time-limited GPU queues; x0 must then be that run's result.
-        callback : called as callback(it, x_gpu, stats) after every iteration (it 1-based, counted over resumed runs);
+        callback : called as callback(it, x, stats) after every iteration (x: the iterate, a pyopencl array, or the
+            host array when streamed; it 1-based, counted over resumed runs);
             a true return value stops the run there (e.g. at a time limit; solver.state continues it).
         returns x (see x0). solver.iter_stats: per iteration f (deviance), obj (with lam sum(x)), theta, backtracks,
         restarts, time; solver.state: to continue.
@@ -413,8 +439,11 @@ class FISTAPoisson:
         cshape, dshape = tuple(op.coeff_shape), tuple(op.data_shape)
         uploaded = []
         host_x0 = None
+        streamed = not isinstance(x0, clarray.Array) and supports_streaming(op)
         if isinstance(x0, clarray.Array):
             x = check_device(x0, cshape, "x0")
+        elif streamed:
+            x = as_host(x0, cshape, "x0")
         else:
             host_x0 = as_host(x0, cshape, "x0")
             x = clarray.to_device(q, host_x0)
@@ -437,6 +466,8 @@ class FISTAPoisson:
                 raise ValueError("the gain must be positive everywhere")
         _, _, _, ng = reduction(max(int(np.prod(dshape)), int(np.prod(cshape))))
         self._part = clarray.empty(q, (3 * ng,), np.float64)
+        if streamed:
+            return self._run_streamed(x, niter, verbose, diagnostics_interval, state, callback, t_start, uploaded)
 
         # ---- buffers ----
         xn = clarray.empty(q, cshape, np.float32)
@@ -583,3 +614,285 @@ class FISTAPoisson:
             x.get(ary=host_x0)
             return host_x0
         return x
+
+    # ------------------------------------------------------------------ streamed coefficients
+    def _pass(self, st, ups, dns, compute):
+        """One pass over the operator's orientation batches with the coefficients in host memory. ups and dns: lists
+        of (host flat array, two pinned buffers, two device slots); batch ib uses slot ib % 2. Uploads run in the
+        streamer's upload thread, downloads in its download thread, compute(ib, s, n) enqueues the batch's kernels
+        on the operator's queue (n: the batch's number of elements)."""
+        op, q = self.op, st.q
+        nb = len(op.batches)
+        up, dn = [None] * nb, [None] * nb
+        start = cl.enqueue_marker(q)
+        q.flush()
+
+        def size(ib):
+            return st.npix * op.batches[ib]["K_batch"]
+
+        def upload(ib):
+            s = ib % 2
+            if ib >= 2 and dn[ib - 2] is not None:
+                dn[ib - 2].result()  # slot s has been downloaded
+            else:
+                start.wait()
+            n = size(ib)
+            for flat, pins, slots in ups:
+                st._pcopy(pins[s].arr[:n], st.view(flat, ib))
+                cl.enqueue_copy(st.tq_up, slots[s].data, pins[s].arr[:n], is_blocking=True)
+
+        def download(ib, ev):
+            s = ib % 2
+            ev.wait()
+            n = size(ib)
+            for flat, pins, slots in dns:
+                cl.enqueue_copy(st.tq_dn, pins[s].arr[:n], slots[s].data, is_blocking=True)
+                st._pcopy(st.view(flat, ib), pins[s].arr[:n])
+
+        if ups:
+            up[0] = st.io_up.submit(upload, 0)
+        for ib in range(nb):
+            s = ib % 2
+            if ups:
+                if ib + 1 < nb:
+                    up[ib + 1] = st.io_up.submit(upload, ib + 1)
+                up[ib].result()
+            elif ib >= 2 and dn[ib - 2] is not None:
+                dn[ib - 2].result()
+            compute(ib, s, size(ib))
+            ev = cl.enqueue_marker(q)
+            q.flush()
+            if dns:
+                dn[ib] = st.io_dn.submit(download, ib, ev)
+        for f in dn:
+            if f is not None:
+                f.result()
+        q.finish()
+
+    def _host_map(self, st, f, n):
+        """f(a, b) on chunks [a, b) of n elements, on the streamer's thread pool."""
+        chunk = 1 << 24
+        list(st.pool.map(lambda c: f(c, min(c + chunk, n)), range(0, n, chunk)))
+
+    def _run_streamed(self, x, niter, verbose, diagnostics_interval, state, callback, t_start, uploaded):
+        """run() with x (the caller's host array) and the solver's coefficient arrays in host memory."""
+        q, op = self.queue, self.op
+        st = streamer_for(op)
+        npix, kmax = st.npix, op.K_batch_max
+        dshape = tuple(op.data_shape)
+        x_user = x
+        xf = x.reshape(-1)
+        nflat = xf.size
+        npix_u, supp = self._npix()
+        mask_host = None if self.support_gpu is None else self.support_gpu.get().astype(bool)
+
+        # ---- host arrays (y, the candidate, the metric, the gradient) and GPU batch slots
+        yf = np.empty(nflat, np.float32)
+        xnf = np.empty(nflat, np.float32)
+        Df = np.empty(nflat, np.float32)
+        Gf = np.empty(nflat, np.float32)
+        nslot = npix * kmax
+        dev = lambda: clarray.empty(q, (nslot,), np.float32)
+        gs, ns = [dev(), dev()], [dev(), dev()]
+        pin_g = [_Pinned(op.ctx, q, nslot), _Pinned(op.ctx, q, nslot)]
+        _, _, _, ngb = reduction(nslot)
+        parts = [clarray.empty(q, (3 * ngb,), np.float64) for _ in range(2)]
+        acc = clarray.zeros(q, (3,), np.float64)
+        Ax = clarray.empty(q, dshape, np.float32)
+        Axn = clarray.empty(q, dshape, np.float32)
+        Ay = clarray.empty(q, dshape, np.float32)
+        gd, nd = elementwise(Ax.size)
+
+        def accumulate(part, ng, nsums):
+            self.k["accumulate"](q, (256,), (256,), part.data, np.uint32(ng), np.uint32(nsums), acc.data,
+                                 cl.LocalMemory(8 * 256))
+
+        def ones_forward(dst):
+            """dst = A 1_S (no transfers: the batch of ones is made on the GPU)."""
+            dst.fill(0.0)
+            for ib in range(len(op.batches)):
+                n = npix * op.batches[ib]["K_batch"]
+                g1, n1 = elementwise(n)
+                self.k["support_ones"](q, g1, None, ns[0].data, supp, npix_u, n1)
+                op._direct_batch(ns[0], 0, kmax, ib, dst)
+
+        def metric(mu, scratch):
+            """D = 1 / A^T(c A 1_S) into host Df, c = the curvature at the prediction mu; scratch is overwritten."""
+            ones_forward(scratch)
+            rg, rl, rn, rng_ = reduction(scratch.size)
+            self.k["times_curvature"](q, rg, rl, scratch.data, mu.data, self.b.data, self.w.data, np.uint64(self.pw),
+                                      self.g.data, np.uint64(self.pg), self.bg.data, np.uint64(self.pbg),
+                                      np.float32(self.floor_counts), np.int32(self._mode), rn, self._part.data,
+                                      cl.LocalMemory(8 * rl[0]))
+            u_r = float(self._part[:rng_].get().sum())
+            acc.fill(0.0)
+
+            def compute(ib, s, n):
+                op._adjoint_batch(scratch, ib, gs[s], 0, kmax)
+                g2, l2, n2, ng2 = reduction(n)
+                self.k["support_sum"](q, g2, l2, gs[s].data, supp, npix_u, n2, parts[s].data,
+                                      cl.LocalMemory(8 * l2[0]))
+                accumulate(parts[s], ng2, 1)
+                g1, n1 = elementwise(n)
+                self.k["invert_metric"](q, g1, None, ns[s].data, gs[s].data, supp, npix_u, n1)
+            self._pass(st, [], [(Df, st.pin_dn["x"], ns)], compute)
+            at_u = float(acc.get()[0])
+            if u_r > 0 and at_u > 0:
+                self.adjoint_scale = at_u / u_r
+
+        theta_box = [1.0]
+
+        def step_pass(first):
+            """x_new = prox(y - theta D grad) batch by batch, its forward into Axn and the sums <grad, dx>,
+            sum dx^2 / D, sum x_new; first: the gradient batch from the adjoint of Ay (and saved), else from the
+            host."""
+            Axn.fill(0.0)
+            acc.fill(0.0)
+            th = np.float32(theta_box[0])
+
+            def compute(ib, s, n):
+                if first:
+                    op._adjoint_batch(Ay, ib, gs[s], 0, kmax)
+                g1, n1 = elementwise(n)
+                self.k["metric_step"](q, g1, None, ns[s].data, st.ys[s].data, gs[s].data, st.xs[s].data, th,
+                                      np.float32(self.lam), n1)
+                g2, l2, n2, ng2 = reduction(n)
+                self.k["step_sums"](q, g2, l2, ns[s].data, st.ys[s].data, gs[s].data, st.xs[s].data, n2,
+                                    parts[s].data, cl.LocalMemory(3 * 8 * l2[0]))
+                accumulate(parts[s], ng2, 3)
+                op._direct_batch(ns[s], 0, kmax, ib, Axn)
+            ups = [(yf, st.pin_up["y"], st.ys), (Df, st.pin_up["x"], st.xs)]
+            dns = [(xnf, st.pin_dn["x"], ns)]
+            if first:
+                dns.append((Gf, st.pin_dn["y"], gs))
+            else:
+                ups.append((Gf, pin_g, gs))
+            self._pass(st, ups, dns, compute)
+            return acc.get()
+
+        # ---- start
+        def proj(a, b_):
+            seg = xf[a:b_]
+            np.maximum(seg, 0, out=seg)
+        self._host_map(st, proj, nflat)
+        if mask_host is not None and not mask_host.all():
+            x.reshape(op.K, npix)[:, ~mask_host.ravel()] = 0.0
+        zero_start = state is None and float(xf.max()) == 0.0
+        wls_until = 0
+        if self.start == "wls" and self.n_start > 0:
+            if zero_start:
+                wls_until = self.n_start
+            elif state is not None and state.get("wls_until", 0) > int(state["it"]):
+                wls_until = int(state["wls_until"])
+        self._mode = 1 if wls_until else 0
+        if zero_start and self.start == "uniform":
+            ones_forward(Axn)
+            rg, rl, rn, rng_ = reduction(Axn.size)
+            self.k["weighted_sums"](q, rg, rl, Axn.data, self.b.data, self.w.data, np.uint64(self.pw), rn,
+                                    self._part.data, cl.LocalMemory(2 * 8 * rl[0]))
+            sb, sa = self._part[:2 * rng_].get().reshape(2, rng_).sum(axis=1)
+            if sa > 0 and sb > 0:
+                xf[:] = 0.0
+                x.reshape(op.K, npix)[:, (mask_host.ravel() if mask_host is not None else slice(None))] = sb / sa
+
+        it0, t_mom, theta = 0, 1.0, 1.0
+        if state is not None:
+            it0, t_mom, theta = int(state["it"]), float(state["t"]), float(state["theta"])
+            st._pcopy(yf, np.asarray(state["y"], np.float32).reshape(-1))
+        else:
+            st._pcopy(yf, xf)
+        st.forward(xf, Ax)
+        if state is not None:
+            st.forward(yf, Ay)
+        else:
+            cl.enqueue_copy(q, Ay.data, Ax.data)
+        metric(Ax, Axn)
+        t_metric = time.perf_counter() - t_start
+        f_x = self._data_term(Ax, False)
+        F_x = f_x + self.lam * float(np.sum(xf, dtype=np.float64))
+        self.iter_stats = []
+        n_bt_total, n_restart, n_metric = 0, 0, 0
+        for k in range(niter):
+            it = it0 + k + 1
+            f_y = self._data_term(Ay, True)  # Ay now holds df/dmu at y
+            theta = min(1.0, 2.0 * theta)
+            n_bt, local, first = 0, False, True
+            while True:
+                theta_box[0] = theta
+                p = step_pass(first)
+                first = False
+                f_n = self._data_term(Axn, False)
+                lin, xsum = float(p[0]) / self.adjoint_scale, float(p[2])
+                quad = float(p[1]) / (theta * self.adjoint_scale)
+                if f_n <= f_y + lin + 0.5 * quad + 1e-6 * abs(f_y) or quad == 0.0:
+                    break
+                n_bt += 1
+                if not local and self.refresh_on_failure:  # the metric at y (Ay is free: the gradient is in Gf)
+                    st.forward(yf, Axn)
+                    metric(Axn, Ay)
+                    local, theta = True, 1.0
+                    n_metric += 1
+                    continue
+                theta *= 0.5
+                if n_bt > self.max_backtracks:
+                    raise RuntimeError(f"FISTAPoisson: no sufficient decrease after {n_bt} step reductions (iteration "
+                                       f"{it}, streamed)")
+            n_bt_total += n_bt
+            F_n = f_n + self.lam * xsum
+            restarted = F_n > F_x
+            if restarted:
+                t_mom = 1.0
+                n_restart += 1
+            t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t_mom * t_mom))
+            beta = np.float32((t_mom - 1.0) / t_new)
+            t_mom = t_new
+
+            def ext(a, b_, beta=beta):  # y = xn + beta (xn - x)
+                xn_ = xnf[a:b_]
+                yf[a:b_] = xn_ + beta * (xn_ - xf[a:b_])
+            self._host_map(st, ext, nflat)
+            self.k["extrapolate"](q, gd, None, Ay.data, Axn.data, Ax.data, beta, nd)
+            xf, xnf = xnf, xf  # x <- the candidate (the host arrays swap)
+            Ax, Axn = Axn, Ax
+            f_x, F_x = f_n, F_n
+            switch = self._mode == 1 and it >= wls_until
+            if switch:
+                self._mode = 0
+                f_x = self._data_term(Ax, False)
+                F_x = f_x + self.lam * xsum
+            refreshed = (it in self.refresh or switch) and k + 1 < niter and self._mode == 0
+            if refreshed:
+                metric(Ax, Axn)
+                t_mom, theta = 1.0, 1.0
+                st._pcopy(yf, xf)
+                cl.enqueue_copy(q, Ay.data, Ax.data)
+            elif it % 50 == 0:
+                st.forward(yf, Ay)
+            stats = {"iter": it, "f": f_n, "obj": F_n, "phase": "wls" if it <= wls_until else "poisson",
+                     "theta": theta, "backtracks": n_bt, "local_metric": local, "restart": bool(restarted),
+                     "metric_refresh": bool(refreshed), "time": time.perf_counter() - t_start}
+            self.iter_stats.append(stats)
+            stop = bool(callback(it, xf.reshape(x.shape), stats)) if callback is not None else False
+            if verbose and (k == 0 or (k + 1) % diagnostics_interval == 0 or k + 1 == niter or stop):
+                print(f"[iter {it:5d}] f={f_n:.8e} obj={F_n:.8e} theta={theta:.3g} backtracks={n_bt_total} "
+                      f"metric updates={n_metric} restarts={n_restart} "
+                      f"{time.perf_counter() - t_start:.1f} s (streamed)", flush=True)
+            if stop:
+                break
+
+        q.finish()
+        if not np.shares_memory(xf, x_user):  # the result is in the other host array (after an odd number of swaps)
+            st._pcopy(x_user.reshape(-1), xf)
+        done = len(self.iter_stats)
+        self.state = {"it": it0 + done, "t": t_mom, "theta": theta, "y": yf.reshape(x.shape), "wls_until": wls_until}
+        self.final_stats = {"niter": done, "final_f": f_x, "final_obj": F_x, "backtracks": n_bt_total,
+                            "metric_updates_on_failure": n_metric, "adjoint_scale": self.adjoint_scale,
+                            "restarts": n_restart, "metric_setup_s": t_metric, "streamed": True,
+                            "time": time.perf_counter() - t_start}
+        for p_ in pin_g:
+            p_.release()
+        for a_ in gs + ns + parts + [acc, Ax, Axn, Ay]:
+            a_.base_data.release()
+        del uploaded
+        self.b = self.w = self.g = self.bg = self._part = None
+        return x_user

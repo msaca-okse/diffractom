@@ -146,3 +146,39 @@ def test_fista_poisson_scaled_adjoint():
             assert abs(solver.final_stats["adjoint_scale"] - scale) < 0.05 * scale
     assert abs(fs[1] - fs[0]) <= 1e-4 * fs[0]
     np.testing.assert_allclose(xs[1], xs[0], atol=1e-2 * xs[0].max())
+
+
+def test_fista_poisson_streamed_equals_gpu():
+    """With the coefficients in host memory (NumPy x0, several orientation batches) the iterates are those of the
+    GPU-resident solver (pyopencl x0), up to the order of the sums."""
+    import pyopencl.array as clarray
+    from diffractom import Grid, Material, SinglePhaseForwardOperator
+    from diffractom.optimization.fista_poisson import FISTAPoisson
+    ctx, queue = _context()
+    mat = Material.from_lattice_parameters(a=4.05, b=4.05, c=4.05, alpha=90, beta=90, gamma=90, symmetry_group="cubic",
+                                           wavelength_A=0.35, hkl_list=np.array([[1, 1, 1], [2, 0, 0], [2, 2, 0]]))
+    cfg = {"Nx": 16, "Ny": 16, "My": 17, "N_Omega": 30, "angle_range": [0, 360], "cor_offset": 0.5,
+           "N_eta": 36, "eta_angle_range": [0, 360], "energy": 12.398 / 0.35, "k_direction_0": [0, 0, 1],
+           "p_direction_0": [1, 0, 0], "detector_direction_origin": [0, -1, 0],
+           "detector_direction_positive_90": [0, 0, -1]}
+    np.random.seed(3)
+    grid = Grid.from_random_fundamental_zone(40, "cubic", np.deg2rad(4.0))
+    # dense PF batches of a few orientations, so that the streamed solver goes through several batches
+    op = SinglePhaseForwardOperator(cfg=cfg, material=mat, grid=grid, max_gb=5e-5, normalized=True, pf_mode="dense",
+                                    ctx=ctx, queue=queue)
+    assert len(op.batches) >= 3
+    rng = np.random.default_rng(4)
+    x_true = (rng.random(op.coeff_shape) * (rng.random(op.coeff_shape) < 0.1) * op.support_mask()[None]).astype(np.float32)
+    mu = op.direct(x_true)
+    gain = 0.05
+    b = (rng.poisson(mu / gain) * gain).astype(np.float32)
+    runs = {}
+    for name, x0 in (("gpu", clarray.zeros(queue, op.coeff_shape, np.float32)),
+                     ("streamed", np.zeros(op.coeff_shape, np.float32))):
+        solver = FISTAPoisson(op)
+        x = solver.run(x0, b, niter=60, gain=gain)
+        runs[name] = (x.get() if name == "gpu" else x, [s["f"] for s in solver.iter_stats], solver.final_stats)
+    assert runs["streamed"][2]["streamed"]
+    np.testing.assert_allclose(runs["streamed"][1], runs["gpu"][1], rtol=1e-4)
+    xg, xs = runs["gpu"][0], runs["streamed"][0]
+    assert np.linalg.norm(xs - xg) <= 1e-3 * np.linalg.norm(xg)
