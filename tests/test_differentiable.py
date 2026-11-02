@@ -265,3 +265,30 @@ def test_windowed_operator_gpu():
     g_ref, g_gpu = wr.vjp(c, prm, r), wo.vjp(c, r)
     assert np.abs(g_gpu["lattice"] - g_ref["lattice"]).max() < 1e-4 * np.abs(g_ref["lattice"]).max()
     assert abs(g_gpu["sig_rel"] - g_ref["sig_rel"]) < 1e-4 * abs(g_ref["sig_rel"])
+
+
+def test_absorption_operator_gpu():
+    """AbsorptionOperator (GPU) equals AbsorptionReference with the same exit classes (forward, adjoint, mu gradient);
+    mu = 0 is the plain operator."""
+    from diffractom.differentiable.absorption import AbsorptionOperator, AbsorptionReference, exit_classes
+    from diffractom.differentiable.reference import ReferenceModel
+    ctx, queue = _context()
+    op = _operator(ctx, queue, "sparse")
+    classes = exit_classes(op, width_deg=5.0)
+    abo = AbsorptionOperator(op, classes, angle_chunk=5)
+    rng = np.random.default_rng(4)
+    c = (rng.random(op.coeff_shape) * op.support_mask()[None]).astype(np.float32)
+    r = rng.normal(size=op.data_shape).astype(np.float32)
+    d0 = op.direct(c)
+    assert np.abs(abo.direct(c) - d0).max() <= 1e-6 * np.abs(d0).max()
+    supp = op.support_mask().astype(np.float64)
+    mu = 0.1 * supp * (1 + 0.5 * rng.random(supp.shape))
+    abo.set_mu(mu)
+    abr = AbsorptionReference(ReferenceModel(op), op, classes)
+    prm = abr.ref.params0()
+    prm["mu"] = mu
+    rel = lambda a, b: np.abs(a - b).max() / np.abs(b).max()
+    g = abr.vjp(c, prm, r, groups=("c", "mu"))
+    assert rel(abo.direct(c), abr.forward(c, prm)) < 2e-5
+    assert rel(abo.adjoint(r), g["c"]) < 2e-5
+    assert rel(abo.mu_gradient(c, r), g["mu"]) < 2e-5

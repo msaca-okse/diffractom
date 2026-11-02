@@ -48,7 +48,7 @@ $\partial g/\partial s = -(1-|D|)e_1 - (1+|D|)e_2$ with $s = 1/\sigma^2$, $e_{1,
 | intensity scales | per ring $r_p$ ($P$), per angle $f_a$ ($N_\Omega$), per translation $t_s$ ($M_y$), per segment efficiency ($N_\eta P$) | $d \to f_a t_s r_p\, d$ | $\langle r, d\rangle$ restricted to the index | `IntensityLayer` (angle, translation, ring; not per segment) |
 | background | air $b_j$ + sample part $\beta_j\,\mathcal R_a[\rho](s)$ (2 per segment) | additive | linear | `IntensityLayer` (per segment constant); sample part not built |
 | structure factors | Debye-Waller $B$, occupancies (per phase) | $I_p$ via `IntensityModel` | $\partial I_p/\partial B = -2 s_p^2 I_p$ | not built |
-| absorption | $\mu(x)$ ($N_x N_y$) | $e^{-\int_{\text{in}}\mu - \int_{\text{out}(\eta,2\theta)}\mu}$ inside the projection | attenuated projector and its adjoint | reference (`AbsorptionReference`, exact to 2e-9); GPU not built |
+| absorption | $\mu(x)$ ($N_x N_y$) | $e^{-\int_{\text{in}}\mu - \int_{\text{out}(\eta,2\theta)}\mu}$ inside the projection | attenuated projector and its adjoint | reference (`AbsorptionReference`, exact to 2e-9), GPU (`AbsorptionOperator`, == reference 3e-6) |
 | multi-phase lattice | lattice parameters per phase (1-6), peak widths | window weights $w_{hkl} = \Phi\big(\tfrac{hi - 2\theta_{hkl}}{\varsigma}\big) - \Phi\big(\tfrac{lo - 2\theta_{hkl}}{\varsigma}\big)$ and $\mathbf u$ | chain rule through $2\theta_{hkl}(a, b, c, \alpha, \beta, \gamma)$ | reference (`WindowedReference`, exact to 7e-8), GPU (`WindowedOperator`: family channels + mixing, == reference 1e-5); pole directions kept: exact for cubic |
 | strain | $\varepsilon(x)$ (6 fields) or per orientation | ring position $2\theta - 2\tan\theta\,\mathbf n^{\mathsf T}\varepsilon\,\mathbf n$ | needs radially resolved data | out of scope here |
 
@@ -62,8 +62,16 @@ $A[a,x,j] = \exp\!\big(-\int_0^\infty \mu(x - t\,\mathbf b_a)\,dt - |k_\parallel
 - The projection becomes $S_k[a,s,j] = \kappa\sum_x K(t-s)\,c_k(x)\,A[a,x,j]$, so it depends on the segment.
 - $\partial L/\partial\mu = -\sum_{a,j}(L_a + E_{aj})^{\mathsf T}(A \odot W)$, with
   $W[a,x,j] = \sum_k c_k(x)\,(P_a^{\mathsf T} \mathrm{PF}^{\mathsf T} r)[x,k,j]$.
-- A GPU version would group the segments by exit direction (a few classes of the in-plane angle), with one attenuated
-  projection per class and the path integrals as cumulative sums along rotated grids.
+- Line integrals: on a grid turned to the direction, mu is sampled bilinearly, summed cumulatively along the direction
+  and sampled back at the pixels. The transposes are gathers with the same weights.
+- GPU (`AbsorptionOperator`): segments are grouped by the in-plane angle of their exit direction (`exit_classes`, bins of
+  a few degrees), with attenuation weights W[class, angle, pixel] from the line integrals. Each batch and class gets a
+  weighted projection and a PF product masked to the class's segments.
+  - The mu gradient contracts the coefficients with the class's $\mathrm{PF}^{\mathsf T} r$ at every angle and pixel,
+    then applies the transposed line integrals.
+  - It equals the reference with the same classes (forward 3e-6, adjoint 2e-6, mu gradient 2e-6), and with mu = 0 it
+    is the plain operator.
+  - Cost: n_classes times the projections; the masked PF products read all non-zeros.
 - Before applying it to measurements, check on the data which side $\eta = 0$ lies on (left/right intensity ratios).
 
 ### Integration windows and lattice parameters
