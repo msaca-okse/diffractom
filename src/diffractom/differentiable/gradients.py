@@ -152,3 +152,57 @@ class PFGradient:
             H[:, iu[1], iu[0]] = per_k[:, 4:14]
             out["hess"] = H
         return out
+
+
+class ProjGradient:
+    """grad = ProjGradient(op)(c, r): the gradients of <r, A(c)> with respect to a detector shift of every projection
+    ("shift", (N_Omega,), in detector bins: t_a(x) <- t_a(x) + shift_a) and the centre of rotation ("cor", in the
+    operator's cor_offset units). Native projector, pf_mode "sparse" or "generated"."""
+
+    def __init__(self, op, local_size=256):
+        if op.projector != "native":
+            raise NotImplementedError("ProjGradient needs the native projector")
+        if op.pf_mode not in ("sparse", "generated"):
+            raise NotImplementedError("ProjGradient needs pf_mode 'sparse' or 'generated'")
+        self.op, self.q, self.ls = op, op.queue, int(local_size)
+        opts = ["-DNB=3"] + (["-DTRAPEZOID"] if op.radon.kernel == "trapezoid" else [])
+        prg = cl.Program(op.ctx, Path(__file__).with_name("proj_grad.cl").read_text()).build(options=opts)
+        self.k_dfwd = cl.Kernel(prg, "radon_dforward_k")
+        self.k_dot = cl.Kernel(prg, "shift_dot")
+        self.part = clarray.empty(self.q, (int(op.N_Omega),), np.float32)
+        self.kmax, self.dS = None, None
+
+    def __call__(self, c, r):
+        from ..operators.single_phase_forward_operator import SPMM_TY
+        op, q = self.op, self.q
+        up = []
+        if not isinstance(c, clarray.Array):
+            c = clarray.to_device(q, as_host(c, op.coeff_shape, "c"))
+            up.append(c)
+        if not isinstance(r, clarray.Array):
+            r = clarray.to_device(q, as_host(r, op.data_shape, "r"))
+            up.append(r)
+        R, My, CP, Kmax = int(op.N_Omega), int(op.My), int(op.N_seg), op.K_batch_max
+        if self.kmax != Kmax:
+            self.kmax, self.dS = Kmax, clarray.empty(q, (R * My * Kmax,), np.float32)
+        ls, chunk = op._spmm_setup()
+        jc = min(CP, chunk)
+        n_strips = -(-My // 3)
+        out = np.zeros(R)
+        for ib, b in enumerate(op.batches):
+            k0, Kb = b["k_start"], b["K_batch"]
+            sb = op._pf_batch(ib, forward=False)
+            op.k.spmm_pf_adjoint_c(q, (-(-Kb // ls) * ls, -(-My // SPMM_TY), R), (ls, 1, 1), r.data,
+                                   sb["row_ptr_a"].data, sb["col_j"].data, sb["val_a"].data, op.coeffs_sino_C.data,
+                                   np.int32(R), np.int32(My), np.int32(Kb), np.int32(CP), np.int32(Kmax),
+                                   np.float32(1.0), np.int32(jc), cl.LocalMemory(4 * SPMM_TY * jc))   # Z = PF^T r
+            op.radon.gather(c, op._img_k, k0, Kb, Kmax)
+            k4 = Kmax // 4
+            self.k_dfwd(q, (-(-k4 // 32) * 32, -(-n_strips // 4) * 4, R), (32, 4, 1), op._img_k.data, self.dS.data,
+                        op.radon.geo_gpu.data, np.int32(op.Nx), np.int32(op.Ny), np.int32(My), np.int32(R),
+                        np.int32(k4), np.int32(k4), op.radon.scale)
+            self.k_dot(q, (R * self.ls,), (self.ls,), op.coeffs_sino_C.data, self.dS.data, self.part.data,
+                       np.int32(My), np.int32(Kmax), np.int32(Kb), cl.LocalMemory(4 * self.ls))
+            out += self.part.get()
+        del up
+        return {"shift": out, "cor": -float(out.sum())}     # t = ... - cor / delta_s, delta_s = 1 bin

@@ -88,3 +88,24 @@ def test_gpu_gradients_and_updates(pf_mode):
     set_pf_parameters(op, rotations=rotate_orientations(op.grid_rot_cpu, prm["rot"]), sigma=prm["sigma"],
                       two_theta=prm["two_theta"], eta_offset=prm["eta_offset"], axis_tilt=prm["axis_tilt"])
     assert np.abs(op.direct(c) - d_ref).max() < 2e-5 * np.abs(d_ref).max()
+
+
+@pytest.mark.parametrize("kernel", ["trapezoid", "hat"])
+def test_projector_gradients_and_updates(kernel):
+    from diffractom.differentiable import ProjGradient, ReferenceModel, set_proj_parameters
+    ctx, queue = _context()
+    op = _operator(ctx, queue, "sparse", kernel=kernel)
+    rng = np.random.default_rng(2)
+    c = (rng.random(op.coeff_shape) * op.support_mask()[None]).astype(np.float32)
+    r = rng.normal(size=op.data_shape).astype(np.float32)
+    ref = ReferenceModel(op)
+    prm = ref.params0()
+    g_ref = ref.vjp(c, prm, r, groups=("shift", "cor"))
+    g = ProjGradient(op)(c, r)
+    assert np.abs(g["shift"] - g_ref["shift"]).max() < 1e-4 * np.abs(g_ref["shift"]).max()
+    assert abs(g["cor"] - g_ref["cor"]) < 1e-4 * abs(g_ref["cor"])
+    prm["cor"] = prm["cor"] + 0.3
+    prm["shift"] = rng.normal(0, 0.4, op.N_Omega)
+    d_ref = ref.forward(c, prm)
+    set_proj_parameters(op, cor=prm["cor"], shift=prm["shift"])
+    assert np.abs(op.direct(c) - d_ref).max() < 2e-5 * np.abs(d_ref).max()

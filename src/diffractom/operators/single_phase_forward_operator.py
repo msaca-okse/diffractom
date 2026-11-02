@@ -1424,7 +1424,8 @@ class SinglePhaseForwardOperator:
             for s in out:
                 self._sub_radon.append(ParallelRadon(
                     self.queue, (self.Nx, self.Ny), self.angles[s], self.My, image_width=self.Nx,
-                    detector_width=self.My, detector_shift=self.cor_offset, angle_weights=np.pi / R, bins_per_item=3,
+                    detector_width=self.My, detector_shift=self.detector_shifts()[s], angle_weights=np.pi / R,
+                    bins_per_item=3,
                     kernel=self.radon_kernel, tiled=self._sub_radon[0].modes if self._sub_radon else "auto"))
         self._sub_prg = cl.Program(self.ctx, SUBSET_KERNELS).build(options=[f"-DSPMM_TY={SPMM_TY}"])
         self._sub_k = {n: cl.Kernel(self._sub_prg, n) for n in ("spmm_pf_forward_sub", "spmm_pf_adjoint_sub",
@@ -1440,6 +1441,12 @@ class SinglePhaseForwardOperator:
                 else:
                     self._sub_caps[m][ib] = self.pf_gen.count_subset_entries(sb, b["K_batch"], om)
         return out
+
+    def detector_shifts(self):
+        """The detector shift of every projection angle (N_Omega,): cor_offset minus the per-angle shifts set by
+        differentiable.set_proj_parameters (in detector bins; none by default)."""
+        shift = getattr(self, "angle_shift", None)
+        return np.full(int(self.N_Omega), float(self.cor_offset)) - (0.0 if shift is None else np.asarray(shift))
 
     def release_omega_subsets(self):
         """Free what set_omega_subsets allocated."""

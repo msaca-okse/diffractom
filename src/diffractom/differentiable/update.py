@@ -72,3 +72,23 @@ def set_pf_parameters(op, rotations=None, sigma=None, two_theta=None, eta_offset
         op.build_sparse_pf(**op._pf_build)
     op._pf_version = getattr(op, "_pf_version", 0) + 1
     return op
+
+
+def set_proj_parameters(op, cor=None, shift=None):
+    """Give the operator (native projector) a new centre of rotation (cor, the cfg's cor_offset units) and / or a
+    detector shift of every projection (shift (N_Omega,), in detector bins, added to the detector coordinate: run-out
+    or drift of the rotation stage), and rebuild its projector (the PF matrix is not affected)."""
+    from ..operators.parallel_radon import ParallelRadon
+    if op.projector != "native":
+        raise NotImplementedError("set_proj_parameters needs the native projector")
+    if cor is not None:
+        op.cor_offset = float(cor)
+    if shift is not None:
+        op.angle_shift = np.asarray(shift, np.float64).reshape(int(op.N_Omega)).copy()
+    old = op.radon
+    op.radon = ParallelRadon(op.queue, (op.Nx, op.Ny), op.angles, op.My, image_width=op.Nx, detector_width=op.My,
+                             detector_shift=op.detector_shifts(), angle_weights=old.angle_weights, bins_per_item=3,
+                             kernel=op.radon_kernel, tiled=old.modes)
+    op.release_omega_subsets()
+    op._pf_version = getattr(op, "_pf_version", 0) + 1
+    return op
