@@ -783,6 +783,9 @@ class SinglePhaseForwardOperator:
             n += self.pf_gen.nbytes()
         if self.fradon is not None:
             n += self.fradon.nbytes()
+        for r in getattr(self, "_sub_radon", None) or []:
+            if hasattr(r, "nbytes"):
+                n += r.nbytes()
         return n
 
     def release_streamer(self):
@@ -799,6 +802,7 @@ class SinglePhaseForwardOperator:
         Release OpenCL buffers created by allocate_coefficient_buffer() and
         remove the corresponding attributes from this object.
         """
+        self.release_omega_subsets()
         if getattr(self, "fradon", None) is not None:
             self.fradon.release()
             self.fradon = None
@@ -1375,13 +1379,19 @@ class SinglePhaseForwardOperator:
         subsets : int M (M interleaved subsets, angle i in subset i % M: every subset spans the whole rotation) or a
             list of arrays of angle indices. Returns the list of index arrays (sorted).
 
-        Needs the native projector and the sparse PF modes ("sparse", "generated"). Batches whose PF matrix is
-        generated in every call generate the rows of the subset's angles only, and a stored adjoint CSR is
-        transposed for those rows only. The adjoint of subset m is the transpose of A_m, and the subset adjoints of
-        a partition sum to the full adjoint.
+        Needs the native or the FFT projector and the sparse PF modes ("sparse", "generated"). Batches whose PF
+        matrix is generated in every call generate the rows of the subset's angles only, and a stored adjoint CSR
+        is transposed for those rows only. The adjoint of subset m is the transpose of A_m, and the subset adjoints
+        of a partition sum to the full adjoint.
+
+        Cost: the native projector and the PF products of a subset scale with its angles (the forward projection
+        of a subset costs up to ~1.5x its share, see ParallelRadon tiled). The FFT projector's 2D FFTs of the
+        images (and of the backprojection grid) do not: they are done in every subset call, so a pass over M
+        subsets does them M times.
         """
-        if self.projector != "native":
-            raise NotImplementedError(f"omega subsets need projector='native' (this operator: {self.projector!r})")
+        if self.projector not in ("native", "fft"):
+            raise NotImplementedError(f"omega subsets need projector 'native' or 'fft' (this operator: "
+                                      f"{self.projector!r})")
         if self.pf_mode not in ("sparse", "generated"):
             raise NotImplementedError(f"omega subsets need pf_mode 'sparse' or 'generated' (this operator: "
                                       f"{self.pf_mode!r})")
@@ -1397,12 +1407,21 @@ class SinglePhaseForwardOperator:
             if s.size == 0 or s[0] < 0 or s[-1] >= R:
                 raise ValueError(f"every subset must hold angle indices in 0 .. {R - 1}")
             out.append(s)
+        old = getattr(self, "omega_subsets", None)
+        if old is not None and len(old) == len(out) and all(np.array_equal(a, b) for a, b in zip(old, out)):
+            return out                       # unchanged (e.g. a second solver on this operator)
+        self.release_omega_subsets()
         self.omega_subsets = out
         self._sub_omegas = [clarray.to_device(self.queue, s.astype(np.int32)) for s in out]
-        self._sub_radon = [ParallelRadon(self.queue, (self.Nx, self.Ny), self.angles[s], self.My, image_width=self.Nx,
-                                         detector_width=self.My, detector_shift=self.cor_offset,
-                                         angle_weights=np.pi / R, bins_per_item=3, kernel=self.radon_kernel)
-                           for s in out]
+        self._sub_radon = []
+        if self.projector == "fft":           # sharing the 2D grid buffers and FFT plans of self.fradon
+            self._sub_radon = [self.fradon.subset(s) for s in out]
+        else:   # the kernels (tiled or plain, ParallelRadon tiled="auto") are timed for the first subset
+            for s in out:
+                self._sub_radon.append(ParallelRadon(
+                    self.queue, (self.Nx, self.Ny), self.angles[s], self.My, image_width=self.Nx,
+                    detector_width=self.My, detector_shift=self.cor_offset, angle_weights=np.pi / R, bins_per_item=3,
+                    kernel=self.radon_kernel, tiled=self._sub_radon[0].modes if self._sub_radon else "auto"))
         self._sub_prg = cl.Program(self.ctx, SUBSET_KERNELS).build(options=[f"-DSPMM_TY={SPMM_TY}"])
         self._sub_k = {n: cl.Kernel(self._sub_prg, n) for n in ("spmm_pf_forward_sub", "spmm_pf_adjoint_sub",
                                                                 "zero_rows")}
@@ -1418,8 +1437,19 @@ class SinglePhaseForwardOperator:
                     self._sub_caps[m][ib] = self.pf_gen.count_subset_entries(sb, b["K_batch"], om)
         return out
 
+    def release_omega_subsets(self):
+        """Free what set_omega_subsets allocated."""
+        for r in getattr(self, "_sub_radon", None) or []:
+            if hasattr(r, "release"):
+                r.release()
+        for a in getattr(self, "_sub_omegas", None) or []:
+            a.base_data.release()
+        self._sub_radon, self._sub_omegas = [], []
+        if hasattr(self, "omega_subsets"):
+            del self.omega_subsets
+
     def _subset(self, subset):
-        if not hasattr(self, "omega_subsets"):
+        if getattr(self, "omega_subsets", None) is None:
             raise ValueError("no omega subsets defined: call set_omega_subsets first")
         return int(subset)
 
@@ -1464,8 +1494,11 @@ class SinglePhaseForwardOperator:
         if subset is not None:
             m = self._subset(subset)
             Rm = len(self.omega_subsets[m])
-            self.radon.gather(src, self._img_k, k_src, Kb, Kmax)
-            self._sub_radon[m].forward(self._img_k, self.coeffs_sino_C, Kmax)  # compact (Rm, My, Kmax)
+            if self.projector == "fft":
+                self._sub_radon[m].forward(src, k_src, Kb, self.coeffs_sino_C, Kmax)  # compact (Rm, My, Kmax)
+            else:
+                self.radon.gather(src, self._img_k, k_src, Kb, Kmax)
+                self._sub_radon[m].forward(self._img_k, self.coeffs_sino_C, Kmax)
             sb, compact = self._pf_batch_sub(ib, True, m)
             ls, chunk = self._spmm_setup()
             kc = min(Kb, chunk)
@@ -1645,8 +1678,11 @@ class SinglePhaseForwardOperator:
                 sb["col_j"].data, sb["val_a"].data, self.coeffs_sino_C.data, self._sub_omegas[m].data, np.int32(My),
                 np.int32(Kb), np.int32(CP), np.int32(Kmax), np.float32(alpha), np.int32(jc),
                 cl.LocalMemory(4 * SPMM_TY * jc), np.int32(compact))
-            self._sub_radon[m].backward(self.coeffs_sino_C, self._img_k, Kmax)
-            self.radon.scatter(self._img_k, target, k_target, Kb, Kmax)
+            if self.projector == "fft":
+                self._sub_radon[m].backward(self.coeffs_sino_C, Kmax, target, k_target, Kb)
+            else:
+                self._sub_radon[m].backward(self.coeffs_sino_C, self._img_k, Kmax)
+                self.radon.scatter(self._img_k, target, k_target, Kb, Kmax)
             return
 
         # 1) PF^T product -> coeffs_sino_C (R, My, Kmax)

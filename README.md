@@ -220,13 +220,19 @@ for `SinglePhaseForwardOperator`.
 
 `op.set_omega_subsets(M)` splits the angles into `M` interleaved subsets (or
 takes a list of index arrays); `op.direct_cl(x, data, subset=m)` and
-`op.adjoint_cl(data, x, subset=m)` then compute only the data rows of subset `m`,
-at the cost of those angles (native projector, sparse PF modes).
+`op.adjoint_cl(data, x, subset=m)` then compute only the data rows of subset `m`
+(native or FFT projector, sparse PF modes; PF batches that are generated in
+every call generate only the subset's rows). With the native projector a subset
+costs about its share of the angles; the FFT projector repeats its 2D FFTs for
+every subset, so it suits few subsets.
 `SPDHGPoisson(op, subsets=M)` uses them for stochastic primal-dual
 (Chambolle, Ehrhardt, Richtárik & Schönlieb): every iteration updates the dual
 variables of one subset, so an epoch over all subsets costs about one full
 iteration, and good fits took several times fewer epochs than PDHGPoisson's or
-FISTAPoisson's iterations (`run(x0, b, n_epochs, ...)`; coefficients on the GPU).
+FISTAPoisson's iterations (`run(x0, b, n_epochs, ...)`). Each iteration is one
+pass over the orientation batches; with a NumPy `x0` the coefficient arrays
+that do not fit on the GPU (x, z = A^T y, the step sizes; `resident="auto"`)
+stay in host memory and are streamed through it.
 
 ### Ring intensities from structure factors
 

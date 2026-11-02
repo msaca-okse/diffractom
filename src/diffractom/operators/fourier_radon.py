@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import copy
+
 import numpy as np
 import pyopencl as cl
 import pyopencl.array as clarray
@@ -124,7 +126,7 @@ class FourierRadon:
         beta = 0.97 * np.pi * (1 - 1 / (2 * sigma)) * W        # (FINUFFT's choice for the ES kernel)
         self.Mx, self.My = Mx, My = _smooth(sigma * self.Nx), _smooth(sigma * self.Ny)
         self.Hx = Hx = Mx // 2 + 1
-        RH = R * H
+        self.beta = beta
 
         # ---- deapodisation: psi(x) = int phi(kappa) cos(2 pi kappa x / M) dkappa
         kap = np.linspace(-W / 2, W / 2, 4001)
@@ -135,6 +137,39 @@ class FourierRadon:
         self.inv_dx = dev((1.0 / psi(np.arange(self.Nx) - self.cx, Mx)).astype(np.float32))
         self.inv_dy = dev((1.0 / psi(np.arange(self.Ny) - self.cy, My)).astype(np.float32))
 
+        self._XYT = (X, Y, T)                                 # per angle, for subset()
+        self._set_polar(X, Y, T, self.angle_weights)
+        RH = self.RH
+
+        # ---- channel slice and scratch buffers
+        per_channel = 4 * Mx * My + 8 * My * Hx + 8 * RH + 4 * R * L
+        # channels per work-item of the interpolations: 1 (A40, us per orientation for the forward one at
+        # 400 / 800 / 1200 pixels: CC = 1 31 / 103 / 213, CC = 2 40 / 169 / 472, CC = 8 152 / 632 / 1163:
+        # what runs at once must stay within a few channel planes of the grid for the L2 cache)
+        self.CC = CC = 1
+        self.CCS = 8                                       # channels per work-group of the spreading
+        self.C = C = int(max(1, min(256 // CC, max_gb * 1024**3 // (CC * per_channel)))) * CC
+        self.grid = clarray.empty(q, (C, My, Mx), np.float32)
+        self.G = clarray.empty(q, (C, My, Hx), np.complex64)
+        self.spec = clarray.empty(q, (C * R, H), np.complex64)
+        self.lines = clarray.empty(q, (C * R, L), np.float32)
+        self._plans2 = {}                                  # FFT plans (and buffer views) per slice size: 2D
+        self._plans1 = {}                                  # and 1D
+        self._parent = None
+
+        src = Path(__file__).with_name("fourier_radon.cl").read_text()
+        prg = cl.Program(q.context, src).build(options=[f"-DW={W}", f"-DCC={CC}", f"-DCCS={self.CCS}",
+                                                       f"-DTS={self.TS}"])
+        self.k = {n: cl.Kernel(prg, n) for n in ("fr_pad", "fr_slices", "fr_lines_out", "fr_zero_channels",
+                                                  "fr_lines_in", "fr_unfilter", "fr_spread", "fr_crop")}
+
+    def _set_polar(self, X, Y, T, angle_weights):
+        """The polar samples of the angles with the geometry X, Y, T (per angle): interpolation taps and
+        weights, phase and bin response, the spreading tiles, the angle weights."""
+        q, R, H, L, W, beta = self.queue, len(X), self.H, self.L, self.W, self.beta
+        Mx, My, Hx = self.Mx, self.My, self.Hx
+        RH = R * H
+        dev = lambda a: clarray.to_device(q, np.ascontiguousarray(a))
         # ---- polar samples (angle a, frequency j >= 0): phase and bin response, taps, weights
         om = 2 * np.pi * np.arange(H) / L
         filt = (np.sinc(om / (2 * np.pi)) ** 2)[None, :] * np.exp(-1j * om[None, :] * T[:, None]) / L
@@ -173,26 +208,7 @@ class FourierRadon:
         np.cumsum(np.bincount(tile, minlength=self.n_tiles), out=tile_ptr[1:])
         self.tile_ptr = dev(tile_ptr.astype(np.int32))
         self.tile_smp = dev(np.where(flag == 1, -smps - 1, smps).astype(np.int32))
-        self.wa = dev(self.angle_weights.astype(np.float32))
-
-        # ---- channel slice and scratch buffers
-        per_channel = 4 * Mx * My + 8 * My * Hx + 8 * RH + 4 * R * L
-        # channels per work-item of the interpolations: 1 (A40, us per orientation for the forward one at
-        # 400 / 800 / 1200 pixels: CC = 1 31 / 103 / 213, CC = 2 40 / 169 / 472, CC = 8 152 / 632 / 1163:
-        # what runs at once must stay within a few channel planes of the grid for the L2 cache)
-        self.CC = CC = 1
-        self.CCS = 8                                       # channels per work-group of the spreading
-        self.C = C = int(max(1, min(256 // CC, max_gb * 1024**3 // (CC * per_channel)))) * CC
-        self.grid = clarray.empty(q, (C, My, Mx), np.float32)
-        self.G = clarray.empty(q, (C, My, Hx), np.complex64)
-        self.spec = clarray.empty(q, (C * R, H), np.complex64)
-        self.lines = clarray.empty(q, (C * R, L), np.float32)
-        self._plans = {}                                   # FFT plans (and buffer views) per slice size
-
-        src = Path(__file__).with_name("fourier_radon.cl").read_text()
-        prg = cl.Program(q.context, src).build(options=[f"-DW={W}", f"-DCC={CC}", f"-DCCS={self.CCS}", f"-DTS={TS}"])
-        self.k = {n: cl.Kernel(prg, n) for n in ("fr_pad", "fr_slices", "fr_lines_out", "fr_zero_channels",
-                                                  "fr_lines_in", "fr_unfilter", "fr_spread", "fr_crop")}
+        self.wa = dev(np.asarray(angle_weights, np.float64).astype(np.float32))
         self.RH = RH
 
     def _slices(self, Kb):
@@ -202,19 +218,42 @@ class FourierRadon:
         return [(c0, min(cs, Kb - c0), cs) for c0 in range(0, Kb, cs)]
 
     def _plan(self, cs):
-        """FFT plans and buffer views for slices of cs channels (cached)."""
-        if cs not in self._plans:
-            R, q = self.R, self.queue
-            grid, G, spec, lines = self.grid[:cs], self.G[:cs], self.spec[:cs * R], self.lines[:cs * R]
-            app2 = VkFFTApp(grid.shape, np.float32, queue=q, ndim=2, inplace=False, norm=0, r2c=True)
-            app1 = VkFFTApp(lines.shape, np.float32, queue=q, ndim=1, inplace=False, norm=0, r2c=True)
-            self._plans[cs] = (app2, app1, grid, G, spec, lines)
-        return self._plans[cs]
+        """FFT plans and buffer views for slices of cs channels (cached; the 2D ones are shared with subsets)."""
+        if cs not in self._plans2:
+            grid, G = self.grid[:cs], self.G[:cs]
+            self._plans2[cs] = (VkFFTApp(grid.shape, np.float32, queue=self.queue, ndim=2, inplace=False, norm=0,
+                                         r2c=True), grid, G)
+        if cs not in self._plans1:
+            R = self.R
+            spec, lines = self.spec[:cs * R], self.lines[:cs * R]
+            self._plans1[cs] = (VkFFTApp(lines.shape, np.float32, queue=self.queue, ndim=1, inplace=False, norm=0,
+                                         r2c=True), spec, lines)
+        app2, grid, G = self._plans2[cs]
+        app1, spec, lines = self._plans1[cs]
+        return app2, app1, grid, G, spec, lines
+
+    def subset(self, idx):
+        """The transform restricted to the angles idx (an index array): its forward projection gives the rows of
+        those angles (sinogram (len(idx), Ns, Kstride)), its backward projection their transpose weighted by their
+        angle weights. It shares this instance's padded grid and its spectrum (buffers, 2D FFT plans) and kernels;
+        only the polar samples, the spreading tiles and the 1D lines are its own."""
+        idx = np.asarray(idx, dtype=np.int64)
+        sub = copy.copy(self)            # shallow: the shared buffers, kernels and the 2D plan cache
+        sub.R = len(idx)
+        sub.angle_weights = self.angle_weights[idx].copy()
+        X, Y, T = (a[idx] for a in self._XYT)
+        sub._XYT = (X, Y, T)
+        sub._set_polar(X, Y, T, sub.angle_weights)
+        sub.spec = clarray.empty(self.queue, (self.C * sub.R, self.H), np.complex64)
+        sub.lines = clarray.empty(self.queue, (self.C * sub.R, self.L), np.float32)
+        sub._plans1 = {}
+        sub._parent = self
+        return sub
 
     def nbytes(self):
-        bufs = (self.grid, self.G, self.spec, self.lines, self.kb, self.w1s, self.w2s, self.tile_ptr, self.tile_smp,
-                self.filt)
-        return sum(a.nbytes for a in bufs)
+        own = (self.spec, self.lines, self.kb, self.w1s, self.w2s, self.tile_ptr, self.tile_smp, self.filt)
+        shared = (self.grid, self.G) if self._parent is None else ()
+        return sum(a.nbytes for a in own + shared)
 
     def forward(self, coeffs, k0, Kb, sino, Kstride):
         """sino (R, Ns, Kstride), channels 0 .. Kb-1 = forward projections of images k0 .. k0+Kb-1 of
@@ -261,8 +300,12 @@ class FourierRadon:
                          np.int32(self.Mx), np.int32(self.My), np.int32(self.cx), np.int32(self.cy), np.int32(cb))
 
     def release(self):
-        self._plans = {}
-        for a in (self.grid, self.G, self.spec, self.lines, self.kb, self.w1s, self.w2s, self.tile_ptr, self.tile_smp,
-                  self.filt, self.inv_dx, self.inv_dy, self.wa):
+        """Release the buffers (a subset: only its own; the parent's are shared)."""
+        self._plans1 = {}
+        own = [self.spec, self.lines, self.kb, self.w1s, self.w2s, self.tile_ptr, self.tile_smp, self.filt, self.wa]
+        if self._parent is None:
+            self._plans2.clear()
+            own += [self.grid, self.G, self.inv_dx, self.inv_dy]
+        for a in own:
             if a.base_data is not None:
                 a.base_data.release()
