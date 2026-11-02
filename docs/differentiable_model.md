@@ -37,16 +37,16 @@ $\partial g/\partial s = -(1-|D|)e_1 - (1+|D|)e_2$ with $s = 1/\sigma^2$, $e_{1,
 | group | parameters (count) | how it enters | derivative | status |
 |---|---|---|---|---|
 | coefficients | $c_k(x)$ ($K N_x N_y$) | linear | the adjoint $A^{\mathsf T} r$ | operator |
-| orientations | rotation $\delta_k$ of every basis orientation ($3K$) | poles: $U_k \leftarrow e^{[\delta_k]_\times}U_k$ | $\partial D/\partial\delta_k = \mathbf n\times\mathbf v$ | reference |
-| kernel widths | $\sigma_k$ ($K$) | $g$ and $N$ | $\partial \mathrm{PF}/\partial\sigma = -\tfrac{2}{\sigma}\mathrm{PF} - \tfrac{2}{\sigma^3} I N\sum w\, m\, \partial g/\partial s$ | reference |
-| Bragg angles | $2\theta_p$ ($P$); from $\lambda$ (1) or lattice parameters (1-6 per phase) | $\mathbf u$ | $\partial\mathbf u/\partial(2\theta) = \tfrac12(-\sin\theta\,\mathbf e - \cos\theta\,\mathbf p_0)$; $\partial(2\theta)/\partial a = -2\tan\theta / a$ | reference ($2\theta_p$) |
-| azimuth zero | $\eta$ offset (1) | $\mathbf u$ | $\partial\mathbf u/\partial\eta = \cos\theta(-\sin\eta\,\mathbf d_0 + \cos\eta\,\mathbf d_{90})$ | reference |
-| rotation axis | tilt of $\mathbf k_0$ about $\mathbf e_1,\mathbf e_2\perp\mathbf k_0$ (2) | $R(\omega) \to Q R Q^{\mathsf T}$ | $\partial\mathbf v/\partial\tau_i = \mathbf e_i\times\mathbf v - R^{\mathsf T}(\mathbf e_i\times\mathbf u)$ | reference |
-| centre of rotation | cor (1) | $t_a$ | $\partial S/\partial\mathrm{cor} = -\tfrac{\kappa}{\delta_s}\sum_x K'(t - s)\,c(x)$ | reference |
-| per-angle shift | $\Delta_a$ ($N_\Omega$): wobble, run-out, drift | $t_a$ | $\partial S/\partial\Delta_a = \kappa\sum_x K'(t-s)\,c(x)$ | reference |
+| orientations | rotation $\delta_k$ of every basis orientation ($3K$) | poles: $U_k \leftarrow e^{[\delta_k]_\times}U_k$ | $\partial D/\partial\delta_k = \mathbf n\times\mathbf v$ | reference, GPU (`PFGradient`) |
+| kernel widths | $\sigma_k$ ($K$) | $g$ and $N$ | $\partial \mathrm{PF}/\partial\sigma = -\tfrac{2}{\sigma}\mathrm{PF} - \tfrac{2}{\sigma^3} I N\sum w\, m\, \partial g/\partial s$ | reference, GPU |
+| Bragg angles | $2\theta_p$ ($P$); from $\lambda$ (1) or lattice parameters (1-6 per phase) | $\mathbf u$ | $\partial\mathbf u/\partial(2\theta) = \tfrac12(-\sin\theta\,\mathbf e - \cos\theta\,\mathbf p_0)$; $\partial(2\theta)/\partial a = -2\tan\theta / a$ | reference, GPU ($2\theta_p$) |
+| azimuth zero | $\eta$ offset (1) | $\mathbf u$ | $\partial\mathbf u/\partial\eta = \cos\theta(-\sin\eta\,\mathbf d_0 + \cos\eta\,\mathbf d_{90})$ | reference, GPU |
+| rotation axis | tilt of $\mathbf k_0$ about $\mathbf e_1,\mathbf e_2\perp\mathbf k_0$ (2) | $R(\omega) \to Q R Q^{\mathsf T}$ | $\partial\mathbf v/\partial\tau_i = \mathbf e_i\times\mathbf v - R^{\mathsf T}(\mathbf e_i\times\mathbf u)$ | reference, GPU |
+| centre of rotation | cor (1) | $t_a$ | $\partial S/\partial\mathrm{cor} = -\tfrac{\kappa}{\delta_s}\sum_x K'(t - s)\,c(x)$ | reference, GPU (`ProjGradient`) |
+| per-angle shift | $\Delta_a$ ($N_\Omega$): wobble, run-out, drift | $t_a$ | $\partial S/\partial\Delta_a = \kappa\sum_x K'(t-s)\,c(x)$ | reference, GPU (`ProjGradient`) |
 | beam profile | width of the pencil beam (1-2) | convolution of $S$ along $s$ | derivative of the blur kernel | not built (needs a model term) |
-| intensity scales | per ring $r_p$ ($P$), per angle $f_a$ ($N_\Omega$), per translation $t_s$ ($M_y$), per segment efficiency ($N_\eta P$) | $d \to f_a t_s r_p\, d$ | $\langle r, d\rangle$ restricted to the index | trivial, not built |
-| background | air $b_j$ + sample part $\beta_j\,\mathcal R_a[\rho](s)$ (2 per segment) | additive | linear | not built |
+| intensity scales | per ring $r_p$ ($P$), per angle $f_a$ ($N_\Omega$), per translation $t_s$ ($M_y$), per segment efficiency ($N_\eta P$) | $d \to f_a t_s r_p\, d$ | $\langle r, d\rangle$ restricted to the index | `IntensityLayer` (angle, translation, ring; not per segment) |
+| background | air $b_j$ + sample part $\beta_j\,\mathcal R_a[\rho](s)$ (2 per segment) | additive | linear | `IntensityLayer` (per segment constant); sample part not built |
 | structure factors | Debye-Waller $B$, occupancies (per phase) | $I_p$ via `IntensityModel` | $\partial I_p/\partial B = -2 s_p^2 I_p$ | not built |
 | absorption | $\mu(x)$ ($N_x N_y$) | $e^{-\int_{\text{in}}\mu - \int_{\text{out}(\eta,2\theta)}\mu}$ inside the projection | attenuated projector and its adjoint | not built (new operator) |
 | multi-phase lattice | lattice parameters per phase (1-6), peak widths | window weights $w_{hkl} = \Phi\big(\tfrac{hi - 2\theta_{hkl}}{\varsigma}\big) - \Phi\big(\tfrac{lo - 2\theta_{hkl}}{\varsigma}\big)$ and $\mathbf u$ | chain rule through $2\theta_{hkl}(a, b, c, \alpha, \beta, \gamma)$ | not built |
@@ -69,6 +69,10 @@ $\partial g/\partial s = -(1-|D|)e_1 - (1+|D|)e_2$ with $s = 1/\sigma^2$, $e_{1,
   rad at $\varepsilon = 10^{-3}$) mostly is not. Strain therefore needs radially resolved data, not ring sums.
 - Orientations and coefficients: two basis orientations closer than about $\sigma$ make the split of $c$ between them
   ill-posed, and refining both pulls them together. Merge them, or regularise their distance.
+
+Setting parameters on an operator: `set_pf_parameters` (orientations, widths, and incremental geometry),
+`set_geometry` (eta offset, axis tilt, Bragg angles, centre of rotation, per-angle shifts, all relative to the geometry
+the operator was built with: for optimisers), `set_proj_parameters` (centre of rotation, per-angle shifts).
 
 ## 3. How the derivatives are computed
 

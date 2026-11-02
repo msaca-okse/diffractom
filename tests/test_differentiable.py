@@ -109,3 +109,26 @@ def test_projector_gradients_and_updates(kernel):
     d_ref = ref.forward(c, prm)
     set_proj_parameters(op, cor=prm["cor"], shift=prm["shift"])
     assert np.abs(op.direct(c) - d_ref).max() < 2e-5 * np.abs(d_ref).max()
+
+
+def test_set_geometry_is_absolute():
+    """set_geometry sets offsets from the geometry the operator was built with: moving it twice ends at the second
+    setting, equal to the reference model there."""
+    from diffractom.differentiable import ReferenceModel, set_geometry
+    ctx, queue = _context()
+    op = _operator(ctx, queue, "generated")
+    rng = np.random.default_rng(3)
+    c = (rng.random(op.coeff_shape) * op.support_mask()[None]).astype(np.float32)
+    ref = ReferenceModel(op)
+    prm = ref.params0()
+    prm["eta_offset"] = 0.012
+    prm["axis_tilt"] = np.array([0.01, -0.015])
+    prm["two_theta"] = prm["two_theta"] + 0.0015
+    prm["cor"] = prm["cor"] + 0.3
+    prm["shift"] = rng.normal(0, 0.2, op.N_Omega)
+    d_ref = ref.forward(c, prm)
+    set_geometry(op, eta_offset=-0.02, axis_tilt=[0.03, 0.0], two_theta=prm["two_theta"] - 0.004, cor=0.0,
+                 shift=np.zeros(op.N_Omega))
+    set_geometry(op, eta_offset=prm["eta_offset"], axis_tilt=prm["axis_tilt"], two_theta=prm["two_theta"],
+                 cor=prm["cor"], shift=prm["shift"])
+    assert np.abs(op.direct(c) - d_ref).max() < 2e-5 * np.abs(d_ref).max()
