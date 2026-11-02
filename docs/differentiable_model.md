@@ -160,6 +160,22 @@ Setup:
 - On the 10° sample the ground-truth score stops improving after three steps while the residual keeps falling. Its
   intragranular orientation gradients are larger than the basis spacing.
 
+### Real data: Al1050 (held-out rotation angles)
+
+- Setup: indexed basis (K 48 017); L2 on 80 % of the angles (every fifth block of 5 held out); the edge-band
+  background as a fixed offset; widths kept at or above 0.2°.
+- 6 outer steps as above (Gauss-Newton blocks, then 50 FISTA iterations each); L40S.
+- Per step: the gradient pass takes 3-4 s, the step with its line search (PF rebuilds) 8-14 s, and FISTA 120 s.
+
+| | train relative residual | held-out relative residual |
+|---|---|---|
+| baseline, 200 FISTA iterations | 0.3953 | 0.4359 |
+| control, 500 FISTA iterations | 0.3755 | 0.4180 |
+| refined, 6 steps (500 iterations in total) | **0.3535** | **0.4082** |
+
+- The refined basis predicts the angles the fit did not see 2.3 % better than plain FISTA (5.9 % on the fitted ones).
+- The widths settle at a median of 0.28°, the optimum an earlier width sweep on this sample found (0.25-0.3°).
+
 ### Geometry recovery (simulated 1° sample)
 
 - Setup: the operator's geometry was perturbed (eta offset +0.2°, axis tilt +0.15° / -0.10°, every Bragg angle
