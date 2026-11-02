@@ -189,3 +189,111 @@ class WindowedReference:
             g_lat += dL_dq @ wi["dq"]
             g_sig += float((dL_dw_tot * wi["dw_ds"]).sum())
         return {"lattice": g_lat, "sig_rel": g_sig}
+
+
+class WindowedOperator:
+    """GPU version of WindowedReference: an operator whose data channels are single reflection families, each
+    evaluated at its window's two-theta (rings=[([f], [1])], ring_two_theta), and a mixing layer that adds the
+    families of a window with their shares m_f w_f / sum(m w):
+
+        d[a, s, c, p] = sum_{f in window p} share_f(lattice, sig_rel) u[a, s, c, f],   u = family_op(c).
+
+    forward(c) and vjp(c, r) work on window data (N_Omega, My, N_eta * N_windows); the gradients with respect to the
+    lattice parameters and sig_rel combine the shares (analytic) and the channels' two-theta (PFGradient of the family
+    operator). set_lattice(lattice, sig_rel) moves the channels' two-theta (rebuilds the family operator's PF matrix).
+    The remaining keyword arguments (cfg, grid, max_gb, pf_mode, ...) go to the family operator."""
+
+    def __init__(self, material, windows, sig_rel, min_overlap=1e-3, **op_kwargs):
+        from ..operators.single_phase_forward_operator import SinglePhaseForwardOperator
+        self.material, self.windows, self.sig = material, [tuple(map(float, w)) for w in windows], float(sig_rel)
+        self.lat = np.array([material.lattice_params[k] for k in LATTICE], np.float64)
+        self.hkl = np.asarray(material.reflections["hkl"], np.float64)
+        self.mult = np.asarray(material.reflections["multiplicity"], np.float64)
+        self.lam = 12.398 / float(op_kwargs["cfg"]["energy"])
+        rings = windows_to_rings(material, self.windows, self.sig, min_overlap)
+        self.families = [np.asarray(ix) for ix, _ in rings]
+        self.channel_window = np.concatenate([[p] * len(f) for p, f in enumerate(self.families)]).astype(int)
+        self.channel_family = np.concatenate(self.families).astype(int)
+        self.P, self.F = len(self.windows), len(self.channel_family)
+        info = self._info(self.lat, self.sig)
+        if op_kwargs.get("normalized", True) is not True:
+            raise NotImplementedError("WindowedOperator: normalized=True only")
+        op_kwargs = dict(op_kwargs, material=material, normalized=True,
+                         rings=[([f], [1.0]) for f in self.channel_family], ring_two_theta=info["tth_ch"])
+        self.op = SinglePhaseForwardOperator(**op_kwargs)
+        self.C = int(self.op.N_eta)
+        self.data_shape = (int(self.op.N_Omega), int(self.op.My), self.C * self.P)
+        self.info = info
+        self._pg = None
+
+    def _info(self, lat, sig):
+        """Shares, window two-theta and their derivatives at (lat, sig)."""
+        q, dq = q_and_derivative(self.hkl, lat)
+        share = np.zeros(self.F)
+        tthw = np.zeros(self.P)
+        parts = []
+        for p, ((lo, hi), fam) in enumerate(zip(self.windows, self.families)):
+            ch = np.nonzero(self.channel_window == p)[0]
+            w, dw_dq, dw_ds = overlap(q[fam], lo, hi, sig)
+            tth = 2 * np.arcsin(self.lam * q[fam] / (4 * np.pi))
+            m = self.mult[fam]
+            S, W = (m * w).sum(), w.sum()
+            share[ch] = m * w / S
+            tthw[p] = (w * tth).sum() / W
+            parts.append(dict(ch=ch, w=w, dw_dq=dw_dq, dw_ds=dw_ds, dq=dq[fam], m=m, S=S, W=W, tth=tth,
+                              dtth_dq=self.lam / (2 * np.pi * np.cos(tth / 2)), tthw=tthw[p]))
+        return {"share": share, "tthw": tthw, "tth_ch": tthw[self.channel_window], "parts": parts}
+
+    def set_lattice(self, lattice=None, sig_rel=None):
+        from .update import set_pf_parameters
+        if lattice is not None:
+            self.lat = np.asarray(lattice, np.float64).copy()
+        if sig_rel is not None:
+            self.sig = float(sig_rel)
+        self.info = self._info(self.lat, self.sig)
+        set_pf_parameters(self.op, two_theta=self.info["tth_ch"])
+
+    def mix(self, u):
+        """Window data (N_Omega, My, C * P) from family data u (N_Omega, My, C * F) (NumPy)."""
+        R, My = self.data_shape[:2]
+        u4 = np.asarray(u, np.float64).reshape(R, My, self.C, self.F)
+        d = np.zeros((R, My, self.C, self.P))
+        np.add.at(d, (slice(None), slice(None), slice(None), self.channel_window), u4 * self.info["share"])
+        return d.reshape(self.data_shape)
+
+    def unmix(self, r):
+        """The transpose of mix: family residual from window residual."""
+        R, My = self.data_shape[:2]
+        r4 = np.asarray(r, np.float64).reshape(R, My, self.C, self.P)
+        return (r4[..., self.channel_window] * self.info["share"]).reshape(R, My, self.C * self.F)
+
+    def forward(self, c):
+        return self.mix(self.op.direct(c))
+
+    def vjp(self, c, r, groups=("lattice", "sig_rel", "c")):
+        """Gradients of <r, d> with respect to the lattice parameters, sig_rel and the coefficients."""
+        from .gradients import PFGradient
+        R, My = self.data_shape[:2]
+        u4 = np.asarray(self.op.direct(c), np.float64).reshape(R, My, self.C, self.F)
+        r4 = np.asarray(r, np.float64).reshape(R, My, self.C, self.P)
+        r_ch = self.unmix(r).astype(np.float32)
+        out = {}
+        if "c" in groups:
+            out["c"] = self.op.adjoint(r_ch)
+        if "lattice" in groups or "sig_rel" in groups:
+            if self._pg is None:
+                self._pg = PFGradient(self.op)
+            g_tth = self._pg(c, r_ch, groups=("two_theta",))["two_theta"]       # per family channel
+            T = np.einsum("ascf,ascf->f", r4[..., self.channel_window], u4)      # <r_window, u_f>
+            g_lat, g_sig = np.zeros(6), 0.0
+            for pt in self.info["parts"]:
+                ch = pt["ch"]
+                share = self.info["share"][ch]
+                dL_dw = pt["m"] / pt["S"] * (T[ch] - (share * T[ch]).sum())
+                dL_dtthw = float(g_tth[ch].sum())
+                dL_dw_tot = dL_dw + dL_dtthw * (pt["tth"] - pt["tthw"]) / pt["W"]
+                dL_dq = dL_dw_tot * pt["dw_dq"] + dL_dtthw * pt["w"] / pt["W"] * pt["dtth_dq"]
+                g_lat += dL_dq @ pt["dq"]
+                g_sig += float((dL_dw_tot * pt["dw_ds"]).sum())
+            out["lattice"], out["sig_rel"] = g_lat, g_sig
+        return out

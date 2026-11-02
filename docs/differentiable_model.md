@@ -49,7 +49,7 @@ $\partial g/\partial s = -(1-|D|)e_1 - (1+|D|)e_2$ with $s = 1/\sigma^2$, $e_{1,
 | background | air $b_j$ + sample part $\beta_j\,\mathcal R_a[\rho](s)$ (2 per segment) | additive | linear | `IntensityLayer` (per segment constant); sample part not built |
 | structure factors | Debye-Waller $B$, occupancies (per phase) | $I_p$ via `IntensityModel` | $\partial I_p/\partial B = -2 s_p^2 I_p$ | not built |
 | absorption | $\mu(x)$ ($N_x N_y$) | $e^{-\int_{\text{in}}\mu - \int_{\text{out}(\eta,2\theta)}\mu}$ inside the projection | attenuated projector and its adjoint | reference (`AbsorptionReference`, exact to 2e-9); GPU not built |
-| multi-phase lattice | lattice parameters per phase (1-6), peak widths | window weights $w_{hkl} = \Phi\big(\tfrac{hi - 2\theta_{hkl}}{\varsigma}\big) - \Phi\big(\tfrac{lo - 2\theta_{hkl}}{\varsigma}\big)$ and $\mathbf u$ | chain rule through $2\theta_{hkl}(a, b, c, \alpha, \beta, \gamma)$ | reference (`WindowedReference`, exact to 7e-8; pole directions kept: exact for cubic) |
+| multi-phase lattice | lattice parameters per phase (1-6), peak widths | window weights $w_{hkl} = \Phi\big(\tfrac{hi - 2\theta_{hkl}}{\varsigma}\big) - \Phi\big(\tfrac{lo - 2\theta_{hkl}}{\varsigma}\big)$ and $\mathbf u$ | chain rule through $2\theta_{hkl}(a, b, c, \alpha, \beta, \gamma)$ | reference (`WindowedReference`, exact to 7e-8), GPU (`WindowedOperator`: family channels + mixing, == reference 1e-5); pole directions kept: exact for cubic |
 | strain | $\varepsilon(x)$ (6 fields) or per orientation | ring position $2\theta - 2\tan\theta\,\mathbf n^{\mathsf T}\varepsilon\,\mathbf n$ | needs radially resolved data | out of scope here |
 
 ### Absorption
@@ -80,6 +80,9 @@ $A[a,x,j] = \exp\!\big(-\int_0^\infty \mu(x - t\,\mathbf b_a)\,dt - |k_\parallel
   also turn with the lattice, which is not included yet.
 - For the rocks: a mineral's composition (solid solutions) moves its reflections between windows, and this makes it
   measurable.
+- GPU (`WindowedOperator`): an operator whose data channels are single reflection families, each at its window's
+  $2\theta$, plus a mixing layer with the shares. The share derivatives are analytic, and the $2\theta$ part comes from
+  `PFGradient` of the family operator. It costs (families / windows) times the PF products of a window operator.
 
 ### Gauges and identifiability
 

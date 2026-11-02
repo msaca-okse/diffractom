@@ -232,3 +232,36 @@ def test_beam_blur():
         p2[key][ix] -= 1e-6
         fd = (np.sum(r * lay.forward(u, p1)) - np.sum(r * lay.forward(u, p2))) / 2e-6
         assert abs(gl[key][ix] - fd) < 1e-6 * max(abs(fd), 1e-3)
+
+
+def test_windowed_operator_gpu():
+    """WindowedOperator (family channels + mixing on the GPU) equals WindowedReference, forward and gradients, also
+    after set_lattice."""
+    from diffractom import Grid, Material, SinglePhaseForwardOperator
+    from diffractom.differentiable.reference import ReferenceModel
+    from diffractom.differentiable.windows import WindowedOperator, WindowedReference, windows_to_rings
+    ctx, queue = _context()
+    mat = Material.from_lattice_parameters(a=4.05, b=4.05, c=4.05, alpha=90, beta=90, gamma=90, symmetry_group="cubic",
+                                           wavelength_A=0.35, hkl_list=np.array([[1, 1, 1], [2, 0, 0], [3, 1, 1],
+                                                                                 [2, 2, 2]]))
+    windows, sig = [(2.55, 2.90), (2.90, 3.30), (4.95, 5.26), (5.26, 5.60)], 0.04
+    cfg = {"Nx": 10, "Ny": 9, "My": 13, "N_Omega": 8, "angle_range": [0, 360], "cor_offset": 0.4, "N_eta": 12,
+           "eta_angle_range": [0, 360], "energy": 12.398 / 0.35, "k_direction_0": [0, 0, 1], "p_direction_0": [1, 0, 0],
+           "detector_direction_origin": [0, -1, 0], "detector_direction_positive_90": [0, 0, -1]}
+    np.random.seed(5)
+    grid = Grid.from_random_fundamental_zone(6, "cubic", np.deg2rad(6.0))
+    kw = dict(cfg=cfg, grid=grid, max_gb=1e-5, pf_mode="sparse", projector="native", ctx=ctx, queue=queue)
+    wo = WindowedOperator(mat, windows, sig, **kw)
+    opw = SinglePhaseForwardOperator(material=mat, normalized=True, rings=windows_to_rings(mat, windows, sig), **kw)
+    wr = WindowedReference(ReferenceModel(opw), opw, windows, sig)
+    rng = np.random.default_rng(0)
+    c = (rng.random(wo.op.coeff_shape) * wo.op.support_mask()[None]).astype(np.float32)
+    r = rng.normal(size=wo.data_shape).astype(np.float32)
+    prm = wr.params0()
+    prm["lattice"] = prm["lattice"] + np.array([0.004, -0.003, 0.002, 0.1, -0.05, 0.08])
+    wo.set_lattice(prm["lattice"])
+    d = wr.forward(c, prm)
+    assert np.abs(wo.forward(c) - d).max() < 2e-5 * np.abs(d).max()
+    g_ref, g_gpu = wr.vjp(c, prm, r), wo.vjp(c, r)
+    assert np.abs(g_gpu["lattice"] - g_ref["lattice"]).max() < 1e-4 * np.abs(g_ref["lattice"]).max()
+    assert abs(g_gpu["sig_rel"] - g_ref["sig_rel"]) < 1e-4 * abs(g_ref["sig_rel"])
