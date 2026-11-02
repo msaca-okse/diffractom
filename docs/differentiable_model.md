@@ -49,7 +49,7 @@ $\partial g/\partial s = -(1-|D|)e_1 - (1+|D|)e_2$ with $s = 1/\sigma^2$, $e_{1,
 | background | air $b_j$ + sample part $\beta_j\,\mathcal R_a[\rho](s)$ (2 per segment) | additive | linear | `IntensityLayer` (per segment constant); sample part not built |
 | structure factors | Debye-Waller $B$, occupancies (per phase) | $I_p$ via `IntensityModel` | $\partial I_p/\partial B = -2 s_p^2 I_p$ | not built |
 | absorption | $\mu(x)$ ($N_x N_y$) | $e^{-\int_{\text{in}}\mu - \int_{\text{out}(\eta,2\theta)}\mu}$ inside the projection | attenuated projector and its adjoint | reference (`AbsorptionReference`, exact to 2e-9), GPU (`AbsorptionOperator`, == reference 3e-6) |
-| multi-phase lattice | lattice parameters per phase (1-6), peak widths | window weights $w_{hkl} = \Phi\big(\tfrac{hi - 2\theta_{hkl}}{\varsigma}\big) - \Phi\big(\tfrac{lo - 2\theta_{hkl}}{\varsigma}\big)$ and $\mathbf u$ | chain rule through $2\theta_{hkl}(a, b, c, \alpha, \beta, \gamma)$ | reference (`WindowedReference`, exact to 7e-8), GPU (`WindowedOperator`: family channels + mixing, == reference 1e-5); pole directions kept: exact for cubic |
+| multi-phase lattice | lattice parameters per phase (1-6), peak widths | window weights $w_{hkl} = \Phi\big(\tfrac{hi - 2\theta_{hkl}}{\varsigma}\big) - \Phi\big(\tfrac{lo - 2\theta_{hkl}}{\varsigma}\big)$ and $\mathbf u$ | chain rule through $2\theta_{hkl}(a, b, c, \alpha, \beta, \gamma)$ | reference (`WindowedReference`, exact to 7e-8), GPU (`WindowedOperator`: family channels + mixing on the GPU, == reference 1e-5), `normalized` True and False; pole directions kept: exact for cubic |
 | strain | $\varepsilon(x)$ (6 fields) or per orientation | ring position $2\theta - 2\tan\theta\,\mathbf n^{\mathsf T}\varepsilon\,\mathbf n$ | needs radially resolved data | out of scope here |
 
 ### Absorption
@@ -80,8 +80,11 @@ $A[a,x,j] = \exp\!\big(-\int_0^\infty \mu(x - t\,\mathbf b_a)\,dt - |k_\parallel
 - A window $[lo, hi]$ in $q$ holds the families whose Gaussian profile (width $\varsigma q_f$) reaches into it, with
   overlap $w_f = \tfrac12[\operatorname{erf}(u_{hi}) - \operatorname{erf}(u_{lo})]$,
   $u = (\text{edge} - q_f)/(\sqrt2\,\varsigma q_f)$ and $q_f = 2\pi\sqrt{h^{\mathsf T} G^* h}$.
-- The window's pole figure mixes its families' pole figures with shares $m_f w_f/\sum m w$, at the window's
-  $w$-weighted mean $2\theta$, as `SinglePhaseForwardOperator(rings=windows_to_rings(...))` does.
+- The window's pole figure mixes its families' pole figures at the window's $w$-weighted mean $2\theta$, as
+  `SinglePhaseForwardOperator(rings=windows_to_rings(...))` does: shares $m_f w_f/\sum m w$ with `normalized=True`,
+  and $I_f w_f$ with `normalized=False` ($I_f$ the integrated intensity of the intensity model, held at the built
+  lattice: the lattice moves the overlaps and $2\theta$, not $|F|^2$ or the Lorentz factor). The families can be
+  given per window (e.g. a pipeline's own selection, `families=`).
 - Derivatives with respect to all six lattice parameters (through $\partial G^*/\partial p = -G^*\,\partial G/\partial p\,G^*$)
   and to $\varsigma$.
 - The pole directions in the crystal frame are kept fixed. That is exact for cubic phases; for lower symmetry they
@@ -90,7 +93,11 @@ $A[a,x,j] = \exp\!\big(-\int_0^\infty \mu(x - t\,\mathbf b_a)\,dt - |k_\parallel
   measurable.
 - GPU (`WindowedOperator`): an operator whose data channels are single reflection families, each at its window's
   $2\theta$, plus a mixing layer with the shares. The share derivatives are analytic, and the $2\theta$ part comes from
-  `PFGradient` of the family operator. It costs (families / windows) times the PF products of a window operator.
+  `PFGradient` of the family operator. Mixing, its transpose and the per-channel products of the gradient run on the
+  GPU (`direct_cl(..., accumulate=True)` for multi-phase sums, a work buffer shared between phases). It costs
+  (families / windows) times the PF products of a window operator (NWA 7034: 10-137 families for 48 windows per phase,
+  about 5x the window operators in all), so fits use the window operator rebuilt at the current lattice (equal to the
+  family form to 3e-6) and the family operator only for the lattice gradient.
 
 ### Gauges and identifiability
 
@@ -145,7 +152,7 @@ the operator was built with: for optimisers), `set_proj_parameters` (centre of r
 |---|---|---|
 | simulated grains (1°, 10° mosaicity) | orientations + $\sigma_k$ | the basis is discrete; refinement moves it to the true orientations and widths (ground truth known: measurable) |
 | Al1050 (real) | orientations + $\sigma_k$; axis tilt, $\eta$ offset, cor, $2\theta_p$; ring and angle scales; background | calibration and rotation-stage errors are larger than $\sigma/10$; the misfit (0.4) is far above the noise (0.026) |
-| rocks (NWA 7034, meteorite, basalt, ...) | absorption $\mu(x)$; per-phase lattice parameters (composition of solid solutions); geometry; background | transmission down to 6 %, exit-path attenuation 0.5-2x; mineral compositions shift reflections between windows |
+| rocks (NWA 7034, meteorite, basalt, ...) | absorption $\mu(x)$; per-phase lattice parameters (composition of solid solutions); geometry; background | transmission down to 6 %, exit-path attenuation 0.5-2x; mineral compositions shift reflections between windows. Measured on NWA 7034: lattice refinement 0.37 % better on held-out angles, absorption 0.07 % (rays T >= 0.3) |
 | strain | radially resolved data needed | ring-integrated data are almost insensitive |
 
 ## 5. First result: refining the basis orientations and widths (simulated samples)
@@ -202,6 +209,61 @@ Setup:
 - The centre of rotation barely moves. Each basis orientation diffracts at only a few angles, so its image shifts to
   absorb a constant detector offset. Take the centre of rotation from the transmission or the summed intensity
   instead.
+
+### Geometry on Al1050
+
+- Setup as the Al1050 refinement above (indexed basis, sigma 0.4°, held-out angles); 3 steps of [L-BFGS on the eta
+  offset, axis tilt, the 14 Bragg angles and the centre of rotation (15 evaluations, coefficients fixed), 50 FISTA
+  iterations]; L40S, about 3 min per lattice-free geometry step.
+- The data ask for almost nothing: eta -0.004°, tilt +0.001° / -0.001°, Bragg angles within 0.0005°, centre of
+  rotation -0.07 bins. The calibrated geometry is right; there is nothing to gain here.
+- (Held out 0.4322 vs 0.4288 for a control of 350 uninterrupted iterations: the refined run restarted FISTA's
+  momentum three times; not a geometry effect.)
+
+### Rock sample: NWA 7034 (absorption and lattice parameters)
+
+Setup: scan 0512 at 80 µm (the NWA pipeline's reduction, read only): 8 phases on uniform 15° grids (sigma 8°), 48
+windows, the pipeline's weights, rays with transmission >= 0.3, every fifth block of 5 angles held out, FISTA from
+zero. Residual: weighted relative L2 (the texture model explains about 15 % of the data's energy at this resolution).
+
+Absorption (50 iterations; `AbsorptionOperator`, attenuation map from the transmission tomogram, 7 exit classes of 4°):
+
+| model | train | held out |
+|---|---|---|
+| no correction | 0.9297 | 0.9253 |
+| the pipeline's per-ray exit-path factors | 0.9288 | 0.9246 |
+| voxel-resolved absorption | 0.9288 | 0.9247 |
+| voxel-resolved, exit side mirrored | 0.9314 | 0.9272 |
+
+- The voxel model and the pipeline's per-ray approximation agree (1e-4); both are 0.07 % better than no correction,
+  and the mirrored exit side is clearly worse: the data confirm the exit-side convention.
+- With rays below 30 % transmission left out the correction hardly changes the fit; its value is in the darker rays
+  and in phase amounts (not scored here). The voxel model costs about 4x per iteration.
+
+Lattice parameters (`WindowedOperator`, normalized=False, the pipeline's families): 26 parameters with the
+crystal-system constraints (triclinic plagioclase 6 ... cubic magnetite 1, lengths +-2 %, angles +-1°) and one
+relative peak width; 3 steps of [L-BFGS-B, 15 evaluations at fixed coefficients (20 s each on a V100), then 40 FISTA
+iterations with the window operators rebuilt at the new lattice]; control: the same FISTA schedule (restarts
+included) at the CIF lattices.
+
+| iterations | refined: train / held out | control: train / held out |
+|---|---|---|
+| 50 (start) | 0.9297 / 0.9253 | 0.9297 / 0.9253 |
+| 90 | 0.9251 / 0.9219 | 0.9274 / 0.9238 |
+| 130 | 0.9220 / 0.9198 | 0.9256 / 0.9227 |
+| 170 | 0.9197 / **0.9185** | 0.9242 / **0.9219** |
+
+- The refined lattices predict the held-out angles better, by 0.0034 after three steps (0.7 % of the residual
+  energy, 4 % more explained energy), and the gap grows with every step.
+- The peak width stays at the pipeline's value (0.00500 -> 0.00501).
+- Some changes are stable from step to step: oligoclase c +0.6-0.7 %, orthopyroxene b -0.63..-0.67 %, magnetite a
+  +0.22-0.28 %, ilmenite a +0.6-0.8 % and c -0.64..-0.68 %. Others drift to the bounds: pigeonite b +2 %, augite c
+  -2 %, zircon a -1.45 %. Those are not plausible compositions. The three pyroxenes overlap heavily, and a window of
+  +-1.25 FWHM is sensitive to a peak position mainly near its edges, where moving a reflection redistributes
+  intensity between neighbouring windows. So the lattice parameters also act as intensity knobs.
+- To measure lattices rather than fit them: finer q bins (or the radial profile) in the windows' place, a prior
+  towards the CIF values with a plausible spread, or fewer parameters (one isotropic scale per phase).
+- Scripts: `claude_scratch/diffmodel/nwa` (absorption_test.py, lattice_stage.py, summary.md).
 
 ## 6. Suggested order
 
