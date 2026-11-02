@@ -132,3 +132,38 @@ def test_set_geometry_is_absolute():
     set_geometry(op, eta_offset=prm["eta_offset"], axis_tilt=prm["axis_tilt"], two_theta=prm["two_theta"],
                  cor=prm["cor"], shift=prm["shift"])
     assert np.abs(op.direct(c) - d_ref).max() < 2e-5 * np.abs(d_ref).max()
+
+
+def test_absorption_reference():
+    """Self-absorption (AbsorptionReference): mu = 0 is the plain reference; the gradient with respect to mu equals
+    central finite differences under strong absorption; the coefficient gradient is the adjoint."""
+    from diffractom import Grid, Material, SinglePhaseForwardOperator
+    from diffractom.differentiable.absorption import AbsorptionReference
+    from diffractom.differentiable.reference import ReferenceModel, perturb
+    ctx, queue = _context()
+    mat = Material.from_lattice_parameters(a=4.05, b=4.05, c=4.05, alpha=90, beta=90, gamma=90, symmetry_group="cubic",
+                                           wavelength_A=0.35, hkl_list=np.array([[1, 1, 1], [2, 0, 0]]))
+    cfg = {"Nx": 8, "Ny": 7, "My": 11, "N_Omega": 6, "angle_range": [0, 360], "cor_offset": 0.4, "N_eta": 8,
+           "eta_angle_range": [0, 360], "energy": 12.398 / 0.35, "k_direction_0": [0, 0, 1], "p_direction_0": [1, 0, 0],
+           "detector_direction_origin": [0, -1, 0], "detector_direction_positive_90": [0, 0, -1]}
+    np.random.seed(5)
+    grid = Grid.from_random_fundamental_zone(4, "cubic", np.deg2rad(10.0))
+    op = SinglePhaseForwardOperator(cfg=cfg, material=mat, grid=grid, max_gb=0.2, normalized=True, pf_mode="dense",
+                                    projector="native", ctx=ctx, queue=queue)
+    rng = np.random.default_rng(0)
+    ref = ReferenceModel(op, cut=None)
+    ab = AbsorptionReference(ref, op)
+    prm = ref.params0()
+    supp = op.support_mask().astype(np.float64)
+    c = rng.random(op.coeff_shape) * supp[None]
+    prm["mu"] = np.zeros((op.Ny, op.Nx))
+    assert np.abs(ab.forward(c, prm) - ref.forward(c, prm)).max() < 1e-12 * np.abs(ref.forward(c, prm)).max()
+    prm["mu"] = 0.1 * supp * (1 + 0.5 * rng.random(supp.shape))
+    r = rng.normal(size=op.data_shape)
+    g = ab.vjp(c, prm, r, groups=("c", "mu"))
+    L = lambda p_: float(np.sum(r * ab.forward(c, p_)))
+    for ix in [(3, 4), (1, 2), (5, 6)]:
+        fd = (L(perturb(prm, "mu", ix, 1e-6)) - L(perturb(prm, "mu", ix, -1e-6))) / 2e-6
+        assert abs(g["mu"][ix] - fd) <= 1e-6 * max(abs(fd), 1e-3 * np.abs(r).sum())
+    x = rng.random(op.coeff_shape)
+    assert abs(np.sum(g["c"] * x) / np.sum(r * ab.forward(x, prm)) - 1) < 1e-10
