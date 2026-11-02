@@ -267,6 +267,66 @@ def test_windowed_operator_gpu():
     assert abs(g_gpu["sig_rel"] - g_ref["sig_rel"]) < 1e-4 * abs(g_ref["sig_rel"])
 
 
+def test_windowed_operator_unnormalized():
+    """normalized=False windows (shares I_f w_f, explicit families, a window without channels): WindowedOperator ==
+    the operator built with the same rings; the reference's lattice gradient == central finite differences; GPU ==
+    reference after set_lattice; adjoint == transpose."""
+    import pyopencl.array as clarray
+    from diffractom import Grid, Material, SinglePhaseForwardOperator
+    from diffractom.differentiable.reference import ReferenceModel, perturb
+    from diffractom.differentiable.windows import WindowedOperator, WindowedReference, windows_to_rings
+    ctx, queue = _context()
+    mat = Material.from_sites([("Al", 0, 0, 0, 1.0, 0.0108)], a=4.0495, space_group="F m -3 m", wavelength_A=0.35,
+                              hkl_list=np.array([[1, 1, 1], [2, 0, 0], [2, 2, 0], [3, 1, 1], [2, 2, 2]]))
+    windows, sig = [(2.55, 2.90), (2.90, 3.30), (3.6, 3.7), (4.95, 5.26), (5.26, 5.60)], 0.04
+    fams = [ix for ix, _ in windows_to_rings(mat, windows, sig)]
+    cfg = {"Nx": 10, "Ny": 9, "My": 13, "N_Omega": 8, "angle_range": [0, 360], "cor_offset": 0.4, "N_eta": 12,
+           "eta_angle_range": [0, 360], "energy": 12.398 / 0.35, "k_direction_0": [0, 0, 1], "p_direction_0": [1, 0, 0],
+           "detector_direction_origin": [0, -1, 0], "detector_direction_positive_90": [0, 0, -1]}
+    np.random.seed(5)
+    grid = Grid.from_random_fundamental_zone(6, "cubic", np.deg2rad(6.0))
+    kw = dict(cfg=cfg, grid=grid, max_gb=1e-5, pf_mode="sparse", projector="native", ctx=ctx, queue=queue,
+              normalized=False)
+    rings = windows_to_rings(mat, windows, sig, families=fams)
+    rings[2] = (np.array([2]), np.array([0.0]))           # the empty window: a placeholder of weight 0
+    opw = SinglePhaseForwardOperator(material=mat, rings=rings, **kw)
+    fams[2] = np.array([], dtype=int)
+    wo = WindowedOperator(mat, windows, sig, families=fams, **kw)
+    rng = np.random.default_rng(0)
+    c = (rng.random(wo.op.coeff_shape) * wo.op.support_mask()[None]).astype(np.float32)
+    r = rng.normal(size=wo.data_shape).astype(np.float32)
+    d = opw.direct(c)
+    assert np.abs(wo.forward(c) - d).max() < 2e-6 * np.abs(d).max()
+    keep = np.ones((1, 1, 12, 5), np.float32)
+    keep[..., 2] = 0                                      # the reference needs a family per window: compare the rest
+    keep = keep.reshape(1, 1, -1)
+    r = r * keep
+    opr = SinglePhaseForwardOperator(material=mat, rings=windows_to_rings(mat, windows, sig, families=[
+        f if len(f) else np.array([1]) for f in fams]), **kw)
+    wf = WindowedReference(ReferenceModel(opr, cut=None), opr, windows, sig)
+    prm = wf.params0()
+    prm["lattice"] = prm["lattice"] + np.array([0.004, -0.003, 0.002, 0.1, -0.05, 0.08])
+    g = wf.vjp(c, prm, r)
+    L = lambda p_: float(np.sum(r * wf.forward(c, p_)))
+    for i, h in ((0, 1e-6), (4, 1e-5)):
+        fd = (L(perturb(prm, "lattice", (i,), h)) - L(perturb(prm, "lattice", (i,), -h))) / (2 * h)
+        assert abs(g["lattice"][i] - fd) <= 1e-5 * max(abs(fd), 1e-3 * np.abs(r).sum())
+    fd = (L(perturb(prm, "sig_rel", None, 1e-7)) - L(perturb(prm, "sig_rel", None, -1e-7))) / 2e-7
+    assert abs(g["sig_rel"] - fd) <= 1e-5 * abs(fd)
+    wr = WindowedReference(ReferenceModel(opr), opr, windows, sig)
+    wo.set_lattice(prm["lattice"])
+    dr = wr.forward(c, prm) * keep
+    assert np.abs(wo.forward(c) * keep - dr).max() < 5e-6 * np.abs(dr).max()
+    g_ref, g_gpu = wr.vjp(c, prm, r), wo.vjp(c, r)
+    assert np.abs(g_gpu["lattice"] - g_ref["lattice"]).max() < 1e-4 * np.abs(g_ref["lattice"]).max()
+    assert abs(g_gpu["sig_rel"] - g_ref["sig_rel"]) < 1e-3 * abs(g_ref["sig_rel"])
+    cg, rg = clarray.to_device(queue, c), clarray.to_device(queue, r)
+    od, oa = clarray.empty(queue, wo.data_shape, np.float32), clarray.empty(queue, wo.coeff_shape, np.float32)
+    a1 = float(np.sum(wo.direct_cl(cg, od).get().astype(np.float64) * r))
+    a2 = float(np.sum(wo.adjoint_cl(rg, oa).get().astype(np.float64) * c))
+    assert abs(a1 - a2) < 1e-5 * abs(a1)
+
+
 def test_absorption_operator_gpu():
     """AbsorptionOperator (GPU) equals AbsorptionReference with the same exit classes (forward, adjoint, mu gradient);
     mu = 0 is the plain operator."""
