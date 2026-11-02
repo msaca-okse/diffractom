@@ -44,7 +44,7 @@ $\partial g/\partial s = -(1-|D|)e_1 - (1+|D|)e_2$ with $s = 1/\sigma^2$, $e_{1,
 | rotation axis | tilt of $\mathbf k_0$ about $\mathbf e_1,\mathbf e_2\perp\mathbf k_0$ (2) | $R(\omega) \to Q R Q^{\mathsf T}$ | $\partial\mathbf v/\partial\tau_i = \mathbf e_i\times\mathbf v - R^{\mathsf T}(\mathbf e_i\times\mathbf u)$ | reference, GPU |
 | centre of rotation | cor (1) | $t_a$ | $\partial S/\partial\mathrm{cor} = -\tfrac{\kappa}{\delta_s}\sum_x K'(t - s)\,c(x)$ | reference, GPU (`ProjGradient`) |
 | per-angle shift | $\Delta_a$ ($N_\Omega$): wobble, run-out, drift | $t_a$ | $\partial S/\partial\Delta_a = \kappa\sum_x K'(t-s)\,c(x)$ | reference, GPU (`ProjGradient`) |
-| beam profile | width of the pencil beam (1-2) | convolution of $S$ along $s$ | derivative of the blur kernel | not built (needs a model term) |
+| beam profile | width of the pencil beam (1-2) | Gaussian blur of the prediction along $s$ (commutes with the PF product) | $\partial B/\partial w$ | `BeamBlur` (data_model.py) |
 | intensity scales | per ring $r_p$ ($P$), per angle $f_a$ ($N_\Omega$), per translation $t_s$ ($M_y$), per segment efficiency ($N_\eta P$) | $d \to f_a t_s r_p\, d$ | $\langle r, d\rangle$ restricted to the index | `IntensityLayer` (angle, translation, ring; not per segment) |
 | background | air $b_j$ + sample part $\beta_j\,\mathcal R_a[\rho](s)$ (2 per segment) | additive | linear | `IntensityLayer` (per segment constant); sample part not built |
 | structure factors | Debye-Waller $B$, occupancies (per phase) | $I_p$ via `IntensityModel` | $\partial I_p/\partial B = -2 s_p^2 I_p$ | not built |

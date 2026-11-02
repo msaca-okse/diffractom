@@ -204,3 +204,31 @@ def test_window_model_lattice_gradients():
         assert abs(g["lattice"][i] - fd) <= 1e-5 * max(abs(fd), 1e-3 * np.abs(r).sum())
     fd = (L(perturb(prm, "sig_rel", None, 1e-7)) - L(perturb(prm, "sig_rel", None, -1e-7))) / 2e-7
     assert abs(g["sig_rel"] - fd) <= 1e-5 * abs(fd)
+
+
+def test_beam_blur():
+    """BeamBlur: the width derivative equals central finite differences, its "u" output is the adjoint, and the
+    intensity layer's gradients equal finite differences."""
+    from diffractom.differentiable.data_model import BeamBlur, IntensityLayer
+    rng = np.random.default_rng(2)
+    shape = (5, 13, 6)
+    u, r = rng.random(shape), rng.normal(size=shape)
+    bb = BeamBlur(shape)
+    w = 0.8
+    g = bb.vjp(u, w, r)
+    fd = (np.sum(r * bb.forward(u, w + 1e-6)) - np.sum(r * bb.forward(u, w - 1e-6))) / 2e-6
+    assert abs(g["beam_width"] - fd) < 1e-6 * abs(fd)
+    v = rng.random(shape)
+    assert abs(np.sum(g["u"] * v) / np.sum(r * bb.forward(v, w)) - 1) < 1e-12
+    lay = IntensityLayer(shape, 3)
+    prm = lay.params0()
+    prm = {k: v_ * (1 + 0.1 * rng.random(np.shape(v_))) if k != "background" else rng.random(np.shape(v_))
+           for k, v_ in prm.items()}
+    gl = lay.vjp(u, prm, r)
+    for key, ix in (("angle_scale", 2), ("trans_scale", 4), ("ring_scale", 1), ("background", 3)):
+        p1 = {k: np.array(v_, copy=True) for k, v_ in prm.items()}
+        p2 = {k: np.array(v_, copy=True) for k, v_ in prm.items()}
+        p1[key][ix] += 1e-6
+        p2[key][ix] -= 1e-6
+        fd = (np.sum(r * lay.forward(u, p1)) - np.sum(r * lay.forward(u, p2))) / 2e-6
+        assert abs(gl[key][ix] - fd) < 1e-6 * max(abs(fd), 1e-3)

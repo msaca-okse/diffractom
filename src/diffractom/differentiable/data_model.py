@@ -98,3 +98,46 @@ class IntensityLayer:
                     p[key] /= m
                     p["ring_scale"] *= m
         return p
+
+
+class BeamBlur:
+    """The pencil beam's profile across the translation direction as a Gaussian blur of the prediction along the
+    detector (translation) axis, beyond the bin footprint of the projector:
+
+        d[a, s, j] = sum_D B(D) u[a, s - D, j],   B(D) = exp(-D^2 / (2 width^2)) / sum_D' exp(-D'^2 / (2 width^2))
+
+    (D = -H .. H, H = ceil(4 width) + 1; bins outside the detector count as zero). It commutes with the PF product, so
+    it acts on the whole prediction u = A(c). width in detector bins (> 0)."""
+
+    def __init__(self, data_shape):
+        self.R, self.My, self.N_seg = (int(v) for v in data_shape)
+
+    def kernel(self, width):
+        w = float(width)
+        H = int(np.ceil(4 * w)) + 1
+        D = np.arange(-H, H + 1, dtype=np.float64)
+        e = np.exp(-D * D / (2 * w * w))
+        B = e / e.sum()
+        dB = B * (D * D / w ** 3 - (B * D * D).sum() / w ** 3)           # d B / d width
+        return D.astype(int), B, dB
+
+    def _conv(self, u, D, k):
+        out = np.zeros_like(u)
+        for d_, kk in zip(D, k):
+            if d_ >= 0:
+                out[:, d_:] += kk * u[:, :self.My - d_]
+            else:
+                out[:, :d_] += kk * u[:, -d_:]
+        return out
+
+    def forward(self, u, width):
+        u = _np(u).astype(np.float64).reshape(self.R, self.My, self.N_seg)
+        D, B, _ = self.kernel(width)
+        return self._conv(u, D, B)
+
+    def vjp(self, u, width, r):
+        """{"beam_width": d<r, d>/d width, "u": B^T r (for the operator's gradients)}."""
+        u = _np(u).astype(np.float64).reshape(self.R, self.My, self.N_seg)
+        r = _np(r).astype(np.float64).reshape(self.R, self.My, self.N_seg)
+        D, B, dB = self.kernel(width)
+        return {"beam_width": float((r * self._conv(u, D, dB)).sum()), "u": self._conv(r, -D, B)}
