@@ -93,7 +93,8 @@ __kernel void pf_gen_candidates(
     __global ushort *cand_j,           // mode 1: (n,)
     __global int *cand_row,            // mode 1: (n,)
     const int R, const int Kb, const int k0, const int C, const int P, const int A, const int S, const int S_eta,
-    const float eta0, const float dsub, const int full, const int mode)
+    const float eta0, const float dsub, const int full, const int mode,
+    __global const int *omegas, const int use_om)    // use_om: rows (s, k) of the angles omegas[s] (R of them)
 {
     __local uint lmask[RPG][PPW][MAXWC];
     __local int lcount[RPG][PPW];
@@ -103,6 +104,7 @@ __kernel void pf_gen_candidates(
     int row = get_group_id(0) * RPG + lr;
     int active = (row < n_rows) && (p < P);
     int r = row / Kb, kg = k0 + row % Kb;
+    if (use_om && row < n_rows) r = omegas[r];
     int Msub = C * S_eta;
     uint mask[MAXWC];
     #pragma unroll
@@ -217,13 +219,14 @@ __kernel void pf_gen_evaluate(
     __global const float *axis_count, __global const float *inv_sigma2, __global const float *norm_factor,
     __global const float *qw, __global const float *intens, __global float *cand_val, __global int *flag,
     const int n_rows, const int n_flags, const int Kb, const int k0, const int C, const int P, const int A,
-    const int S, const int S_eta, const int normalized)
+    const int S, const int S_eta, const int normalized, __global const int *omegas, const int use_om)
 {
     int i = get_global_id(0);
     if (i >= n_flags) return;
     if (i >= cand_ptr[n_rows]) { flag[i] = 0; return; }
     int row = cand_row[i], j = cand_j[i];
     int r = row / Kb, kg = k0 + row % Kb, c = j / P, p = j % P;
+    if (use_om) r = omegas[r];
     float v = pf_entry(coords, poles, axis_start, axis_count, qw, inv_sigma2[kg], norm_factor[kg], r, kg, c, p,
                        S, C, S_eta, P, A);
     if (!normalized) v *= intens[p];   // as SCALE_PF_BY_INTENSITY_INPLACE
@@ -306,4 +309,81 @@ __kernel void pf_gen_row_of(__global const int *row_ptr, __global int *row_of, c
     int i = get_global_id(0);
     if (i >= row_ptr[n_rows]) return;
     row_of[i] = csr_row(row_ptr, n_rows, i);
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Subsets of the angles (SinglePhaseForwardOperator.set_omega_subsets): rows (s, k) of the angles omegas[s].
+
+// counts[t] = candidates of subset row t = s * Kb + k, from the candidate offsets of all rows (cached; full_ptr);
+// counts[n_rows] = 0 (for the scan)
+__kernel void pf_gen_sub_counts(__global const int *full_ptr, __global const int *omegas, __global int *counts,
+                                const int Kb, const int n_rows)
+{
+    int t = get_global_id(0);
+    if (t > n_rows) return;
+    if (t == n_rows) { counts[t] = 0; return; }
+    int s = t / Kb, k = t - s * Kb;
+    int row = omegas[s] * Kb + k;
+    counts[t] = full_ptr[row + 1] - full_ptr[row];
+}
+
+// lengths[s] = non-zeros of angle omegas[s] in an adjoint CSR of all angles (rows r * Kb + k); lengths[Rs] = 0
+__kernel void pf_gen_sub_lengths(__global const int *row_ptr_a, __global const int *omegas, __global int *lengths,
+                                 const int Kb, const int Rs)
+{
+    int s = get_global_id(0);
+    if (s > Rs) return;
+    if (s == Rs) { lengths[s] = 0; return; }
+    int r = omegas[s];
+    lengths[s] = row_ptr_a[(r + 1) * Kb] - row_ptr_a[r * Kb];
+}
+
+// Entry t of the subset's part of an adjoint CSR of all angles (sub_ptr: exclusive scan of pf_gen_sub_lengths):
+// its index i in the CSR, the subset angle s and the orientation k of its row. 0 if t is beyond the last entry.
+inline int sub_entry(__global const int *row_ptr_a, __global const int *omegas, __global const int *sub_ptr,
+                     const int Kb, const int Rs, const int t, int *i, int *s, int *k)
+{
+    if (t >= sub_ptr[Rs]) return 0;
+    int lo = 0, hi = Rs - 1;                 // the last s with sub_ptr[s] <= t
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (sub_ptr[mid] <= t) lo = mid; else hi = mid - 1;
+    }
+    *s = lo;
+    int r = omegas[lo];
+    int ii = row_ptr_a[r * Kb] + (t - sub_ptr[lo]);
+    *i = ii;
+    int a = 0, b = Kb - 1;                   // the last k with row_ptr_a[r * Kb + k] <= ii
+    while (a < b) {
+        int mid = (a + b + 1) >> 1;
+        if (row_ptr_a[r * Kb + mid] <= ii) a = mid; else b = mid - 1;
+    }
+    *k = a;
+    return 1;
+}
+
+// Forward CSR of the subset's rows (s * CP + j, listing k) from an adjoint CSR of all angles: count, fill (then
+// scan and pf_gen_rank_rows as for the whole matrix). One work-item per entry of the subset.
+__kernel void pf_gen_count_fwd_sub(
+    __global const int *row_ptr_a, __global const ushort *col_j, __global const int *omegas,
+    __global const int *sub_ptr, __global volatile int *counts_f, const int Kb, const int Rs, const int CP)
+{
+    int i, s, k;
+    if (!sub_entry(row_ptr_a, omegas, sub_ptr, Kb, Rs, get_global_id(0), &i, &s, &k)) return;
+    atomic_inc(&counts_f[s * CP + col_j[i]]);
+}
+
+__kernel void pf_gen_fill_fwd_sub(
+    __global const int *row_ptr_a, __global const ushort *col_j, __global const float *val_a,
+    __global const int *omegas, __global const int *sub_ptr, __global const int *row_ptr_f,
+    __global volatile int *cursor, __global ushort *col_k, __global float *val_f, const int Kb, const int Rs,
+    const int CP)
+{
+    int i, s, k;
+    if (!sub_entry(row_ptr_a, omegas, sub_ptr, Kb, Rs, get_global_id(0), &i, &s, &k)) return;
+    int rf = s * CP + col_j[i];
+    int o = row_ptr_f[rf] + atomic_inc(&cursor[rf]);
+    col_k[o] = (ushort)k;
+    val_f[o] = val_a[i];
 }

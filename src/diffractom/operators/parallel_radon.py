@@ -1,6 +1,7 @@
 """Parallel-beam Radon transform on the GPU, vectorised over many channels (orientations)."""
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -63,22 +64,34 @@ class ParallelRadon:
         percent within +-1.5 degrees of it for compact features), 1.3 % at 26.6 and 63.4, 0.9 % at 33.7 and 56.3
         degrees, and a reconstruction gets a diagonal cross-hatch pattern. It needs delta_x <= delta_s (larger
         pixels would leave bins empty).
-    tiled : bool
-        Use the tiled kernels (default): they stage what a work-group shares in local memory (the
-        image rows of a block of angles and bins in the forward projection, the sinogram bins of a
-        pixel tile in the backward one) instead of reading it from the caches about twice per
-        angle. Bitwise the same results as the plain kernels (tiled=False).
+    tiled : "auto", bool or dict
+        The tiled kernels stage what a work-group shares in local memory (the image rows of a block
+        of angles and bins in the forward projection, the sinogram bins of a pixel tile in the
+        backward one) instead of reading it from the caches about twice per angle; the plain kernels
+        do not. Both give bitwise the same results; which is faster depends on the GPU, the grid and
+        the angles. "auto" (default): the forward and the backward projection each use the faster of
+        the tiled kernel and the plain one in slices of 128 or 64 channels, timed once here on a
+        scratch stack (see ``modes``). True / False: the tiled / plain kernels for both. A dict
+        ``modes`` of another instance: its choice (e.g. for subsets of the same angles).
+        Measured (500 angles over 360 degrees, 512 channels, ms): forward tiled / plain-128 on an
+        A100 at 64, 115, 200, 400 pixels 5.9/2.1, 9.8/6.3, 27.7/19.0, 124/138, on a V100 6.0/2.9,
+        17.5/9.3, 50/52, 225/268; backward tiled / plain on the A100 at 115 and 400 pixels
+        7.9/5.5, 87/129. For every 8th angle (a subset of 63) the plain forward is 1.8-3.4x faster
+        than the tiled one at 400 pixels (the tiled kernel's angle blocks then span 90 degrees).
+        The tiled kernels were tuned on an A40 (with the hat kernel), where they were the faster
+        ones at 120 pixels too.
     channels_per_launch : int, optional
         The projections run in slices of this many channels (a multiple of 4). Default: all at
-        once with the tiled kernels; with the plain kernels 64 for images of 160 x 160 pixels or
-        more, 128 otherwise (measured on an A40, 360 angles: for 400 x 400 pixels one launch over
-        256-1024 channels took 2.6x as long as slices of 64; for 99 x 99 up to 3x as long as
-        slices of 128).
+        once with the tiled kernels; with the plain kernels (tiled=False) 64 for images of 160 x 160
+        pixels or more, 128 otherwise (measured on an A40, 360 angles: for 400 x 400 pixels one
+        launch over 256-1024 channels took 2.6x as long as slices of 64; for 99 x 99 up to 3x as
+        long as slices of 128). Given, it applies to both kernels (and "auto" only chooses between
+        them).
     """
 
     def __init__(self, queue, img_shape, angles, n_detectors, image_width, detector_width,
                  detector_shift=0.0, angle_weights=None, bins_per_item=3, channels_per_launch=None,
-                 tiled=True, kernel="trapezoid"):
+                 tiled="auto", kernel="trapezoid"):
         self.queue = queue
         self.Nx, self.Ny = (int(n) for n in img_shape)
         self.Ns = int(n_detectors)
@@ -111,31 +124,40 @@ class ParallelRadon:
         self.geo_gpu = clarray.to_device(queue, np.ascontiguousarray(geo))
 
         self.bins_per_item = int(bins_per_item)
-        self.tiled = bool(tiled)
-        if channels_per_launch is None:
-            if self.tiled:
-                channels_per_launch = 1 << 30
-            else:
-                channels_per_launch = 64 if self.Nx * self.Ny >= 160 * 160 else 128
-        if channels_per_launch % 4 or channels_per_launch <= 0:
+        if channels_per_launch is not None and (channels_per_launch % 4 or channels_per_launch <= 0):
             raise ValueError("channels_per_launch must be a positive multiple of 4")
-        self.channels_per_launch = int(channels_per_launch)
+        plain_cpl = channels_per_launch or (64 if self.Nx * self.Ny >= 160 * 160 else 128)
+        if isinstance(tiled, dict):
+            self.modes = {d: (bool(tiled[d][0]), int(tiled[d][1])) for d in ("forward", "backward")}
+        elif tiled == "auto":
+            self.modes = None   # timed below
+        elif tiled in (True, False):
+            m = (True, channels_per_launch or 1 << 30) if tiled else (False, plain_cpl)
+            self.modes = {"forward": m, "backward": m}
+        else:
+            raise ValueError(f"tiled must be 'auto', True, False or a modes dict, not {tiled!r}")
+        self._use_tiled = self.modes is None or any(m[0] for m in self.modes.values())
         src = Path(__file__).with_name("radon_kernels.cl").read_text()
         options = [f"-DNB={self.bins_per_item}"]
         if kernel == "trapezoid":
             options += ["-DTRAPEZOID", f"-DNTAP={self.n_taps}"]
-        if self.tiled:
+        if self._use_tiled:
             if self.FCQ * self.FSB * self.FAB > queue.device.max_work_group_size:
                 self.FAB = max(1, queue.device.max_work_group_size // (self.FCQ * self.FSB))
             options += self._tiling(geo, queue.device, a_max)
         self.prg = cl.Program(queue.context, src).build(options=options)
         self._fwd = self.prg.radon_forward_k
         self._bwd = self.prg.radon_backward_k
-        if self.tiled:
+        if self._use_tiled:
             self._fwd_t = self.prg.radon_forward_tiled
             self._bwd_t = self.prg.radon_backward_tiled
         self._gather = self.prg.gather_channels_k_fastest
         self._scatter = self.prg.scatter_channels_k_fastest
+        if self.modes is None:
+            cand = [(True, channels_per_launch or 1 << 30)]
+            cand += [(False, channels_per_launch)] if channels_per_launch else [(False, 128), (False, 64)]
+            self.modes = self._tune(cand)
+        self.tune_times = getattr(self, "tune_times", None)
 
     # work-group shapes of the tiled kernels: forward (channel quads, strips, angles), backward
     # (channel quads, 8 x 8 pixels). Forward measured on an A40 (360 angles, us per channel at
@@ -213,12 +235,58 @@ class ParallelRadon:
         self._scatter(self.queue, gsize, (32, 8), img_k.data, coeffs.data,
                       np.int32(Npix), np.int32(k0), np.int32(Kb), np.int32(Kstride))
 
+    TUNE_BYTES = 256 * 2**20   # scratch of the timing in __init__ (tiled="auto")
+
+    def _tune(self, cand):
+        """The fastest of the candidate (tiled, channels per launch) modes of the forward and the backward
+        projection, timed (best of 3) on a scratch stack of up to 256 channels."""
+        q = self.queue
+        npix = self.Nx * self.Ny
+        C = 4 * max(1, min(64, self.TUNE_BYTES // (16 * (npix + self.R * self.Ns))))
+        while True:
+            try:
+                img = clarray.empty(q, (npix * C,), np.float32)
+                sino = clarray.empty(q, (self.R * self.Ns * C,), np.float32)
+                break
+            except cl.MemoryError:
+                if C == 4:            # no room even for 4 channels: the tiled kernels, untimed
+                    self.tune_times = {}
+                    return {"forward": cand[0], "backward": cand[0]}
+                C = max(4, C // 8 * 4)
+        img.fill(np.float32(1.0))
+        sino.fill(np.float32(1.0))
+        out, times = {}, {}
+        for d, f in (("forward", lambda: self.forward(img, sino, C)), ("backward", lambda: self.backward(sino, img, C))):
+            best, tb = None, np.inf
+            for c in cand:
+                self.modes = {d: c, "forward" if d == "backward" else "backward": c}
+                try:
+                    f()
+                    q.finish()
+                    tc = np.inf
+                    for _ in range(3):
+                        t0 = time.perf_counter()
+                        f()
+                        q.finish()
+                        tc = min(tc, time.perf_counter() - t0)
+                except cl.Error:     # e.g. OUT_OF_RESOURCES for the work-group of a tiled kernel
+                    tc = np.inf
+                times[(d,) + c] = tc
+                if tc < tb:
+                    best, tb = c, tc
+            out[d] = best if best is not None else (False, 128)
+        img.base_data.release()
+        sino.base_data.release()
+        self.tune_times = times
+        return out
+
     def forward(self, img_k, sino_k, Kstride):
         """sino_k (R, Ns, Kstride) = forward projection of img_k (Nx*Ny, Kstride)."""
         assert Kstride % 4 == 0, "Kstride must be a multiple of 4"
         n_strips = -(-self.Ns // self.bins_per_item)
-        if self.tiled:
-            for k4, n4 in self._slices(Kstride):
+        tiled, cpl = self.modes["forward"]
+        if tiled:
+            for k4, n4 in self._slices(Kstride, cpl):
                 gsize = (_round_up(n4, self.FCQ), _round_up(n_strips, self.FSB), self.n_blocks * self.FAB)
                 self._fwd_t(self.queue, gsize, (self.FCQ, self.FSB, self.FAB), img_k.data, sino_k.data,
                             self.geo_gpu.data, self.blocks_gpu.data, np.int32(self.Nx), np.int32(self.Ny),
@@ -226,7 +294,7 @@ class ParallelRadon:
                             np.int32(n4), self.scale, np.int32(self.W),
                             cl.LocalMemory(self.FVR * self.W * self.FCQ * 16), cl.LocalMemory(4 * self.FVR))
             return
-        for k4, n4 in self._slices(Kstride):
+        for k4, n4 in self._slices(Kstride, cpl):
             gsize = (_round_up(n4, 32), _round_up(n_strips, 4), self.R)
             self._fwd(self.queue, gsize, (32, 4, 1), img_k.data, sino_k.data, self.geo_gpu.data,
                       np.int32(self.Nx), np.int32(self.Ny), np.int32(self.Ns), np.int32(self.R),
@@ -235,20 +303,21 @@ class ParallelRadon:
     def backward(self, sino_k, img_k, Kstride):
         """img_k (Nx*Ny, Kstride) = backward projection of sino_k (R, Ns, Kstride)."""
         assert Kstride % 4 == 0, "Kstride must be a multiple of 4"
-        if self.tiled:
-            for k4, n4 in self._slices(Kstride):
+        tiled, cpl = self.modes["backward"]
+        if tiled:
+            for k4, n4 in self._slices(Kstride, cpl):
                 gsize = (_round_up(n4, self.BCQ), _round_up(self.Nx, self.BT), _round_up(self.Ny, self.BT))
                 self._bwd_t(self.queue, gsize, (self.BCQ, self.BT, self.BT), sino_k.data, img_k.data,
                             self.geo_gpu.data, np.int32(self.Nx), np.int32(self.Ny), np.int32(self.Ns),
                             np.int32(self.R), np.int32(Kstride // 4), np.int32(k4), np.int32(n4))
             return
-        for k4, n4 in self._slices(Kstride):
+        for k4, n4 in self._slices(Kstride, cpl):
             gsize = (_round_up(n4, 32), _round_up(self.Nx, 4), self.Ny)
             self._bwd(self.queue, gsize, (32, 4, 1), sino_k.data, img_k.data, self.geo_gpu.data,
                       np.int32(self.Nx), np.int32(self.Ny), np.int32(self.Ns), np.int32(self.R),
                       np.int32(Kstride // 4), np.int32(k4), np.int32(n4))
 
-    def _slices(self, Kstride):
-        """(first, count) of the channel slices, in float4 units."""
-        K4, c4 = Kstride // 4, self.channels_per_launch // 4
+    def _slices(self, Kstride, cpl):
+        """(first, count) of the channel slices of cpl channels, in float4 units."""
+        K4, c4 = Kstride // 4, min(cpl, Kstride) // 4
         return [(k4, min(c4, K4 - k4)) for k4 in range(0, K4, c4)]

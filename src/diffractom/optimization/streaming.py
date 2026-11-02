@@ -260,7 +260,7 @@ def batch_pass(st, ups, dns, compute):
     number of elements), reading the upload slots and writing the download slots. Returns when all downloads are done."""
     op, q = st.op, st.q
     nb = len(op.batches)
-    up, dn = [None] * nb, [None] * nb
+    up, dn, done = [None] * nb, [None] * nb, [None] * nb
     start = cl.enqueue_marker(q)
     q.flush()
 
@@ -271,6 +271,8 @@ def batch_pass(st, ups, dns, compute):
         s = ib % 2
         if ib >= 2 and dn[ib - 2] is not None:
             dn[ib - 2].result()  # slot s has been downloaded
+        elif ib >= 2:
+            done[ib - 2].wait()  # (nothing downloaded) the batch that used slot s has been computed
         else:
             start.wait()
         n = size(ib)
@@ -297,7 +299,7 @@ def batch_pass(st, ups, dns, compute):
         elif ib >= 2 and dn[ib - 2] is not None:
             dn[ib - 2].result()
         compute(ib, s, size(ib))
-        ev = cl.enqueue_marker(q)
+        ev = done[ib] = cl.enqueue_marker(q)
         q.flush()
         if dns:
             dn[ib] = st.io_dn.submit(download, ib, ev)
