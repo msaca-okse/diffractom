@@ -104,7 +104,30 @@ $\partial g/\partial s = -(1-|D|)e_1 - (1+|D|)e_2$ with $s = 1/\sigma^2$, $e_{1,
 | rocks (NWA 7034, meteorite, basalt, ...) | absorption $\mu(x)$; per-phase lattice parameters (composition of solid solutions); geometry; background | transmission down to 6 %, exit-path attenuation 0.5-2x; mineral compositions shift reflections between windows |
 | strain | radially resolved data needed | ring-integrated data are almost insensitive |
 
-## 5. Suggested order
+## 5. First result: refining the basis orientations and widths (simulated samples)
+
+Setup:
+- The indexed basis of the two simulated samples, sigma 0.4°, and an unregularised nonnegative L2 fit.
+- Baseline: 200 FISTA iterations from zero.
+- Then 10 outer steps. Each is a damped Gauss-Newton step for every orientation (rotation and width: the exact
+  4x4 blocks from `PFGradient`, at most 0.2° and 30 % per step, widths kept at or above 0.1°, a line search on the
+  loss with the coefficients fixed), followed by 50 FISTA iterations warm-started.
+- Control: the baseline continued with FISTA only, 700 iterations in total.
+- The quadrature rule was chosen for a width of 0.1°. Script:
+  `claude_scratch/diffmodel/refine_sims.py`; V100, 5 s (1°) and 16 s (10°) per outer step.
+
+| sample | median misorientation to the ground truth | p90 | relative residual |
+|---|---|---|---|
+| 1° mosaicity, K 345 | 0.216° -> **0.097°** (control 0.214°) | 0.42° -> 0.24° | 0.687 -> 0.348 (control 0.685) |
+| 10° mosaicity, K 3025 | 0.329° -> **0.282°** (control 0.327°) | 0.64° -> 0.53° | 0.528 -> 0.184 (control 0.520) |
+
+- The orientations moved by 0.24° / 0.37° (median), at most 0.7° / 1.1°.
+- 83 % / 57 % of the widths ended at the 0.1° floor: the data want narrower kernels than 0.4°, so the floor is
+  binding.
+- On the 10° sample the ground-truth score stops improving after three steps while the residual keeps falling. Its
+  intragranular orientation gradients are larger than the basis spacing.
+
+## 6. Suggested order
 
 1. GPU vector-Jacobian product for the PF parameters (orientations, $\sigma_k$, global geometry), checked against the
    reference. Then alternate coefficient and orientation/width steps (block Gauss-Newton) on the simulated samples,
