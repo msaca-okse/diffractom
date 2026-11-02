@@ -70,9 +70,10 @@ def frame_matrix(shape, d):
     return np.asarray((S2 @ C @ S1).todense())
 
 
-def exit_directions(op):
+def exit_directions(op, mirror=False):
     """Per segment j = c P + p: the in-plane part (x, y in the lab frame, rotation axis z) of the diffracted beam's
-    direction, unit (CP, 2), and 1 / its length (CP,)."""
+    direction, unit (CP, 2), and 1 / its length (CP,). mirror: reflected about the beam (the other side of the
+    detector: a check of the setup's convention on data)."""
     vec = lambda k: np.asarray(op.cfg[k], np.float64)
     p0, d0, d90 = vec("p_direction_0"), vec("detector_direction_origin"), vec("detector_direction_positive_90")
     eta = np.asarray(op.eta_angles, np.float64)
@@ -80,13 +81,17 @@ def exit_directions(op):
     e = np.cos(eta)[:, None, None] * d0 + np.sin(eta)[:, None, None] * d90
     k = (np.cos(tth)[None, :, None] * p0 + np.sin(tth)[None, :, None] * e).reshape(-1, 3)
     kpar = np.hypot(k[:, 0], k[:, 1])
-    return k[:, :2] / kpar[:, None], 1.0 / kpar
+    xy = k[:, :2] / kpar[:, None]
+    if mirror:
+        b = p0[:2] / np.linalg.norm(p0[:2])
+        xy = 2 * (xy @ b)[:, None] * b[None] - xy                          # reflection about the beam's line
+    return xy, 1.0 / kpar
 
 
-def exit_classes(op, width_deg=2.0):
+def exit_classes(op, width_deg=2.0, mirror=False):
     """Segments grouped by the in-plane angle of their exit direction (bins of width_deg): (assign (CP,), unit lab
     directions (n, 2), length factors (n,)), each class's direction and factor the mean of its members'."""
-    dirs, fac = exit_directions(op)
+    dirs, fac = exit_directions(op, mirror)
     phi = np.arctan2(dirs[:, 1], dirs[:, 0])
     phi0 = np.arctan2(*np.asarray(op.cfg["p_direction_0"], np.float64)[[1, 0]])
     rel = np.angle(np.exp(1j * (phi - phi0)))                                # relative to the beam
