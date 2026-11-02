@@ -131,6 +131,22 @@ Setup:
 - On the 10° sample the ground-truth score stops improving after three steps while the residual keeps falling. Its
   intragranular orientation gradients are larger than the basis spacing.
 
+### Geometry recovery (simulated 1° sample)
+
+- Setup: the operator's geometry was perturbed (eta offset +0.2°, axis tilt +0.15° / -0.10°, every Bragg angle
+  +0.03°, centre of rotation +0.5 bins) and the coefficients refit.
+- Each step: L-BFGS on the 20 geometry parameters (exact gradients, coefficients fixed; about 21 evaluations with PF
+  rebuilds, 170 s on a V100), then 50 FISTA iterations.
+
+| after 3 steps | eta offset | tilt | Bragg angles (mean, rms) | centre of rotation |
+|---|---|---|---|---|
+| remaining error | -0.027° | +0.035°, +0.016° | -0.002°, 0.009° | +0.40 bins (of 0.5) |
+
+- The angular parameters come back to a few hundredths of a degree.
+- The centre of rotation barely moves. Each basis orientation diffracts at only a few angles, so its image shifts to
+  absorb a constant detector offset. Take the centre of rotation from the transmission or the summed intensity
+  instead.
+
 ## 6. Suggested order
 
 1. GPU vector-Jacobian product for the PF parameters (orientations, $\sigma_k$, global geometry), checked against the
