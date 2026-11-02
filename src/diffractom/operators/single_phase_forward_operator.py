@@ -445,9 +445,12 @@ class SinglePhaseForwardOperator:
         self.pf_storage = None
         if sparse_max_gb is None:
             sparse_max_gb = self.default_sparse_budget_gb()
+        # how the PF matrix was set up (differentiable.set_pf_parameters rebuilds it the same way)
+        self._pf_build = dict(mode=pf_mode, max_fill=sparse_max_fill, max_gb=sparse_max_gb,
+                              max_fill_partial=sparse_max_fill_partial)
+        self._pf_version = 0
         if pf_mode != "dense":
-            self.build_sparse_pf(mode=pf_mode, max_fill=sparse_max_fill, max_gb=sparse_max_gb,
-                                 max_fill_partial=sparse_max_fill_partial)
+            self.build_sparse_pf(**self._pf_build)
         if self.verbose:
             if self.pf_mode == "generated":
                 how = f"{len(self.batches)} batches, stored: {self.pf_storage}, the others generated in every call"

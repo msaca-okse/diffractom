@@ -115,6 +115,23 @@ class ReferenceModel:
         u, _, _ = self._u(prm)
         return np.einsum("rsij,cepi->rscepj", self._rot_om(prm), u)
 
+    def probed_derivatives(self, prm, groups=("eta_offset", "axis_tilt", "two_theta")):
+        """Derivatives of the probed directions, each shaped like probed(): "eta_offset", ("axis_tilt", 0),
+        ("axis_tilt", 1) and "two_theta" (ring p's slice holds d v / d (2 theta_p))."""
+        Rot = self._rot_om(prm)
+        u, du_eta, du_tth = self._u(prm)
+        out = {}
+        if "eta_offset" in groups:
+            out["eta_offset"] = np.einsum("rsij,cepi->rscepj", Rot, du_eta)
+        if "two_theta" in groups:
+            out["two_theta"] = np.einsum("rsij,cepi->rscepj", Rot, du_tth)
+        if "axis_tilt" in groups:
+            v = np.einsum("rsij,cepi->rscepj", Rot, u)
+            for i, e in enumerate(self.e_tilt):
+                eu = np.cross(e[None, None, None, :], u)
+                out[("axis_tilt", i)] = np.cross(e, v) - np.einsum("rsij,cepi->rscepj", Rot, eu)
+        return out
+
     def poles(self, prm):
         rot = Rotation.from_rotvec(prm["rot"]).as_matrix() @ self.U0                   # (K, 3, 3)
         return np.einsum("kij,aj->kai", rot, self.axes)
@@ -216,16 +233,7 @@ class ReferenceModel:
         norm = 1.0 / (8.0 * np.pi * sig ** 2)
         out = {"rot": np.zeros((self.K, 3)), "sigma": np.zeros(self.K), "two_theta": np.zeros(self.P),
                "eta_offset": 0.0, "axis_tilt": np.zeros(2)}
-        dv = {}
-        if "eta_offset" in groups:
-            dv["eta_offset"] = np.einsum("rsij,cepi->rscepj", Rot, du_eta)
-        if "two_theta" in groups:
-            dv["two_theta"] = np.einsum("rsij,cepi->rscepj", Rot, du_tth)       # ring p's column of d v / d 2theta_p
-        if "axis_tilt" in groups:
-            for i, e in enumerate(self.e_tilt):
-                eu = np.cross(e[None, None, None, :], u)                           # (C, Se, P, 3)
-                dv[("axis_tilt", i)] = (np.cross(e, v)
-                                        - np.einsum("rsij,cepi->rscepj", Rot, eu))
+        dv = self.probed_derivatives(prm, groups)
         for p in range(self.P):
             a0, a1 = self.start[p], self.start[p + 1]
             vp, np_ = v[..., p, :], n[:, a0:a1]
