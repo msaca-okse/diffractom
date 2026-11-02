@@ -674,6 +674,7 @@ class SinglePhaseForwardOperator:
             counts.append(cnt)
             start.append(start[-1] + len(uniq))
         axes = np.concatenate(axes)
+        self.pole_axes_cpu = axes          # (N_axes, 3) unit axes in the crystal frame (for the differentiable model)
         self.N_axes = len(axes)
         self.axis_start_cpu = np.asarray(start, dtype=np.int32)
         self.axis_count_cpu = np.concatenate(counts).astype(np.float32)
