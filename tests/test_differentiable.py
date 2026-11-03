@@ -352,3 +352,44 @@ def test_absorption_operator_gpu():
     assert rel(abo.direct(c), abr.forward(c, prm)) < 2e-5
     assert rel(abo.adjoint(r), g["c"]) < 2e-5
     assert rel(abo.mu_gradient(c, r), g["mu"]) < 2e-5
+
+
+def test_local_basis_gradients():
+    """PFGradient on LocalSinglePhaseForwardOperator == on the global operator with the coefficients zero outside the
+    support (also the Gauss-Newton blocks and after set_pf_parameters); split_regions gives one copy per region."""
+    from diffractom import LocalSinglePhaseForwardOperator, LocalSupport, MatrixGrid, SinglePhaseForwardOperator
+    from diffractom.differentiable import PFGradient, rotate_orientations, set_pf_parameters
+    from diffractom.differentiable.local_basis import split_regions
+    ctx, queue = _context()
+    g = _operator(ctx, queue)
+    cfg, mat = g.cfg, g.material
+    mats, sig = g.grid_rot_cpu.astype(np.float64), g.sigma_cpu.astype(np.float64)
+    rng = np.random.default_rng(3)
+    mask = np.zeros((g.K, g.Ny, g.Nx), bool)
+    for k in range(g.K):                                  # each orientation in one or two random blobs
+        for _ in range(1 + k % 2):
+            cy, cx = rng.integers(2, g.Ny - 2), rng.integers(2, g.Nx - 2)
+            mask[k, max(cy - 2, 0):cy + 2, max(cx - 2, 0):cx + 3] = True
+    sup = LocalSupport.from_mask(mask)
+    for split in (None, "components", "tiles"):
+        m2, s2, sp = (mats, sig, sup) if split is None else split_regions(mats, sig, sup, mode=split, tile=4)[:3]
+        kw = dict(normalized=True, ctx=ctx, queue=queue, quadrature="auto")
+        lop = LocalSinglePhaseForwardOperator(cfg, mat, MatrixGrid(m2, s2), 1e-5, support=sp, **kw)
+        gop = SinglePhaseForwardOperator(cfg=cfg, material=mat, grid=MatrixGrid(m2, s2), max_gb=1e-5, pf_mode="sparse",
+                                         projector="native", **kw)
+        x = rng.random(lop.coeff_shape).astype(np.float32)
+        xd = lop.to_dense(x).astype(np.float32)
+        r = rng.normal(size=lop.data_shape).astype(np.float32)
+        oi = lop.orientation_index
+        for step in range(2):
+            gl = PFGradient(lop, hessian=True)(x, r, groups=("rot", "sigma"))
+            gg = PFGradient(gop, hessian=True)(xd, r, groups=("rot", "sigma"))
+            for key in ("rot", "sigma", "hess"):
+                assert np.abs(gl[key] - gg[key][oi]).max() < 1e-4 * np.abs(gg[key]).max(), (split, step, key)
+            inc = 0.003 * rng.normal(size=(lop.K, 3))
+            set_pf_parameters(lop, rotations=rotate_orientations(lop.grid_rot_cpu, inc))
+            rg = gop.grid_rot_cpu.astype(np.float64).copy()
+            rg[oi] = rotate_orientations(rg[oi], inc)
+            set_pf_parameters(gop, rotations=rg)
+            d1, d2 = lop.direct(x), gop.direct(xd)
+            assert np.abs(d1 - d2).max() < 1e-5 * np.abs(d2).max()

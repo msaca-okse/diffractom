@@ -117,6 +117,8 @@ def _rebuild(op, pf_changed, geo_changed):
     op._pf_cached = False
     if op._pf_build["mode"] != "dense":
         op.build_sparse_pf(**op._pf_build)
+    if getattr(op, "coefficient_layout", "dense") == "local":
+        op._setup_local()                       # the batches may have changed with the fill: strips, tiles
     op._pf_version = getattr(op, "_pf_version", 0) + 1
 
 

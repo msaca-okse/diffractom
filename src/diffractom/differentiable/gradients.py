@@ -28,8 +28,9 @@ class PFGradient:
     def __init__(self, op, hessian=False, local_size=64):
         if op.pf_mode not in ("sparse", "generated"):
             raise NotImplementedError(f"PFGradient needs pf_mode 'sparse' or 'generated' (this operator: {op.pf_mode!r})")
-        if getattr(op, "coefficient_layout", "dense") != "dense":
-            raise NotImplementedError("PFGradient needs the (K, Ny, Nx) coefficient layout")
+        self.local = getattr(op, "coefficient_layout", "dense") == "local"
+        if getattr(op, "coefficient_layout", "dense") not in ("dense", "local"):
+            raise NotImplementedError("PFGradient needs the (K, Ny, Nx) or the local coefficient layout")
         self.op, self.q = op, op.queue
         self.hessian, self.ls = bool(hessian), int(local_size)
         self.P = int(op.N_peaks)
@@ -42,6 +43,8 @@ class PFGradient:
         prg = cl.Program(op.ctx, src).build(options=opts)
         self.k_vjp = cl.Kernel(prg, "pf_param_vjp")
         self.k_sum = cl.Kernel(prg, "rows_to_orientations")
+        if self.local:
+            self.k_scatter = cl.Kernel(cl.Program(op.ctx, _STRIP_SCATTER).build(), "strips_to_sino")
         self.dummy = clarray.zeros(self.q, (1,), np.float32)
         self.dv = {}
         self._alloc()
@@ -50,6 +53,8 @@ class PFGradient:
         op = self.op
         self.kmax, self.version = op.K_batch_max, getattr(op, "_pf_version", 0)
         self.rows = clarray.empty(self.q, (int(op.N_Omega) * op.K_batch_max * self.NQ,), np.float32)
+        if self.local:           # the batch sinogram (R, My, Kmax) the gradient kernel reads, from the patches' strips
+            self.sino = clarray.empty(self.q, (int(op.N_Omega) * int(op.My) * op.K_batch_max,), np.float32)
         self.per_k = clarray.empty(self.q, (op.K_batch_max * self.NQ,), np.float32)
 
     def refresh(self):
@@ -73,17 +78,32 @@ class PFGradient:
         return get("eta_offset"), get(("axis_tilt", 0)), get(("axis_tilt", 1)), get("two_theta")
 
     def _project(self, c, ib):
-        """The projections of batch ib's coefficients into op.coeffs_sino_C (R, My, K_batch_max)."""
+        """The projections of batch ib's coefficients into op.coeffs_sino_C (R, My, K_batch_max) (local layout: into
+        self.sino, the patches' strips added at their detector offsets)."""
         op = self.op
+        if self.local:
+            lb = op.local_batches[ib]
+            self.sino.fill(np.float32(0.0))
+            if lb is None:
+                return self.sino
+            op._radon_forward(c, lb)
+            R = int(op.N_Omega)
+            n = lb["n_strip"]
+            self.k_scatter(self.q, (-(-n // 256) * 256,), (256,), op._strips.data, self.sino.data, lb["W"].data,
+                           lb["soff"].data, lb["off"].data, lb["pk"].data, np.int32(lb["n"]), np.int32(R),
+                           np.int32(op.My), np.int32(op.K_batch_max), np.int32(n))
+            return self.sino
         b = op.batches[ib]
         k0, Kb, Kmax = b["k_start"], b["K_batch"], op.K_batch_max
         if op.projector == "fft":
             op.fradon.forward(c, k0, Kb, op.coeffs_sino_C, Kmax)
+            return op.coeffs_sino_C
         elif op.projector == "native":
             op.radon.gather(c, op._img_k, k0, Kb, Kmax)
             op.radon.forward(op._img_k, op.coeffs_sino_C, Kmax)
         else:
             op._radon_gratopy_forward(c, k0, Kb)
+        return op.coeffs_sino_C
 
     def __call__(self, c, r, groups=PF_GROUPS, curv=None):
         """c: coefficients (K, Ny, Nx), r: dL/d data (N_Omega, My, N_seg) (NumPy arrays are uploaded); curv: the
@@ -120,10 +140,10 @@ class PFGradient:
         per_k = np.zeros((op.K, self.NQ), np.float64)
         for ib, b in enumerate(op.batches):
             k0, Kb = b["k_start"], b["K_batch"]
-            self._project(c, ib)
+            sino = self._project(c, ib)
             sb = op._pf_batch(ib, forward=False)
             self.k_vjp(q, (R * Kb * self.ls,), (self.ls,), sb["row_ptr_a"].data, sb["col_j"].data, r.data,
-                       (curv if self.hessian else self.dummy).data, op.coeffs_sino_C.data, op.coords_gpu.data,
+                       (curv if self.hessian else self.dummy).data, sino.data, op.coords_gpu.data,
                        dv_eta, dv_t1, dv_t2, dv_tth, op.poles_gpu.data, op.axis_start_gpu.data,
                        op.axis_count_gpu.data, op.inv_sigma2_gpu.data, op.norm_factor_gpu.data,
                        op.quad_weights_gpu.data, op.intens_gpu.data, self.rows.data, np.int32(My), np.int32(Kb),
@@ -152,6 +172,27 @@ class PFGradient:
             H[:, iu[1], iu[0]] = per_k[:, 4:14]
             out["hess"] = H
         return out
+
+
+_STRIP_SCATTER = r"""
+inline void atomic_add_f(volatile __global float *p, const float v) {
+    union { unsigned int u; float f; } old, nw;
+    do { old.f = *p; nw.f = old.f + v; } while (atomic_cmpxchg((volatile __global unsigned int *)p, old.u, nw.u) != old.u);
+}
+// sino[(a * My + s) * Kmax + pk[p]] += strips[soff[p] + a * W[p] + j],  s = off[p * R + a] + j (inside the detector)
+__kernel void strips_to_sino(__global const float *strips, __global float *sino, __global const int *W,
+                             __global const int *soff, __global const int *off, __global const int *pk,
+                             const int P, const int R, const int My, const int Kmax, const int n)
+{
+    const int i = get_global_id(0);
+    if (i >= n) return;
+    int lo = 0, hi = P - 1;                       // the patch holding strip bin i (soff ascending)
+    while (lo < hi) { const int mid = (lo + hi + 1) / 2; if (soff[mid] <= i) lo = mid; else hi = mid - 1; }
+    const int p = lo, rem = i - soff[p], a = rem / W[p], j = rem - a * W[p];
+    const int s = off[p * R + a] + j;
+    if (s >= 0 && s < My) atomic_add_f(sino + ((size_t)a * My + s) * Kmax + pk[p], strips[i]);
+}
+"""
 
 
 class ProjGradient:
