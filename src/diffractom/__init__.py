@@ -4,6 +4,7 @@ from .crystallography.material import Material
 from .crystallography.intensity import IntensityModel
 from .utils.grid import Grid, MatrixGrid
 from .utils.support import fov_support_mask
+from .utils.omega import angle_range_from_frames
 from .utils.counting import pyfai_gain, gain_from_pairs
 from .operators.single_phase_forward_operator import SinglePhaseForwardOperator, estimate_L_power
 from .operators.local_forward_operator import LocalSinglePhaseForwardOperator
@@ -43,6 +44,7 @@ __all__ = [
     "SinglePhaseForwardOperator",
     "LocalSinglePhaseForwardOperator",
     "QuadratureRule",
+    "angle_range_from_frames",
     "LocalSupport",
     "estimate_L_power",
     "MultiPhaseForwardOperator",

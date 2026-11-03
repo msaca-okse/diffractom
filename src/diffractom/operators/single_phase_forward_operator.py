@@ -179,6 +179,12 @@ class SinglePhaseForwardOperator:
         cfg : dict
             Experiment configuration (keys: Nx, Ny, My, N_Omega, N_eta, angle_range,
             wavelength, detector_direction_origin, etc.).
+            ``angle_range = [a0, a1]`` (degrees) are the EDGES of the rotation the N_Omega data bins cover:
+            bin i is [a0 + i d, a0 + (i + 1) d], d = (a1 - a0) / N_Omega; the diffraction part integrates over
+            the interval and the projection is taken at its centre. Build it from the recorded frame angles with
+            ``diffractom.utils.omega.angle_range_from_frames(omega, label=...)``: recorded angles that are the
+            start or the end of each frame's interval, used as centres, turn every reconstructed orientation by
+            half a frame about the rotation axis.
         material : Material
             Crystallographic material with reflections and symmetry.
         grid : Grid
