@@ -163,6 +163,9 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
         t_patch = time.perf_counter() - t0
 
         inner = MatrixGrid(mats[self.orientation_index], sigmas[self.orientation_index])
+        if kwargs.get("beam_profile") is not None:
+            raise NotImplementedError("LocalSinglePhaseForwardOperator: beam_profile is not supported (its own "
+                                      "projection kernels use the one-step box)")
         super().__init__(cfg, material, inner, max_gb, verbose=verbose, projector="native", **kwargs)
         if self.pf_mode == "dense":
             self.free_memory()

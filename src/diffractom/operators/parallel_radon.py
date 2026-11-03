@@ -64,6 +64,12 @@ class ParallelRadon:
         percent within +-1.5 degrees of it for compact features), 1.3 % at 26.6 and 63.4, 0.9 % at 33.7 and 56.3
         degrees, and a reconstruction gets a diagonal cross-hatch pattern. It needs delta_x <= delta_s (larger
         pixels would leave bins empty).
+    beam_profile : BeamProfile, optional
+        The profile of the beam across the detector coordinate (the translation direction), in detector bins, unit
+        area (see ``operators.beam_profile``). Given, the weight is the pixel footprint (as for the trapezoid)
+        convolved with the profile, tabulated per angle (``K_a(d)``, linear interpolation on 256 points per bin)
+        instead of averaged over one bin; ``BeamProfile(width=1)`` is the trapezoid. Needs kernel="trapezoid".
+        A wider profile makes a pixel touch more bins (forward and backward cost grow with it).
     tiled : "auto", bool or dict
         The tiled kernels stage what a work-group shares in local memory (the image rows of a block
         of angles and bins in the forward projection, the sinogram bins of a pixel tile in the
@@ -91,7 +97,7 @@ class ParallelRadon:
 
     def __init__(self, queue, img_shape, angles, n_detectors, image_width, detector_width,
                  detector_shift=0.0, angle_weights=None, bins_per_item=3, channels_per_launch=None,
-                 tiled="auto", kernel="trapezoid"):
+                 tiled="auto", kernel="trapezoid", beam_profile=None):
         self.queue = queue
         self.Nx, self.Ny = (int(n) for n in img_shape)
         self.Ns = int(n_detectors)
@@ -120,6 +126,18 @@ class ParallelRadon:
                              "use kernel='trapezoid'")
         self.kernel = kernel
         self.n_taps = max(2, int(np.ceil(1.0 + a_max - 1e-6)))      # bins a pixel touches (trapezoid)
+        from .beam_profile import as_beam_profile
+        self.beam_profile = as_beam_profile(beam_profile)
+        self.phw = 0.5 * (1.0 + a_max) if kernel == "trapezoid" else 1.0   # half support of the weight (bins)
+        if self.beam_profile is not None:
+            if kernel != "trapezoid":
+                raise ValueError("beam_profile needs kernel='trapezoid' (the profile replaces the bin average)")
+            self.kernel = "profile"
+            tab, self.phw, self.pnt = self.beam_profile.tables(np.maximum(np.abs(X), np.abs(Y)))
+            self.n_taps = int(np.ceil(2.0 * self.phw)) + 1
+            self.ktab_gpu = clarray.to_device(queue, tab)
+        else:
+            self.ktab_gpu = clarray.zeros(queue, (1,), np.float32)
         geo = np.stack([X, Y, T0, self.angle_weights], axis=1).astype(np.float32)
         self.geo_gpu = clarray.to_device(queue, np.ascontiguousarray(geo))
 
@@ -139,8 +157,11 @@ class ParallelRadon:
         self._use_tiled = self.modes is None or any(m[0] for m in self.modes.values())
         src = Path(__file__).with_name("radon_kernels.cl").read_text()
         options = [f"-DNB={self.bins_per_item}"]
-        if kernel == "trapezoid":
+        if self.kernel == "trapezoid":
             options += ["-DTRAPEZOID", f"-DNTAP={self.n_taps}"]
+        elif self.kernel == "profile":
+            options += ["-DPROFILE", f"-DNTAP={self.n_taps}", f"-DPNT={self.pnt}", f"-DPHW={self.phw:.9e}f",
+                        f"-DPINV={(self.pnt - 1) / (2.0 * self.phw):.9e}f"]
         if self._use_tiled:
             if self.FCQ * self.FSB * self.FAB > queue.device.max_work_group_size:
                 self.FAB = max(1, queue.device.max_work_group_size // (self.FCQ * self.FSB))
@@ -196,7 +217,8 @@ class ParallelRadon:
             Nu, Nv = (self.Nx, self.Ny) if ry else (self.Ny, self.Nx)
             v = np.arange(Nv, dtype=np.float64)
             c = B[:, None] * v[None, :] + T0[a0:a0 + na, None]                  # (angles, rows)
-            hw = (0.5 * (1.0 + np.abs(A)) if self.kernel == "trapezoid" else np.ones_like(A))[None, :, None]   # half width
+            hw = (0.5 * (1.0 + np.abs(A)) if self.kernel == "trapezoid" else
+                  np.full_like(A, self.phw))[None, :, None]                         # half width
             e1 = (S0[:, :, None, None] - hw - c[None]) / A[None, :, None]        # (groups, 1, angles, rows)
             e2 = (S1[:, :, None, None] - 1 + hw - c[None]) / A[None, :, None]
             lo = np.clip(np.floor(np.minimum(e1, e2)), 0, Nu - 1).min(axis=(1, 2))   # (groups, rows)
@@ -209,7 +231,7 @@ class ParallelRadon:
             W = budget // (self.FCQ * 16)
         self.W = int(W)
         span = np.max((self.BT - 1) * (np.abs(X.astype(np.float64)) + np.abs(Y.astype(np.float64))))
-        hw_max = 0.5 * (1.0 + a_max) if self.kernel == "trapezoid" else 1.0
+        hw_max = self.phw
         self.BLMAX = int(np.ceil(span + 2.0 * hw_max)) + 2
         per_angle = self.BLMAX * self.BCQ * 16
         self.BAB = max(1, min(self.BAB, budget // per_angle))   # fewer angles per tile for narrow bins
@@ -292,13 +314,14 @@ class ParallelRadon:
                             self.geo_gpu.data, self.blocks_gpu.data, np.int32(self.Nx), np.int32(self.Ny),
                             np.int32(self.Ns), np.int32(self.R), np.int32(Kstride // 4), np.int32(k4),
                             np.int32(n4), self.scale, np.int32(self.W),
-                            cl.LocalMemory(self.FVR * self.W * self.FCQ * 16), cl.LocalMemory(4 * self.FVR))
+                            cl.LocalMemory(self.FVR * self.W * self.FCQ * 16), cl.LocalMemory(4 * self.FVR),
+                            self.ktab_gpu.data)
             return
         for k4, n4 in self._slices(Kstride, cpl):
             gsize = (_round_up(n4, 32), _round_up(n_strips, 4), self.R)
             self._fwd(self.queue, gsize, (32, 4, 1), img_k.data, sino_k.data, self.geo_gpu.data,
                       np.int32(self.Nx), np.int32(self.Ny), np.int32(self.Ns), np.int32(self.R),
-                      np.int32(Kstride // 4), np.int32(k4), np.int32(n4), self.scale)
+                      np.int32(Kstride // 4), np.int32(k4), np.int32(n4), self.scale, self.ktab_gpu.data)
 
     def backward(self, sino_k, img_k, Kstride):
         """img_k (Nx*Ny, Kstride) = backward projection of sino_k (R, Ns, Kstride)."""
@@ -309,13 +332,13 @@ class ParallelRadon:
                 gsize = (_round_up(n4, self.BCQ), _round_up(self.Nx, self.BT), _round_up(self.Ny, self.BT))
                 self._bwd_t(self.queue, gsize, (self.BCQ, self.BT, self.BT), sino_k.data, img_k.data,
                             self.geo_gpu.data, np.int32(self.Nx), np.int32(self.Ny), np.int32(self.Ns),
-                            np.int32(self.R), np.int32(Kstride // 4), np.int32(k4), np.int32(n4))
+                            np.int32(self.R), np.int32(Kstride // 4), np.int32(k4), np.int32(n4), self.ktab_gpu.data)
             return
         for k4, n4 in self._slices(Kstride, cpl):
             gsize = (_round_up(n4, 32), _round_up(self.Nx, 4), self.Ny)
             self._bwd(self.queue, gsize, (32, 4, 1), sino_k.data, img_k.data, self.geo_gpu.data,
                       np.int32(self.Nx), np.int32(self.Ny), np.int32(self.Ns), np.int32(self.R),
-                      np.int32(Kstride // 4), np.int32(k4), np.int32(n4))
+                      np.int32(Kstride // 4), np.int32(k4), np.int32(n4), self.ktab_gpu.data)
 
     def _slices(self, Kstride, cpl):
         """(first, count) of the channel slices of cpl channels, in float4 units."""

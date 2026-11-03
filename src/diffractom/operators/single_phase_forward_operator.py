@@ -161,6 +161,7 @@ class SinglePhaseForwardOperator:
         sparse_max_gb: float | None = None,
         projector: str = "auto",
         radon_kernel: str | None = None,
+        beam_profile=None,
         fft_max_gb: float = 1.5,
         reserve_coefficient_arrays: int = 3,
         pf_cutoff_sigma: float | None = 4.0,
@@ -271,6 +272,13 @@ class SinglePhaseForwardOperator:
             "hat": linear interpolation, the discretisation of gratopy and diffractom's default until 0.2.0; it
             modulates projections from bin to bin near 45 and 135 degrees (6.7 % at exactly 45 degrees), and
             results differ from the trapezoid's at that level. Pass "hat" to reproduce earlier results bitwise.
+        beam_profile : BeamProfile, width, (width, sigma) or None
+            The profile of the pencil beam across the translation direction, in translation steps (detector bins),
+            see ``operators.beam_profile.BeamProfile``: e.g. ``BeamProfile(1.42, 0.2)`` for a 14.2 um slit with
+            edges blurred by 2 um at 10 um steps, or ``BeamProfile.tabulated(x, b)`` for a measured profile.
+            Default None: a box exactly one step wide (the projectors' bin average; results unchanged). The native
+            projector convolves the pixel footprint with it (needs radon_kernel="trapezoid"), the FFT projector
+            multiplies by its transform; not available with gratopy.
         fft_max_gb : float
             GPU memory for the scratch buffers of the "fft" projector (they hold a slice of
             the batch's orientations at a time).
@@ -393,6 +401,10 @@ class SinglePhaseForwardOperator:
         if radon_kernel != "hat" and projector != "native":
             raise ValueError(f"radon_kernel={radon_kernel!r} needs the native projector (projector is {projector!r})")
         self.radon_kernel = radon_kernel
+        from .beam_profile import as_beam_profile
+        self.beam_profile = as_beam_profile(beam_profile)
+        if self.beam_profile is not None and (projector == "gratopy" or (projector == "native" and radon_kernel == "hat")):
+            raise ValueError("beam_profile needs the native projector with radon_kernel='trapezoid', or the fft one")
         self.projector = projector
         self.fradon = None
         # angle weights of the backprojection: pi / N_Omega makes the adjoint the transpose of the forward
@@ -411,6 +423,7 @@ class SinglePhaseForwardOperator:
                 detector_shift=self.cor_offset,
                 angle_weights=angle_weight,
                 max_gb=fft_max_gb,
+                beam_profile=self.beam_profile,
             )
             self.PS = None
         elif projector == "native":
@@ -425,6 +438,7 @@ class SinglePhaseForwardOperator:
                 angle_weights=angle_weight,
                 bins_per_item=3,
                 kernel=radon_kernel,
+                beam_profile=self.beam_profile,
             )
             self.PS = None
         else:
@@ -1421,7 +1435,8 @@ class SinglePhaseForwardOperator:
                 self._sub_radon.append(ParallelRadon(
                     self.queue, (self.Nx, self.Ny), self.angles[s], self.My, image_width=self.Nx,
                     detector_width=self.My, detector_shift=self.cor_offset, angle_weights=np.pi / R, bins_per_item=3,
-                    kernel=self.radon_kernel, tiled=self._sub_radon[0].modes if self._sub_radon else "auto"))
+                    kernel=self.radon_kernel, tiled=self._sub_radon[0].modes if self._sub_radon else "auto",
+                    beam_profile=self.beam_profile))
         self._sub_prg = cl.Program(self.ctx, SUBSET_KERNELS).build(options=[f"-DSPMM_TY={SPMM_TY}"])
         self._sub_k = {n: cl.Kernel(self._sub_prg, n) for n in ("spmm_pf_forward_sub", "spmm_pf_adjoint_sub",
                                                                 "zero_rows")}

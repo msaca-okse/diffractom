@@ -89,10 +89,16 @@ class FourierRadon:
         Padded detector length relative to the span of the projections (and the detector).
     max_gb : float
         GPU memory for the scratch buffers of one channel slice.
+    beam_profile : BeamProfile, optional
+        The beam profile across the detector coordinate (see ParallelRadon): its Fourier transform replaces the
+        response of one detector bin (sinc), so the response is sinc x B instead of sinc^2.
     """
 
     def __init__(self, queue, img_shape, angles, n_detectors, image_width, detector_width,
-                 detector_shift=0.0, angle_weights=None, W=7, sigma=1.5, L_factor=1.25, max_gb=1.5):
+                 detector_shift=0.0, angle_weights=None, W=7, sigma=1.5, L_factor=1.25, max_gb=1.5,
+                 beam_profile=None):
+        from .beam_profile import as_beam_profile
+        self.beam_profile = as_beam_profile(beam_profile)
         if VkFFTApp is None:
             raise ImportError("projector='fft' needs pyvkfft (pip install pyvkfft)")
         self.queue = q = queue
@@ -172,7 +178,9 @@ class FourierRadon:
         dev = lambda a: clarray.to_device(q, np.ascontiguousarray(a))
         # ---- polar samples (angle a, frequency j >= 0): phase and bin response, taps, weights
         om = 2 * np.pi * np.arange(H) / L
-        filt = (np.sinc(om / (2 * np.pi)) ** 2)[None, :] * np.exp(-1j * om[None, :] * T[:, None]) / L
+        resp = np.sinc(om / (2 * np.pi)) * (np.sinc(om / (2 * np.pi)) if self.beam_profile is None
+                                            else self.beam_profile.transform(om))   # pixel x bin (or beam)
+        filt = resp[None, :] * np.exp(-1j * om[None, :] * T[:, None]) / L
         filt32 = filt.astype(np.complex64).ravel()
         self.filt = dev(filt32)
         ku = (Mx * om[None, :] * X[:, None] / (2 * np.pi)).ravel()          # (RH,) grid coordinates

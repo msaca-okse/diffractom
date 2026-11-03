@@ -8,6 +8,7 @@ from .utils.counting import pyfai_gain, gain_from_pairs
 from .operators.single_phase_forward_operator import SinglePhaseForwardOperator, estimate_L_power
 from .operators.local_forward_operator import LocalSinglePhaseForwardOperator
 from .operators.quadrature import QuadratureRule
+from .operators.beam_profile import BeamProfile
 from .operators.local_support import LocalSupport
 from .operators.multi_phase_forward_operator import MultiPhaseForwardOperator
 from .operators.bulk_texture_forward_operator import BulkTextureForwardOperator
@@ -43,6 +44,7 @@ __all__ = [
     "SinglePhaseForwardOperator",
     "LocalSinglePhaseForwardOperator",
     "QuadratureRule",
+    "BeamProfile",
     "LocalSupport",
     "estimate_L_power",
     "MultiPhaseForwardOperator",

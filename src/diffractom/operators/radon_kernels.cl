@@ -33,8 +33,23 @@
 // arrays: a launch per slice of channels. Slices of 64-128 channels keep the work items that run
 // together on the same image region, which is much faster than one launch over many channels.
 
+// With -DPROFILE the weight is the pixel footprint convolved with the beam profile across the translation direction
+// (BeamProfile, unit area), tabulated per angle: K_a(d) on PNT points over [-PHW, PHW] (spacing 1 / PINV), linear
+// interpolation, 0 outside. PHW is the half support (pixel footprint plus beam), NTAP the bins a pixel touches.
+// Every kernel takes the table as its last argument (unused without PROFILE).
+
 #ifndef NB
 #define NB 3
+#endif
+#ifdef PROFILE
+inline float kprof(__global const float *tab, const int a, const float d) {
+    const float x = (d + PHW) * PINV;
+    if (!(x > 0.0f && x < (float)(PNT - 1))) return 0.0f;
+    const int i = (int)x;
+    const float f = x - (float)i;
+    __global const float *r = tab + (size_t)a * PNT + i;
+    return r[0] + f * (r[1] - r[0]);
+}
 #endif
 #ifndef NTAP
 #define NTAP 2
@@ -46,7 +61,7 @@ __kernel void radon_forward_k(
     __global float4 *sino,               // (R, Ns, Kstride4)
     __constant float4 *geo,
     const int Nx, const int Ny, const int Ns, const int R, const int Kstride4, const int k4_off, const int k4_n,
-    const float scale
+    const float scale, __global const float *ktab
 ){
     if ((int)get_global_id(0) >= k4_n) return;
     const int k = get_global_id(0) + k4_off;
@@ -68,13 +83,15 @@ __kernel void radon_forward_k(
     const size_t du = rows_are_y ? ks : (size_t)Nx * ks;
     const size_t dv = rows_are_y ? (size_t)Nx * ks : ks;
     const float inv = 1.0f / A;
-#ifdef TRAPEZOID
+#if defined(PROFILE)
+    const float hw = PHW;
+#elif defined(TRAPEZOID)
     const float hw = 0.5f * (1.0f + fabs(A)), top = fmin(1.0f, fabs(A)), iw = 1.0f / fabs(A);   // half width, plateau, 1 / A
 #endif
 
     for (int v = 0; v < Nv; ++v) {
         const float c = B * v + g.z;
-#ifdef TRAPEZOID
+#if defined(TRAPEZOID) || defined(PROFILE)
         const float lo = fmin((s0 - hw - c) * inv, (s0 + NB - 1 + hw - c) * inv);
         const float hi = fmax((s0 - hw - c) * inv, (s0 + NB - 1 + hw - c) * inv);
 #else
@@ -88,7 +105,9 @@ __kernel void radon_forward_k(
             const float4 val = row[(size_t)u * du];
             const float t = A * u + c - s0;
             #pragma unroll
-#ifdef TRAPEZOID
+#if defined(PROFILE)
+            for (int j = 0; j < NB; ++j) acc[j] += kprof(ktab, a, t - j) * val;
+#elif defined(TRAPEZOID)
             for (int j = 0; j < NB; ++j) acc[j] += (clamp(hw - fabs(t - j), 0.0f, top) * iw) * val;
 #else
             for (int j = 0; j < NB; ++j) acc[j] += fmax(1.0f - fabs(t - j), 0.0f) * val;
@@ -107,7 +126,8 @@ __kernel void radon_backward_k(
     __global const float4 *sino,         // (R, Ns, Kstride4)
     __global float4 *out,                // (Npix, Kstride4)
     __constant float4 *geo,
-    const int Nx, const int Ny, const int Ns, const int R, const int Kstride4, const int k4_off, const int k4_n
+    const int Nx, const int Ny, const int Ns, const int R, const int Kstride4, const int k4_off, const int k4_n,
+    __global const float *ktab
 ){
     if ((int)get_global_id(0) >= k4_n) return;
     const int k = get_global_id(0) + k4_off;
@@ -123,7 +143,14 @@ __kernel void radon_backward_k(
         const int sm = (int)floor(t);
         const int sp = sm + 1;
         float4 v = (float4)(0.0f);
-#ifdef TRAPEZOID
+#if defined(PROFILE)
+        const int sf = (int)floor(t - PHW) + 1;                      // first bin the footprint touches
+        #pragma unroll
+        for (int j = 0; j < NTAP; ++j) {
+            const int sj = sf + j;
+            if (sj >= 0 && sj < Ns) v += kprof(ktab, a, t - sj) * sino[((size_t)a * Ns + sj) * ks + k];
+        }
+#elif defined(TRAPEZOID)
         const float Aa = fmax(fabs(g.x), fabs(g.y)), hw = 0.5f * (1.0f + Aa), top = fmin(1.0f, Aa), iw = 1.0f / Aa;
         const int sf = (int)floor(t - hw) + 1;                       // first bin the footprint touches
         #pragma unroll
@@ -222,7 +249,8 @@ __kernel void radon_forward_tiled(
     const int Nx, const int Ny, const int Ns, const int R, const int Kstride4, const int k4_off, const int k4_n,
     const float scale, const int W,
     __local float4 *lt,                  // FVR * W * FCQ
-    __local int *lbase                   // FVR
+    __local int *lbase,                  // FVR
+    __global const float *ktab
 ){
     const int q = get_local_id(0), sl = get_local_id(1), al = get_local_id(2);
     const int lid = (al * FSB + sl) * FCQ + q;
@@ -248,7 +276,9 @@ __kernel void radon_forward_tiled(
     const float A = rows_are_y ? g.x : g.y;
     const float B = rows_are_y ? g.y : g.x;
     const float inv = 1.0f / A;
-#ifdef TRAPEZOID
+#if defined(PROFILE)
+    const float hw = PHW;
+#elif defined(TRAPEZOID)
     const float hw = 0.5f * (1.0f + fabs(A)), top = fmin(1.0f, fabs(A)), iw = 1.0f / fabs(A);   // half width, plateau, 1 / A
 #endif
     const int work = active_a && s0 < Ns && kq < k4_n;
@@ -269,7 +299,10 @@ __kernel void radon_forward_tiled(
                 const float Bb = rows_are_y ? gb.y : gb.x;
                 const float ib = 1.0f / Ab;
                 const float c = Bb * v + gb.z;
-#ifdef TRAPEZOID
+#if defined(PROFILE)
+                const float hb = PHW;
+                const float l = fmin((S0 - hb - c) * ib, (S1 - 1 + hb - c) * ib);
+#elif defined(TRAPEZOID)
                 const float hb = 0.5f * (1.0f + fabs(Ab));
                 const float l = fmin((S0 - hb - c) * ib, (S1 - 1 + hb - c) * ib);
 #else
@@ -294,7 +327,7 @@ __kernel void radon_forward_tiled(
                 const int v = v0 + r;
                 // as in radon_forward_k
                 const float c = B * v + g.z;
-#ifdef TRAPEZOID
+#if defined(TRAPEZOID) || defined(PROFILE)
                 const float lo = fmin((s0 - hw - c) * inv, (s0 + NB - 1 + hw - c) * inv);
                 const float hi = fmax((s0 - hw - c) * inv, (s0 + NB - 1 + hw - c) * inv);
 #else
@@ -310,7 +343,9 @@ __kernel void radon_forward_tiled(
                     const float4 val = (w >= 0 && w < W) ? lt[(r * W + w) * FCQ + q] : row[(size_t)u * du];
                     const float t = A * u + c - s0;
                     #pragma unroll
-#ifdef TRAPEZOID
+#if defined(PROFILE)
+                    for (int j = 0; j < NB; ++j) acc[j] += kprof(ktab, a, t - j) * val;
+#elif defined(TRAPEZOID)
                     for (int j = 0; j < NB; ++j) acc[j] += (clamp(hw - fabs(t - j), 0.0f, top) * iw) * val;
 #else
                     for (int j = 0; j < NB; ++j) acc[j] += fmax(1.0f - fabs(t - j), 0.0f) * val;
@@ -334,7 +369,8 @@ __kernel void radon_backward_tiled(
     __global const float4 *sino,         // (R, Ns, Kstride4)
     __global float4 *out,                // (Npix, Kstride4)
     __constant float4 *geo,
-    const int Nx, const int Ny, const int Ns, const int R, const int Kstride4, const int k4_off, const int k4_n
+    const int Nx, const int Ny, const int Ns, const int R, const int Kstride4, const int k4_off, const int k4_n,
+    __global const float *ktab
 ){
     __local float4 ls[BAB][BLMAX][BCQ];
     __local int lsmin[BAB];
@@ -356,7 +392,9 @@ __kernel void radon_backward_tiled(
             const float xa = (float)x0, xb = (float)(x0 + BT - 1), ya = (float)y0, yb = (float)(y0 + BT - 1);
             const float t0 = g.x * xa + g.y * ya + g.z, t1 = g.x * xb + g.y * ya + g.z;
             const float t2 = g.x * xa + g.y * yb + g.z, t3 = g.x * xb + g.y * yb + g.z;
-#ifdef TRAPEZOID
+#if defined(PROFILE)
+            lsmin[lid] = (int)floor(fmin(fmin(t0, t1), fmin(t2, t3)) - PHW);
+#elif defined(TRAPEZOID)
             lsmin[lid] = (int)floor(fmin(fmin(t0, t1), fmin(t2, t3)) - 0.5f * (1.0f + fmax(fabs(g.x), fabs(g.y))));
 #else
             lsmin[lid] = (int)floor(fmin(fmin(t0, t1), fmin(t2, t3))) - 1;
@@ -381,7 +419,15 @@ __kernel void radon_backward_tiled(
                 const int sp = sm + 1;
                 const int lm = sm - lsmin[al], lp = sp - lsmin[al];
                 float4 v = (float4)(0.0f);
-#ifdef TRAPEZOID
+#if defined(PROFILE)
+                const int sf = (int)floor(t - PHW) + 1;
+                #pragma unroll
+                for (int j = 0; j < NTAP; ++j) {
+                    const int sj = sf + j, lj = sj - lsmin[al];
+                    if (sj >= 0 && sj < Ns)
+                        v += kprof(ktab, a, t - sj) * ((lj >= 0 && lj < BLMAX) ? ls[al][lj][q] : sino[((size_t)a * Ns + sj) * ks + k]);
+                }
+#elif defined(TRAPEZOID)
                 const float Aa = fmax(fabs(g.x), fabs(g.y)), hw = 0.5f * (1.0f + Aa), top = fmin(1.0f, Aa), iw = 1.0f / Aa;
                 const int sf = (int)floor(t - hw) + 1;
                 #pragma unroll
