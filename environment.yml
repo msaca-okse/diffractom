@@ -1,4 +1,4 @@
-# The environment diffractom 0.2.0 was tested with (Linux, NVIDIA GPUs through OpenCL).
+# The environment diffractom 0.3.0 was tested with (Linux, NVIDIA GPUs through OpenCL).
 # conda env create -f environment.yml; conda activate diffractom; pip install -e ".[examples]"
 name: diffractom
 
