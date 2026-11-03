@@ -71,10 +71,11 @@ class BeamProfile:
         return f"BeamProfile(width={self.width:.4g}, sigma={self.sigma:.4g})"
 
     def half_support(self) -> float:
-        """Half width (bins) outside which the profile is taken as 0 (box: w / 2 + 6 sigma)."""
+        """Half width (bins) outside which the profile is taken as 0 (box: w / 2 + 4.5 sigma: the Gaussian is 4e-5 of
+        its peak there)."""
         if self.is_tabulated:
             return float(max(-self._x[0], self._x[-1]))
-        return 0.5 * self.width + 6.0 * self.sigma
+        return 0.5 * self.width + 4.5 * self.sigma
 
     def __call__(self, x):
         """The profile b(x) (unit area)."""
