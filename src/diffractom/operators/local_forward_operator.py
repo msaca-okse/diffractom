@@ -128,7 +128,9 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
             rng = np.array(c["angle_range"], dtype=np.float64) / 180 * np.pi
             delta = (rng[1] - rng[0]) / n_or
             angles = np.linspace(rng[0], rng[1], n_or, endpoint=False) + delta / 2
-            fov = fov_support_mask(Nx, Ny, My, angles=angles, image_width=Nx, detector_width=My,
+            vs = c.get("voxel_size")
+            fov = fov_support_mask(Nx, Ny, My, angles=angles,
+                                   image_width=Nx if vs is None else float(vs) * max(Nx, Ny), detector_width=My,
                                    detector_shift=c["cor_offset"])
             support = support.restrict(fov)
         if support.n_pairs == 0:

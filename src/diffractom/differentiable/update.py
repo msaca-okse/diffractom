@@ -135,9 +135,11 @@ def set_proj_parameters(op, cor=None, shift=None):
     if shift is not None:
         op.angle_shift = np.asarray(shift, np.float64).reshape(int(op.N_Omega)).copy()
     old = op.radon
-    op.radon = ParallelRadon(op.queue, (op.Nx, op.Ny), op.angles, op.My, image_width=op.Nx, detector_width=op.My,
+    op.radon = ParallelRadon(op.queue, (op.Nx, op.Ny), op.angles, op.My, image_width=op.image_width, detector_width=op.My,
                              detector_shift=op.detector_shifts(), angle_weights=old.angle_weights, bins_per_item=3,
                              kernel=op.radon_kernel, tiled=old.modes)
     op.release_omega_subsets()
+    if getattr(op, "coefficient_layout", "dense") == "local":
+        op._setup_local()                                # the strips follow the projection geometry
     op._pf_version = getattr(op, "_pf_version", 0) + 1
     return op
