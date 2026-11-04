@@ -20,6 +20,9 @@ from .optimization.pdhg_poisson import PDHGPoisson
 from .optimization.spdhg_poisson import SPDHGPoisson
 from .optimization.fista_sum import FISTASum, estimate_L_sum
 from .optimization.streaming import estimate_L_power_streamed
+from .optimization.fista_gram import FISTAGram
+from .optimization.lcurve import lcurve_corner, lcurve_scan
+from .analysis.orientations import refine_orientations
 
 from .utils.reinterpolation.reinterpolationSO3 import (
     build_interpolation_kernelSO3,
@@ -54,6 +57,10 @@ __all__ = [
     "FISTASum",
     "estimate_L_sum",
     "estimate_L_power_streamed",
+    "FISTAGram",
+    "lcurve_corner",
+    "lcurve_scan",
+    "refine_orientations",
     "BulkTextureForwardOperator",
     "MatrixTomographicOperator",
     "BraggEdgeTomographicOperator",
