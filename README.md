@@ -19,8 +19,9 @@ deformed samples, where the spots merge into rings.
 - **Forward operator.** A pole-figure transform gives, for every kernel orientation, the intensity it
   diffracts into each (ω, η, ring) bin, from the crystal structure and the scan geometry. A parallel-beam
   Radon transform then sums the pixels along the beam at every translation.
-- **Inverse problem.** FISTA solves for non-negative coefficients with a Huber or least-squares data term,
-  optionally with ℓ1 or total-variation regularisation and per-segment data weights.
+- **Inverse problem.** The default data term is the Poisson likelihood of the detected photons, minimised for
+  non-negative coefficients by stochastic primal-dual iterations over subsets of the rotation angles (SPDHG).
+  Least-squares and Huber data terms (FISTA, also with ℓ1 or total-variation regularisation) are available.
 - **Crystal frame.** Orientation matrices U map the crystal Cartesian frame to the sample frame, with the
   crystal frame of ImageD11 (Busing & Levy: a* along x, b* in the xy-plane, c along z), so U from ImageD11
   indexing can be used directly. Before version 0.3 diffractom put a along x, which differs for hexagonal,
@@ -111,7 +112,7 @@ The following runs on the example data from the repository root:
 ```python
 import h5py
 import numpy as np
-from diffractom import Material, Grid, SinglePhaseForwardOperator, FISTAHuber, estimate_L_power_streamed
+from diffractom import Material, Grid, SinglePhaseForwardOperator, SPDHGPoisson
 
 with h5py.File("examples/example_data.h5", "r") as f:
     data = f["data_array"][...].squeeze()     # (N_Omega, My, N_eta, N_rings)
@@ -156,10 +157,11 @@ op = SinglePhaseForwardOperator(cfg=cfg, material=mat, grid=grid, max_gb=0.5, no
 b = data.reshape(N_Omega, My, N_eta * N_rings)
 x = np.zeros(op.coeff_shape, dtype=np.float32)
 
-# FISTA with a Huber data term; x is updated in place (streamed through the GPU)
-L = estimate_L_power_streamed(op, niter=6)
-solver = FISTAHuber(op, prox_kind="nonneg", L=1.1 * L, huber_delta=30)
-x = solver.run(x, b, niter=100, verbose=1, diagnostics_interval=10)
+# Poisson likelihood, minimised by stochastic primal-dual iterations over 8 subsets of the rotation
+# angles; x is updated in place (streamed through the GPU). For measured data pass the counting gain
+# (data units per detected photon, see "Data terms and solvers"); these simulated data need none.
+solver = SPDHGPoisson(op, subsets=8)
+x = solver.run(x, b, n_epochs=30, verbose=1, diagnostics_interval=10)
 prediction = op.direct(x)  # (N_Omega, My, N_eta * N_rings)
 ```
 
@@ -167,54 +169,66 @@ prediction = op.direct(x)  # (N_Omega, My, N_eta * N_rings)
 key can also be passed as a keyword argument of the operator, which overrides
 the dictionary.
 
-The FISTA solvers constrain the reconstruction to the field of view by default
+The solvers constrain the reconstruction to the field of view by default
 (`support="fov"`: the pixels whose centre projects onto the detector at every
 angle, i.e. the disk r <= My/2 - |cor_offset| for a full rotation). This
 assumes that the sample stays in the beam during the scan. `support=None`
 disables the constraint, and an `(Ny, Nx)` boolean array gives a custom
 support.
 
-`FISTAL2` is the same solver with a least-squares data term. Both solvers
-accept `prox_kind` values `"nonneg"`, `"l1"`, `"nonneg_l1"` and `"nonneg_tv"`
-(with the regularisation weight `lam`). `FISTAHuber.run` also takes optional
-`weights`, one per segment (eta bin, ring) and shared by all rotations and
-translations, where zero weight excludes the segment. See
-[docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) for the full API.
+### Data terms and solvers
 
-### Poisson likelihood
+Photon-counting data are Poisson distributed, so diffractom minimises the Poisson
+deviance by default: every data point is weighted by its own counting
+statistics, which matters most for the many low-count and empty bins of a scan.
+Three solvers minimise it, all for non-negative coefficients (`prox_kind`
+`"nonneg"` or `"nonneg_l1"` with weight `lam`):
 
-Photon-counting data are Poisson distributed. `FISTAPoisson` minimises the
-Poisson deviance instead of a least-squares or Huber misfit, so that every
-data point is weighted by its own counting statistics. It needs the counting
-gain of the data (variance / mean, in data units per detected photon), which
-`pyfai_gain` computes from the integration's pyFAI geometry and settings
-(`gain_from_pairs` estimates it from data recorded twice):
+- `SPDHGPoisson(op, subsets=M)` (recommended): stochastic primal-dual hybrid
+  gradient over `M` interleaved subsets of the rotation angles (see below). An
+  epoch over all subsets costs about one forward and one adjoint of the full
+  operator; good fits took 20-50 epochs. Without regularisation the fit gets
+  speckled with many more (as other maximum-likelihood reconstructions): on the
+  example data a few voxels inside grains become nearly empty after 30 epochs,
+  more after 100.
+- `PDHGPoisson`: the deterministic Chambolle-Pock method (diagonally
+  preconditioned, no line search).
+- `FISTAPoisson`: FISTA in a diagonal (separable quadratic surrogate) metric
+  with backtracking, because the likelihood has no global Lipschitz constant.
+
+`run(x0, b, ..., gain=..., background=..., weights=...)`. A NumPy `x0` keeps
+the coefficient arrays in host memory and streams them through the GPU (build
+the operator with `reserve_coefficient_arrays=0`); a pyopencl `x0` keeps
+everything on the GPU. The `gain` is the counting gain of the data (variance /
+mean, in data units per detected photon); `pyfai_gain` computes it from the
+integration's pyFAI geometry and settings (`gain_from_pairs` estimates it from
+data recorded twice):
 
 ```python
-from diffractom import FISTAPoisson, pyfai_gain
+from diffractom import pyfai_gain
 
 # gain per (eta bin, ring) of ring-window sums of pyFAI integrate2d bins, with the integration's settings
 gain, _ = pyfai_gain(ai, mask, npt_rad, N_eta, ring_windows, unit="q_nm^-1", radial_range=radial_range,
                      polarization_factor=polarization_factor)
 gain = gain * ring_scale  # if the data were rescaled per ring (averaging n repeats: divide by n)
-
-solver = FISTAPoisson(op)  # nonnegative, field-of-view support
-x = solver.run(np.zeros(op.coeff_shape, np.float32), b, niter=200, gain=gain, weights=weights)
+x = SPDHGPoisson(op, subsets=8).run(x, b, n_epochs=30, gain=gain, weights=weights)
 ```
 
 The gain may be given per segment, per (translation, segment) or per data
-point, and a known background can be added to the prediction (`background`).
-The solver runs FISTA in a diagonal (separable quadratic surrogate) metric with
-backtracking, because the likelihood has no global Lipschitz constant. As with
-`FISTAHuber`, a NumPy `x0` keeps the coefficients in host memory and streams
-them through the GPU (build the operator with `reserve_coefficient_arrays=0`);
-a pyopencl `x0` keeps everything on the GPU.
+point; data that are not counts (e.g. simulations) need none, since a constant
+gain does not change the minimiser. A known `background` is added to the
+prediction. At low counts it matters: the likelihood penalises a prediction of
+nearly zero where photons were detected, so diffuse scattering under the rings
+should be modelled (or removed in the reduction) rather than left to the
+orientations. The primal-dual step balance `rho` (`"auto"` by default) is
+discussed in the solvers' docstrings.
 
-`PDHGPoisson` solves the same problem with the Chambolle-Pock primal-dual
-method (diagonally preconditioned; no line search; also streamed with a NumPy
-`x0`). It reached good fits in fewer iterations in our tests, but its step
-balance `rho` matters by orders of magnitude: the default `"auto"` is calibrated
-for `SinglePhaseForwardOperator`.
+`FISTAL2` and `FISTAHuber` minimise a least-squares or Huber misfit instead
+(step `L` from `estimate_L_power` or `estimate_L_power_streamed`). They are the
+solvers with total-variation regularisation: `prox_kind` `"nonneg"`, `"l1"`,
+`"nonneg_l1"` and `"nonneg_tv"` (weight `lam`). Their `weights` are one per
+segment (eta bin, ring), zero excluding the segment. See
+[docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) for the full API.
 
 ### Subsets of the rotation angles
 
@@ -232,7 +246,9 @@ iteration, and good fits took several times fewer epochs than PDHGPoisson's or
 FISTAPoisson's iterations (`run(x0, b, n_epochs, ...)`). Each iteration is one
 pass over the orientation batches; with a NumPy `x0` the coefficient arrays
 that do not fit on the GPU (x, z = A^T y, the step sizes; `resident="auto"`)
-stay in host memory and are streamed through it.
+stay in host memory and are streamed through it. Passing lists of angle indices
+that leave some angles out fits the others only (e.g. to hold angles out for
+validation). The local-basis operator below has subsets too.
 
 ### Ring intensities from structure factors
 
@@ -274,7 +290,7 @@ operator as `SinglePhaseForwardOperator` on coefficients that are zero outside t
 support (bitwise, with one patch per orientation).
 
 ```python
-from diffractom import LocalSupport, LocalSinglePhaseForwardOperator, estimate_L_power
+from diffractom import LocalSupport, LocalSinglePhaseForwardOperator, SPDHGPoisson
 
 # cand_iy, cand_ix: voxel of every pbp candidate on the TT grid (row, column);
 # cand_U: its orientation matrix (crystal -> sample), (N, 3, 3); basis: the grid's (K, 3, 3)
@@ -282,8 +298,7 @@ support = LocalSupport.from_candidates(basis, cand_iy, cand_ix, cand_U, "cubic",
                                        tol_deg=1.0, dilate=2)
 op = LocalSinglePhaseForwardOperator(cfg, mat, grid, max_gb=2.0, support=support, normalized=True)
 x = np.zeros(op.coeff_shape, dtype=np.float32)   # flat: only the allowed coefficients
-L = estimate_L_power(op, niter=6)
-x = FISTAHuber(op, prox_kind="nonneg", L=1.1 * L, huber_delta=100).run(x, b, niter=100)
+x = SPDHGPoisson(op, subsets=8).run(x, b, n_epochs=30, gain=gain)
 coeffs = op.to_dense(x)                           # (K, Ny, Nx), zero outside the support
 k, iy, ix, value = op.to_coo(x)                   # the same without the dense array
 ```
@@ -295,9 +310,9 @@ restricted problem also allows a 4-7x larger FISTA step. On synthetic grain maps
 360 x 360 x 14 rings, 4 orientations per grain) a FISTA iteration was 4-13x faster than
 with the global basis, and the coefficients took megabytes instead of gigabytes (numbers
 in `LocalSinglePhaseForwardOperator`'s docstring). The data array and the PF matrix are
-as large as with the global basis. `FISTASum` combines it with global operators (e.g. a
-coarse basis for a fine-grained phase). Not supported: the TV prox, streaming (not
-needed), projectors other than the native one.
+as large as with the global basis. All solvers run on it except the TV prox;
+`FISTASum` combines it with global operators (e.g. a coarse basis for a fine-grained
+phase). Not supported: streaming (not needed), projectors other than the native one.
 
 ## License
 

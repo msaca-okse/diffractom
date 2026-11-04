@@ -23,6 +23,16 @@ shape is a fifth) and those of the coefficient arrays x, z, T that are resident 
 memory and are streamed through the GPU in every pass (x and z up and down, T up). resident="auto" keeps as many on
 the GPU as fit, x first. The objective of the full data needs a full forward: it is computed every
 diagnostics_interval epochs (and at the end), in a pass of its own.
+
+Local basis (LocalSinglePhaseForwardOperator, flat coefficients): all coefficient arrays are on the GPU (they are
+small), and an iteration is the subset adjoint, the update of the whole vector, and the next subset's forward (two
+calls of the operator instead of one fused pass; the same work).
+
+Warm starts: state (solver.state of an earlier run) holds the dual variable y and z = A^T y and continues the run (a
+state without "z": z = A^T y recomputed). After the operator has changed (e.g. differentiable.set_pf_parameters),
+start a new run from the current x without a state (y = 0): in the sandstone refinement the old dual variable made
+the next run diverge (the spots had moved under it), a fresh one gave a steady descent. A dual start consistent
+with x (y = F'(Ax)) diverged as well: where photons fall on a near-zero prediction it is huge.
 """
 import time
 
@@ -134,8 +144,12 @@ class SPDHGPoisson:
     def __init__(self, operator, subsets=8, prox_kind="nonneg", lam=0.0, support="fov", eps_counts=1e-3, rho="auto",
                  seed=0, resident="auto"):
         """subsets: the number of interleaved angle subsets, or a list of angle-index arrays (both passed to
-        operator.set_omega_subsets, which needs the native projector and a sparse PF mode); seed: the order of the
-        subsets within each epoch.
+        operator.set_omega_subsets, which needs the native or FFT projector and a sparse PF mode; also the
+        local-basis operator). Angles in no subset are not fitted (e.g. held out for validation). seed: the order of
+        the subsets within each epoch. rho: as PDHGPoisson's ("auto" = 3e4 / mean(b)^2). Measured (held-out
+        deviance after 100 epochs, M 4-16): sandstone quartz rings (DanMAX 2026, local basis, gain ~20 data units
+        per photon, ~3 photons per data point) best at 0.01-0.1 x auto, 0.15 % better than auto; the noise-free
+        example data best at 1-100 x auto, ~3 % better than auto. M 4, 8, 16 within 0.02 %.
 
         resident: which of the coefficient arrays x, z (= A^T y) and T (the primal steps) stay on the GPU when x0
         is a NumPy array: "auto" (as many as fit in the free device memory, in this order), "all", "none" (all
@@ -179,6 +193,17 @@ class SPDHGPoisson:
                                    np.float32(self.eps_counts), np.int32(0), np.int32(0), np.float32(1.0), n,
                                    self._part.data, cl.LocalMemory(8 * l[0]))
         return float(self._part[:ng].get().sum())
+
+    def _mean_counted(self, a):
+        """Mean of a data-shaped GPU array over the counted points (weight != 0)."""
+        rg, rl, rn, rng_ = reduction(int(a.size))
+        self.dk.mean_counted(self.queue, rg, rl, a.data, self.w.data, np.uint64(self.pw), rn, self._part.data,
+                             cl.LocalMemory(2 * 8 * rl[0]))
+        sa, sn = self._part[:2 * rng_].get().reshape(2, rng_).sum(axis=1)
+        return float(sa / max(sn, 1.0))
+
+    def _gain_mean(self):
+        return 1.0 if self.pg == 0 else float(clarray.sum(self.g).get()) / int(self.g.size)
 
     def _dual(self, m):
         """Dual update on the rows of subset m (A_m x in D there; afterwards the dual change)."""
@@ -260,7 +285,12 @@ class SPDHGPoisson:
         else converted; the coefficient arrays not resident on the GPU, see `resident`, are streamed from host
         memory). callback(epoch, x, stats) after every epoch (a true return value stops the run; x is a host array
         for a NumPy x0). state: solver.state of an earlier run (z = A^T y and the dual variable y), to continue it
-        from the x it returned."""
+        from the x it returned (without "z": z recomputed as A^T y). After the operator has changed (e.g.
+        differentiable.set_pf_parameters), start without a state (y = 0) from the current x: continuing the old dual
+        variable diverged in tests (sandstone refinement), restarting it did not."""
+        if getattr(self.op, "coefficient_layout", "dense") == "local":
+            return self._run_local(x0, b, n_epochs, weights, gain, background, verbose, diagnostics_interval,
+                                   callback, state)
         t_start = time.perf_counter()
         q, op = self.queue, self.op
         cshape, dshape = tuple(op.coeff_shape), tuple(op.data_shape)
@@ -314,13 +344,14 @@ class SPDHGPoisson:
         else:
             A["x"] = _Coeff(host=host_x.reshape(-1), pin_up=self.st.pin_up["x"], pin_dn=self.st.pin_dn["x"],
                             slots=self.st.xs)
+        z_given = state is not None and state.get("z") is not None
         if "z" in res:
             zd = clarray.zeros(q, cshape, np.float32)
-            if state is not None:
+            if z_given:
                 zd.set(as_host(state["z"], cshape, "state['z']"))
             A["z"] = _Coeff(dev=zd)
         else:
-            zh = np.zeros(int(np.prod(cshape)), np.float32) if state is None else \
+            zh = np.zeros(int(np.prod(cshape)), np.float32) if not z_given else \
                 np.array(as_host(state["z"], cshape, "state['z']").reshape(-1))
             A["z"] = _Coeff(host=zh, pin_up=self.st.pin_up["y"], pin_dn=self.st.pin_dn["y"], slots=self.st.ys)
         if "T" in res:
@@ -339,6 +370,8 @@ class SPDHGPoisson:
             g1, n1 = elementwise(npix * bt["K_batch"])
             self.pk.support_ones(q, g1, None, self.dz.data, supp, npx, n1)
             op._direct_batch(self.dz, 0, kmax, ib, self.D)
+        self.scales = {"row_sum_mean": self._mean_counted(self.D), "b_mean": self._mean_counted(self.b),
+                       "gain_mean": self._gain_mean()}
         self.dk.dual_steps(q, gd, None, self.sig.data, self.D.data, self.w.data, np.uint64(self.pw),
                            np.float32(gamma), nd)
         # T from the subsets' column sums over the counted points
@@ -367,6 +400,11 @@ class SPDHGPoisson:
                     xf.reshape(op.K, npix)[:, ~inside] = 0.0
         if state is not None:
             self.y.set(as_host(state["y"], dshape, "state['y']"))
+        if state is not None and not z_given:
+            if A["z"].dev is not None:               # z = A^T y of this operator
+                op.adjoint_cl(self.y, A["z"].dev)
+            else:
+                A["z"].host[:] = np.asarray(op.adjoint(self.y.get()), np.float32).reshape(-1)
         t_setup = time.perf_counter() - t_start
 
         ep0 = int(state["epoch"]) if state is not None else 0
@@ -423,7 +461,8 @@ class SPDHGPoisson:
         self.state = {"epoch": ep0 + len(self.iter_stats),
                       "z": z.dev.get() if z.dev is not None else z.host.reshape(cshape), "y": self.y.get()}
         self.final_stats = {"epochs": len(self.iter_stats), "final_f": f, "setup_s": t_setup, "rho": self.rho_used,
-                            "subsets": self.M, "resident": self.resident_used, "time": time.perf_counter() - t_start}
+                            "subsets": self.M, "resident": self.resident_used, "time": time.perf_counter() - t_start,
+                            **self.scales}
         if A["x"].dev is not None and not x_on_gpu:
             A["x"].dev.get(ary=host_x)
             A["x"].dev.base_data.release()
@@ -441,3 +480,131 @@ class SPDHGPoisson:
         self.b = self.w = self.g = self.bg = self._part = self.y = self.sig = self.D = self.dz = None
         self.arrays = self.st = None
         return x_dev if x_on_gpu else host_x
+
+    # ---------------------------------------------------------------- local basis
+    def _run_local(self, x0, b, n_epochs, weights, gain, background, verbose, diagnostics_interval, callback, state):
+        """run() for an operator with flat coefficients (coefficient_layout "local"): every array on the GPU."""
+        t_start = time.perf_counter()
+        q, op = self.queue, self.op
+        cshape, dshape = tuple(op.coeff_shape), tuple(op.data_shape)
+        nc = int(np.prod(cshape))
+        uploaded = []
+        x_on_gpu = isinstance(x0, clarray.Array)
+        host_x = None if x_on_gpu else as_host(x0, cshape, "x0")
+        x = check_device(x0, cshape, "x0") if x_on_gpu else clarray.to_device(q, host_x)
+        self.b = check_device(b, dshape, "b") if isinstance(b, clarray.Array) else \
+            clarray.to_device(q, as_host(b, dshape, "b"))
+        dummy = clarray.zeros(q, (1,), np.float32)
+        dummy_u8 = clarray.zeros(q, (1,), np.uint8)
+        self.w, self.pw = _periodic(q, weights, dshape, "weights", uploaded)
+        self.g, self.pg = _periodic(q, gain, dshape, "gain", uploaded)
+        self.bg, self.pbg = _periodic(q, background, dshape, "background", uploaded)
+        self.w = self.w if self.w is not None else dummy
+        self.g = self.g if self.g is not None else dummy
+        self.bg = self.bg if self.bg is not None else dummy
+        _, _, _, ng = reduction(int(np.prod(dshape)))
+        self._part = clarray.empty(q, (2 * ng,), np.float64)
+        gd, nd = elementwise(int(np.prod(dshape)))
+        gc, ncc = elementwise(nc)
+        self.y = clarray.zeros(q, dshape, np.float32)
+        self.sig = clarray.empty(q, dshape, np.float32)
+        self.D = clarray.empty(q, dshape, np.float32)
+        z = clarray.zeros(q, cshape, np.float32)
+        T = clarray.empty(q, cshape, np.float32)
+        dz = clarray.empty(q, cshape, np.float32)
+
+        rho = self.rho
+        if rho == "auto":
+            rg, rl, rn, rng_ = reduction(int(np.prod(dshape)))
+            self.dk.mean_counted(q, rg, rl, self.b.data, self.w.data, np.uint64(self.pw), rn, self._part.data,
+                                 cl.LocalMemory(2 * 8 * rl[0]))
+            sb, sn = self._part[:2 * rng_].get().reshape(2, rng_).sum(axis=1)
+            mean_b = sb / max(sn, 1.0)
+            rho = RHO_AUTO / mean_b ** 2 if mean_b > 0 else 1.0
+        self.rho_used = float(rho)
+        gamma = np.sqrt(rho)
+        p = 1.0 / self.M
+        self.resident_used = NAMES
+
+        # S from the row sums A 1 (1 on the allowed coefficients), T from the subsets' column sums over the counted
+        # points
+        ones = clarray.to_device(q, np.ascontiguousarray(op.coefficient_mask(), np.float32))
+        op.direct_cl(ones, self.D)
+        ones.base_data.release()
+        self.scales = {"row_sum_mean": self._mean_counted(self.D), "b_mean": self._mean_counted(self.b),
+                       "gain_mean": self._gain_mean()}
+        self.dk.dual_steps(q, gd, None, self.sig.data, self.D.data, self.w.data, np.uint64(self.pw),
+                           np.float32(gamma), nd)
+        self.dk.set_mask_ones(q, gd, None, self.D.data, self.w.data, np.uint64(self.pw), nd)
+        self.k.tinit(q, gc, None, T.data, np.uint64(0), ncc)
+        for m in range(self.M):
+            op.adjoint_cl(self.D, dz, subset=m)
+            self.k.tmin(q, gc, None, T.data, np.uint64(0), dz.data, dummy_u8.data, np.uint64(0),
+                        np.float32(p / gamma), ncc)
+        self.k.tfinal(q, gc, None, T.data, np.uint64(0), ncc)
+        self.pk.project_support(q, gc, None, x.data, dummy_u8.data, np.uint64(0), ncc)
+        if state is not None:
+            self.y.set(as_host(state["y"], dshape, "state['y']"))
+            if state.get("z") is not None:
+                z.set(as_host(state["z"], cshape, "state['z']"))
+            else:                                # z = A^T y of this operator
+                op.adjoint_cl(self.y, z)
+        t_setup = time.perf_counter() - t_start
+
+        inv_p, lam = np.float32(self.M), np.float32(self.lam)
+        ep0 = int(state["epoch"]) if state is not None else 0
+        self.iter_stats = []
+        f = float("nan")
+        order = self._epoch_order()
+        op.direct_cl(x, self.D, subset=order[0])
+        for e in range(n_epochs):
+            ep = ep0 + e + 1
+            last = e + 1 == n_epochs
+            want_f = (e + 1) % max(1, diagnostics_interval) == 0 or last
+            nxt = None
+            for j, m in enumerate(order):
+                self._dual(m)
+                op.adjoint_cl(self.D, dz, subset=m)
+                self.k.spdhg_update(q, gc, None, x.data, np.uint64(0), z.data, np.uint64(0), T.data, np.uint64(0),
+                                    dz.data, inv_p, lam, ncc)
+                end_of_epoch = j + 1 == self.M
+                if not end_of_epoch:
+                    m_next = order[j + 1]
+                elif not last:
+                    nxt = self._epoch_order()
+                    m_next = nxt[0]
+                else:
+                    m_next = None
+                if end_of_epoch and want_f:
+                    op.direct_cl(x, self.D)          # A x on every row (the next subset's among them)
+                    f = self._deviance(self.D)
+                elif m_next is not None:
+                    op.direct_cl(x, self.D, subset=m_next)
+            if nxt is not None:
+                order = nxt
+            q.finish()
+            stats = {"epoch": ep, "f": f if want_f else None, "rho": self.rho_used,
+                     "time": time.perf_counter() - t_start}
+            self.iter_stats.append(stats)
+            stop = False
+            if callback is not None:
+                if not x_on_gpu:
+                    x.get(ary=host_x)
+                stop = bool(callback(ep, x if x_on_gpu else host_x, stats))
+            if verbose and want_f:
+                print(f"[spdhg epoch {ep:4d}] f={f:.8e} {time.perf_counter() - t_start:.1f} s", flush=True)
+            if stop:
+                break
+        q.finish()
+        self.state = {"epoch": ep0 + len(self.iter_stats), "z": z.get(), "y": self.y.get()}
+        self.final_stats = {"epochs": len(self.iter_stats), "final_f": f, "setup_s": t_setup, "rho": self.rho_used,
+                            "subsets": self.M, "resident": self.resident_used, "time": time.perf_counter() - t_start,
+                            **self.scales}
+        if not x_on_gpu:
+            x.get(ary=host_x)
+            x.base_data.release()
+        for a in (z, T, dz, self.y, self.sig, self.D):
+            a.base_data.release()
+        del uploaded
+        self.b = self.w = self.g = self.bg = self._part = self.y = self.sig = self.D = None
+        return x if x_on_gpu else host_x

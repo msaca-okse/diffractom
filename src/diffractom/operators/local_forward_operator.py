@@ -97,6 +97,10 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
         coefficients and to_dense / to_coo use the grid's order either way.)
     pf_chunk : segments per chunk of the PF products in local memory (default: as many as 32 KB hold for TY lines).
 
+    Omega subsets (set_omega_subsets; direct_cl / adjoint_cl with subset=m) as SinglePhaseForwardOperator's: the strip
+    kernels take the subset's angle list, so a subset costs its share of the angles; the subset rows and subset
+    adjoints equal those of the full operator bitwise. SPDHGPoisson runs on it (all arrays on the GPU).
+
     Only the native projector (radon_kernel "trapezoid" or "hat") and the sparse PF modes ("auto", "sparse",
     "generated"; auto never switches to the dense path here) are supported.
     """
@@ -318,55 +322,85 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
         self._strips = clarray.empty(q, (max(max_strip, 1),), np.float32)
         self._mask = clarray.to_device(q, P["mask"])
         self._alpha = np.float32(R / np.pi)       # as SinglePhaseForwardOperator._adjoint_batch
+        self._all_omegas = clarray.to_device(q, np.arange(R, dtype=np.int32))   # the angle list of the full operator
 
     # ------------------------------------------------------------------ kernels
 
-    def _radon_forward(self, coeffs, lb):
+    def _angles(self, subset):
+        """(angle list on the GPU, number of angles) of the full operator (subset None) or of subset m."""
+        if subset is None:
+            return self._all_omegas, int(self.N_Omega)
+        m = self._subset(subset)
+        return self._sub_omegas[m], len(self.omega_subsets[m])
+
+    def _radon_forward(self, coeffs, lb, subset=None):
         R = int(self.N_Omega)
-        nab = -(-R // RADON_AB)
+        om, Rs = self._angles(subset)
+        nab = -(-Rs // RADON_AB)
         self._k_rf(self.queue, (LS_RADON, RADON_AB * lb["n"] * nab), (LS_RADON, RADON_AB), coeffs.data,
                    self._mask.data, self._strips.data, lb["box"].data, lb["coff"].data, lb["W"].data,
-                   lb["soff"].data, lb["off"].data, self.radon.geo_gpu.data, np.int32(R), self.radon.scale)
+                   lb["soff"].data, lb["off"].data, self.radon.geo_gpu.data, np.int32(R), self.radon.scale,
+                   om.data, np.int32(Rs))
 
-    def _radon_backward(self, coeffs, lb):
+    def _radon_backward(self, coeffs, lb, subset=None):
+        om, Rs = self._angles(subset)
         self._k_rb(self.queue, (lb["n_blk"] * LS_BACK,), (LS_BACK,), self._strips.data, coeffs.data,
                    self._mask.data, lb["blk"].data, lb["box"].data, lb["coff"].data, lb["W"].data,
                    lb["soff"].data, lb["off"].data, self.radon.geo_gpu.data, np.int32(self.N_Omega),
-                   np.int32(self.My))
+                   np.int32(self.My), om.data, np.int32(Rs))
 
     def _pf_args(self, lb):
         return (lb["tile_ptr"].data, lb["tile_patch"].data, lb["pk"].data, lb["W"].data, lb["soff"].data,
                 lb["off"].data)
 
-    def _pf_forward(self, lb, sb, Kb, data):
+    def _pf_forward(self, lb, sb, Kb, data, subset=None, compact=0):
         R = int(self.N_Omega)
-        self._k_pff(self.queue, (LS_PF * R * self._n_tiles,), (LS_PF,), self._strips.data, *self._pf_args(lb),
+        om, Rs = self._angles(subset)
+        self._k_pff(self.queue, (LS_PF * Rs * self._n_tiles,), (LS_PF,), self._strips.data, *self._pf_args(lb),
                     sb["row_ptr_f"].data, sb["col_k"].data, sb["val_f"].data, data.data, np.int32(R),
                     np.int32(self.My), np.int32(self.N_seg), np.int32(Kb), np.int32(self._n_tiles),
-                    cl.LocalMemory(4 * TY * Kb))
+                    cl.LocalMemory(4 * TY * Kb), om.data, np.int32(compact))
 
-    def _pf_adjoint(self, lb, sb, Kb, data):
+    def _pf_adjoint(self, lb, sb, Kb, data, subset=None, compact=0):
         R = int(self.N_Omega)
-        self._k_pfa(self.queue, (LS_PA * R * self._n_tiles,), (LS_PA,), data.data, *self._pf_args(lb),
+        om, Rs = self._angles(subset)
+        self._k_pfa(self.queue, (LS_PA * Rs * self._n_tiles,), (LS_PA,), data.data, *self._pf_args(lb),
                     sb["row_ptr_a"].data, sb["col_j"].data, sb["val_a"].data, self._strips.data, np.int32(R),
                     np.int32(self.My), np.int32(self.N_seg), np.int32(Kb), np.int32(self._n_tiles), np.int32(self._jc),
-                    self._alpha, cl.LocalMemory(4 * TY * self._jc))
+                    self._alpha, cl.LocalMemory(4 * TY * self._jc), om.data, np.int32(compact))
+
+    def _pf_batch_for(self, ib, forward, subset):
+        """(CSR, compact) of batch ib for the full operator or subset m."""
+        if subset is None:
+            return self._pf_batch(ib, forward=forward), 0
+        return self._pf_batch_sub(ib, forward, self._subset(subset))
+
+    def _subset_projectors(self, subsets):
+        """No projectors per subset: the strip kernels take the subset's angle list."""
+        return []
 
     # ------------------------------------------------------------------ operator
 
-    def direct_cl(self, coeffs, data):
-        """data = PF @ Radon(coeffs) in place. coeffs: (n_coef,) float32; data: (N_Omega, My, N_seg), overwritten."""
+    def direct_cl(self, coeffs, data, subset=None):
+        """data = PF @ Radon(coeffs) in place. coeffs: (n_coef,) float32; data: (N_Omega, My, N_seg), overwritten
+        (with subset=m only the rows of the angles of subset m, see set_omega_subsets; the other rows are left as
+        they are)."""
         check_device(coeffs, self.coeff_shape, "coeffs")
         check_device(data, self.data_shape, "data")
-        data.fill(0.0)
+        if subset is None:
+            data.fill(0.0)
+        else:
+            self.zero_subset_rows(data, subset)
         for ib, lb in enumerate(self.local_batches):
             if lb is None:
                 continue
-            self._radon_forward(coeffs, lb)
-            self._pf_forward(lb, self._pf_batch(ib, forward=True), self.batches[ib]["K_batch"], data)
+            self._radon_forward(coeffs, lb, subset)
+            sb, compact = self._pf_batch_for(ib, True, subset)
+            self._pf_forward(lb, sb, self.batches[ib]["K_batch"], data, subset, compact)
 
-    def adjoint_cl(self, data, coeffs):
-        """coeffs = A^T data in place (zero outside the support)."""
+    def adjoint_cl(self, data, coeffs, subset=None):
+        """coeffs = A^T data in place (zero outside the support); subset=m: A_m^T (only the rows of the angles of
+        subset m are read)."""
         check_device(data, self.data_shape, "data")
         check_device(coeffs, self.coeff_shape, "coeffs")
         for ib, lb in enumerate(self.local_batches):
@@ -374,8 +408,9 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
                 continue
             # bins the PF product does not write are read with weight 0 by the backprojection: keep them finite
             cl.enqueue_fill_buffer(self.queue, self._strips.data, np.float32(0), 0, 4 * lb["n_strip"])
-            self._pf_adjoint(lb, self._pf_batch(ib, forward=False), self.batches[ib]["K_batch"], data)
-            self._radon_backward(coeffs, lb)
+            sb, compact = self._pf_batch_for(ib, False, subset)
+            self._pf_adjoint(lb, sb, self.batches[ib]["K_batch"], data, subset, compact)
+            self._radon_backward(coeffs, lb, subset)
 
     def direct(self, coeffs):
         """The forward operator, allocating its output: NumPy (n_coef,) -> NumPy (N_Omega, My, N_seg), or pyopencl
@@ -466,7 +501,7 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
                     if isinstance(v, clarray.Array) and v.base_data is not None:
                         v.base_data.release()
         self.local_batches = None
-        for name in ("_strips", "_mask"):
+        for name in ("_strips", "_mask", "_all_omegas"):
             a = getattr(self, name, None)
             if a is not None and a.base_data is not None:
                 a.base_data.release()
