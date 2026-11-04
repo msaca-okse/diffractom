@@ -18,6 +18,9 @@ from .optimization.fista_l2 import FISTAL2
 from .optimization.fista_poisson import FISTAPoisson
 from .optimization.pdhg_poisson import PDHGPoisson
 from .optimization.spdhg_poisson import SPDHGPoisson
+from .optimization.listmode import ListModeSPDHG, ListModeMLEM
+from .detector import (DetectorPixels, RadialProfiles, DetectorCells, EventList, RawDetectorModel,
+                       powder_ring_scales)
 from .optimization.fista_sum import FISTASum, estimate_L_sum
 from .optimization.streaming import estimate_L_power_streamed
 
@@ -51,6 +54,14 @@ __all__ = [
     "FISTAPoisson",
     "PDHGPoisson",
     "SPDHGPoisson",
+    "ListModeSPDHG",
+    "ListModeMLEM",
+    "DetectorPixels",
+    "RadialProfiles",
+    "DetectorCells",
+    "EventList",
+    "RawDetectorModel",
+    "powder_ring_scales",
     "FISTASum",
     "estimate_L_sum",
     "estimate_L_power_streamed",

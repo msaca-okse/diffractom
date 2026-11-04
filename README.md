@@ -279,6 +279,52 @@ Unnormalised intensities need the background under the rings removed in the
 data reduction and segments partly off the detector excluded
 (`diffractom.utils.segment_coverage`).
 
+### Raw detector counts
+
+Instead of integrated ring data, the model can be fitted to the detector counts themselves
+(`diffractom.detector`): the expected counts of a pixel are its solid angle and polarisation
+factor (from the pyFAI calibration) x a scale per ring x the ring's radial profile at the
+pixel's two-theta x the operator's prediction at the pixel's azimuth (an operator with eta bins
+finer than a pixel, e.g. 0.25 deg, interpolated linearly), and the data term is the Poisson
+likelihood of the raw counts: nothing is normalised or summed in ring windows. Only pixels with
+counts are stored (events); the pixels without counts enter through the sensitivity B^T 1.
+
+```python
+from diffractom import (DetectorPixels, DetectorCells, EventList, RadialProfiles, RawDetectorModel,
+                        ListModeSPDHG, powder_ring_scales)
+
+cfg["N_eta"] = 1440                               # 0.25 deg eta bins
+op = SinglePhaseForwardOperator(cfg, mat, grid, max_gb=2.0, normalized=True)
+pix = DetectorPixels.from_pyfai("calibration.poni", frame_shape, mask=mask, polarization_factor=1.0)
+pix = pix.subset(pix.in_windows(op.two_theta_peaks, half_width))
+builder = EventList.builder(pix, op.N_Omega, op.My)
+for i_omega, i_y, frame in frames:                # raw frames (several may go into one bin)
+    builder.add_dense(i_omega, i_y, frame)
+pixel_events = builder.finish()
+profiles = RadialProfiles.from_powder(pix.two_theta, pixel_events.unit_sums(), pix.factor,
+                                      op.two_theta_peaks, half_width, bin_width=1e-4)
+cells = DetectorCells(pix, profiles, op.N_eta, op.eta_angle_range)
+events = pixel_events.to_cells(cells)
+cells.set_ring_scales(powder_ring_scales(cells, events))
+model = RawDetectorModel(op, cells, events, subsets=8)          # storage="host" for large data
+x = ListModeSPDHG(model, subsets=8).run(np.zeros(op.coeff_shape, np.float32), 200)
+```
+
+`DetectorPixels.from_pyfai` maps pyFAI's azimuth chi onto the operator's eta as an integration
+with `integrate2d` and `eta_angle_range = [0, 360]` does (eta = chi + 180 deg); re-binning raw
+frames this way reproduces such an integration. Cells (`cell_of_pixel`) sum the counts of several
+pixels, which keeps the likelihood exact Poisson and saves memory where most pixels count
+(background). `ListModeSPDHG` is the list-mode SPDHG of Schramm & Holler (2022), with one dual
+variable per event; `ListModeMLEM` (EM / OSEM) is the step-free reference. Not modelled yet:
+background, the position along the beam (parallax), several phases.
+
+On the simulated aluminium samples the raw-detector fit reaches the maps of an integration with
+fine eta bins: ground-truth median misorientation 0.208 deg (1 deg sample) against 0.216 deg for
+the 2-degree integration of the published pipeline and 0.209 deg for one with 0.5-degree bins, at
+10 and 1 photons per intensity unit as well (10 deg sample at 1 photon: 0.325 / 0.330 / 0.324). An
+epoch took 0.21 s for 24 million events (V100), 3.5 times one on the integrated data; the GPU holds
+one data-sized array instead of the four of a fine-eta integrated fit.
+
 ### Local basis: orientations only where they occur
 
 With a global basis every orientation has an image on the whole grid (K x Ny x Nx
