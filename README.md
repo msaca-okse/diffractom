@@ -189,8 +189,11 @@ Three solvers minimise it, all for non-negative coefficients (`prox_kind`
   epoch over all subsets costs about one forward and one adjoint of the full
   operator; good fits took 20-50 epochs. Without regularisation the fit gets
   speckled with many more (as other maximum-likelihood reconstructions): on the
-  example data a few voxels inside grains become nearly empty after 30 epochs,
-  more after 100.
+  example data voxels inside grains become nearly empty (67 after 30 epochs, 107
+  after 100). `tv=` adds the total variation of every orientation's image as one
+  more block of the stochastic iteration; a weight of 1-3 % of the data term at an
+  unregularised fit (`tv = c * D / TV`) left 11-36 such voxels after 100 epochs
+  and predicted held-out angles slightly better.
 - `PDHGPoisson`: the deterministic Chambolle-Pock method (diagonally
   preconditioned, no line search).
 - `FISTAPoisson`: FISTA in a diagonal (separable quadratic surrogate) metric
@@ -224,9 +227,8 @@ orientations. The primal-dual step balance `rho` (`"auto"` by default) is
 discussed in the solvers' docstrings.
 
 `FISTAL2` and `FISTAHuber` minimise a least-squares or Huber misfit instead
-(step `L` from `estimate_L_power` or `estimate_L_power_streamed`). They are the
-solvers with total-variation regularisation: `prox_kind` `"nonneg"`, `"l1"`,
-`"nonneg_l1"` and `"nonneg_tv"` (weight `lam`). Their `weights` are one per
+(step `L` from `estimate_L_power` or `estimate_L_power_streamed`), with
+`prox_kind` `"nonneg"`, `"l1"`, `"nonneg_l1"` and `"nonneg_tv"` (weight `lam`). Their `weights` are one per
 segment (eta bin, ring), zero excluding the segment. See
 [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) for the full API.
 
