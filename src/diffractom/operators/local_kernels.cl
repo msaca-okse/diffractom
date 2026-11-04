@@ -18,6 +18,11 @@
 // strips reach into its tile (tile_ptr, tile_patch: CSR over r * n_tiles + tile, patches in ascending order).
 // The PF matrix of the batch: the forward CSR (rows r * CP + j, columns k ascending) for the forward product, the
 // adjoint CSR (rows r * Kb + k, columns j ascending) for the adjoint.
+//
+// Angles: every kernel works on the Rs angles omegas[0 .. Rs-1] (all R angles in order for the full operator; the
+// angles of one subset for the subset forms of the operator). The strips keep the layout of all R angles (rows of
+// the other angles are not touched). compact = 1: the CSR holds the rows of the listed angles only (row s for
+// angle omegas[s]), as generated or transposed for a subset.
 
 #ifndef NB
 #define NB 3
@@ -40,18 +45,20 @@ __kernel void local_radon_forward(
     __global const int *soff,
     __global const int *off,             // (P, R)
     __constant float4 *geo,
-    const int R, const float scale
+    const int R, const float scale,
+    __global const int *omegas, const int Rs
 ){
     // work-group: get_local_size(1) angles of one patch, get_local_size(0) bins of each at a time
     const int AB = get_local_size(1);
-    const int nab = (R + AB - 1) / AB;
+    const int nab = (Rs + AB - 1) / AB;
     const int p = get_group_id(1) / nab;
-    const int a = (get_group_id(1) - p * nab) * AB + get_local_id(1);
+    const int as = (get_group_id(1) - p * nab) * AB + get_local_id(1);
     const int4 bx = box[p];
     const int Wp = W[p];
     __global const float *cp = coef + coff[p];
     __global const uchar *mp = mask + coff[p];
-    if (a < R) {
+    if (as < Rs) {
+        const int a = omegas[as];
         const int o = off[(size_t)p * R + a];
         const float4 g = geo[a];
         const int rows_are_y = fabs(g.x) >= fabs(g.y);
@@ -127,7 +134,8 @@ __kernel void local_radon_backward(
     __global const int *soff,
     __global const int *off,
     __constant float4 *geo,
-    const int R, const int Ns
+    const int R, const int Ns,
+    __global const int *omegas, const int Rs
 ){
     const int2 b = blk[get_group_id(0)];
     const int p = b.x;
@@ -141,7 +149,8 @@ __kernel void local_radon_backward(
     __global const float *sp = strips + soff[p];
     __global const int *op = off + (size_t)p * R;
     float acc = 0.0f;
-    for (int a = 0; a < R; ++a) {
+    for (int as = 0; as < Rs; ++as) {
+        const int a = omegas[as];
         const float4 g = geo[a];
         const float t = g.x * x + g.y * y + g.z;
         __global const float *sa = sp + (size_t)a * Wp - op[a];       // sa[s]: bin s of the strip
@@ -183,11 +192,14 @@ __kernel void local_pf_forward(
     __global const float *val,
     __global float *data,                // (R, My, CP)
     const int R, const int My, const int CP, const int Kb, const int n_tiles,
-    __local float *tab                   // TY * Kb
+    __local float *tab,                  // TY * Kb
+    __global const int *omegas, const int compact
 ){
     const int lid = get_local_id(0), ls = get_local_size(0);
-    const int gid = get_group_id(0);
-    const int r = gid / n_tiles, tile = gid - r * n_tiles;
+    const int rs = get_group_id(0) / n_tiles, tile = get_group_id(0) - rs * n_tiles;
+    const int r = omegas[rs];
+    const int gid = r * n_tiles + tile;
+    const int rr = compact ? rs : r;     // the CSR row block of the angle
     const int y0 = tile * TY, ny = min(TY, My - y0);
     const int i0 = tile_ptr[gid], i1 = tile_ptr[gid + 1];
     if (i0 == i1) return;
@@ -215,8 +227,8 @@ __kernel void local_pf_forward(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int j = lid; j < CP; j += ls) {
-        int e = row_ptr[r * CP + j];
-        const int e1 = row_ptr[r * CP + j + 1];
+        int e = row_ptr[rr * CP + j];
+        const int e1 = row_ptr[rr * CP + j + 1];
         if (e == e1) continue;
         float acc[TY];
         #pragma unroll
@@ -261,11 +273,14 @@ __kernel void local_pf_adjoint(
     __global const float *val,
     __global float *strips,
     const int R, const int My, const int CP, const int Kb, const int n_tiles, const int JC, const float alpha,
-    __local float *ld                    // TY * JC
+    __local float *ld,                   // TY * JC
+    __global const int *omegas, const int compact
 ){
     const int lid = get_local_id(0), ls = get_local_size(0);
-    const int gid = get_group_id(0);
-    const int r = gid / n_tiles, tile = gid - r * n_tiles;
+    const int rs = get_group_id(0) / n_tiles, tile = get_group_id(0) - rs * n_tiles;
+    const int r = omegas[rs];
+    const int gid = r * n_tiles + tile;
+    const int rr = compact ? rs : r;
     const int y0 = tile * TY, ny = min(TY, My - y0);
     const int i0 = tile_ptr[gid], i1 = tile_ptr[gid + 1];
     if (i0 == i1) return;
@@ -286,7 +301,7 @@ __kernel void local_pf_adjoint(
             float acc[TY];
             #pragma unroll
             for (int t = 0; t < TY; ++t) acc[t] = (j0 > 0 && t >= tlo && t < thi) ? st[t] : 0.0f;
-            const int row = r * Kb + pk[p];
+            const int row = rr * Kb + pk[p];
             const int e1 = row_ptr[row + 1];
             for (int e = lower_bound_u16(col_j, row_ptr[row], e1, j0); e < e1; ++e) {
                 const int seg = (int)col_j[e] - j0;

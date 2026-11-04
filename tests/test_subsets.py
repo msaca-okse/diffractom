@@ -169,3 +169,91 @@ def test_spdhg_streamed_and_resumed():
     x = two.run(x, b, 2, diagnostics_interval=2, state=two.state)
     assert two.state["epoch"] == 6
     np.testing.assert_allclose(x, x_ref, rtol=1e-5, atol=1e-6 * np.abs(x_ref).max())
+
+
+def _local_operator(ctx, queue, pf_mode, max_gb=1e-4, split_patches=True):
+    """The geometry of _operator with a local basis: every orientation in one or two discs of the grid."""
+    from diffractom import Grid, LocalSinglePhaseForwardOperator, LocalSupport, Material
+    mat = Material.from_lattice_parameters(a=4.05, b=4.05, c=4.05, alpha=90, beta=90, gamma=90, symmetry_group="cubic",
+                                           wavelength_A=0.35, hkl_list=np.array([[1, 1, 1], [2, 0, 0], [2, 2, 0]]))
+    cfg = {"Nx": 20, "Ny": 20, "My": 21, "N_Omega": 30, "angle_range": [0, 360], "cor_offset": 0.5,
+           "N_eta": 36, "eta_angle_range": [0, 360], "energy": 12.398 / 0.35, "k_direction_0": [0, 0, 1],
+           "p_direction_0": [1, 0, 0], "detector_direction_origin": [0, -1, 0],
+           "detector_direction_positive_90": [0, 0, -1]}
+    np.random.seed(5)
+    grid = Grid.from_random_fundamental_zone(30, "cubic", np.deg2rad(4.0))
+    rng = np.random.default_rng(3)
+    yy, xx = np.mgrid[:20, :20]
+    mask = np.zeros((30, 20, 20), bool)
+    for k in range(30):
+        for _ in range(1 + k % 2):
+            cy, cx, r = rng.uniform(3, 17), rng.uniform(3, 17), rng.uniform(1.5, 4)
+            mask[k] |= (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
+    return LocalSinglePhaseForwardOperator(cfg, mat, grid, max_gb, support=LocalSupport.from_mask(mask),
+                                           normalized=True, pf_mode=pf_mode, sparse_batch_max=8,
+                                           split_patches=split_patches, ctx=ctx, queue=queue)
+
+
+@pytest.mark.parametrize("pf_mode", ["sparse", "generated"])
+def test_local_subsets(pf_mode):
+    """Subsets of the local-basis operator: the subset forward gives the full forward's rows bitwise (other rows
+    untouched), the subset adjoint the full adjoint of the data zeroed outside the subset's rows bitwise, the subset
+    adjoints of a partition sum to the full adjoint, and each subset adjoint is the transpose of its forward."""
+    import pyopencl.array as clarray
+    ctx, queue = _context()
+    op = _local_operator(ctx, queue, pf_mode)
+    assert len(op.batches) > 1 and op.pf_mode == pf_mode
+    R = op.N_Omega
+    rng = np.random.default_rng(6)
+    x = rng.random(op.coeff_shape).astype(np.float32)
+    y = rng.random(op.data_shape).astype(np.float32)
+    full, adj = op.direct(x), op.adjoint(y)
+    for subsets in (4, [np.arange(0, 7), np.arange(7, 20), np.arange(20, R)]):
+        subs = op.set_omega_subsets(subsets)
+        xd, yd = clarray.to_device(queue, x), clarray.to_device(queue, y)
+        adj_sum = np.zeros_like(adj)
+        for m, s in enumerate(subs):
+            d = clarray.to_device(queue, np.full(op.data_shape, -7.0, np.float32))
+            op.direct_cl(xd, d, subset=m)
+            d = d.get()
+            assert np.array_equal(d[s], full[s])
+            assert np.all(d[np.setdiff1d(np.arange(R), s)] == -7.0)
+            a_m = clarray.empty(queue, op.coeff_shape, np.float32)
+            op.adjoint_cl(yd, a_m, subset=m)
+            a_m = a_m.get()
+            ym = np.zeros_like(y)
+            ym[s] = y[s]
+            assert np.array_equal(a_m, op.adjoint(ym))
+            adj_sum += a_m
+            lhs = float(np.dot(d[s].ravel().astype(np.float64), y[s].ravel()))
+            rhs = float(np.dot(x.astype(np.float64), a_m))
+            assert abs(lhs / rhs - 1) < 1e-5
+        np.testing.assert_allclose(adj_sum, adj, rtol=1e-4, atol=1e-5 * np.abs(adj).max())
+
+
+def test_spdhg_local_basis():
+    """SPDHG on the local-basis operator reaches the objective of a long FISTAPoisson run. Its state keeps z = A^T y,
+    and a warm start from a state without z (z recomputed, as after an operator change) continues the run."""
+    import pyopencl.array as clarray
+    from diffractom import FISTAPoisson, SPDHGPoisson
+    ctx, queue = _context()
+    op = _local_operator(ctx, queue, "sparse")
+    rng = np.random.default_rng(7)
+    x_true = (rng.random(op.coeff_shape) * (rng.random(op.coeff_shape) < 0.3)).astype(np.float32)
+    gain = 0.05
+    b = (rng.poisson(op.direct(x_true) / gain) * gain).astype(np.float32)
+    ref = FISTAPoisson(op)
+    ref.run(clarray.zeros(queue, op.coeff_shape, np.float32), b, niter=3000, gain=gain)
+    f_ref = ref.final_stats["final_f"]
+    sp = SPDHGPoisson(op, subsets=4)
+    x = sp.run(np.zeros(op.coeff_shape, np.float32), b, n_epochs=300, gain=gain, diagnostics_interval=100)
+    f300 = sp.final_stats["final_f"]
+    assert f300 <= f_ref * (1 + 2e-3)
+    st = sp.state
+    z = op.adjoint(st["y"])
+    np.testing.assert_allclose(st["z"], z, rtol=1e-4, atol=1e-5 * np.abs(z).max())
+    for state in (st, {"y": st["y"], "epoch": st["epoch"]}):
+        s2 = SPDHGPoisson(op, subsets=4, seed=3)
+        s2.run(x.copy(), b, n_epochs=50, gain=gain, diagnostics_interval=50, state=state)
+        assert s2.state["epoch"] == 350
+        assert s2.final_stats["final_f"] <= f300 * (1 + 1e-4)

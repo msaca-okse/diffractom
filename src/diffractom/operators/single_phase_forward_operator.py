@@ -1432,17 +1432,7 @@ class SinglePhaseForwardOperator:
         self.release_omega_subsets()
         self.omega_subsets = out
         self._sub_omegas = [clarray.to_device(self.queue, s.astype(np.int32)) for s in out]
-        self._sub_radon = []
-        if self.projector == "fft":           # sharing the 2D grid buffers and FFT plans of self.fradon
-            self._sub_radon = [self.fradon.subset(s) for s in out]
-        else:   # the kernels (tiled or plain, ParallelRadon tiled="auto") are timed for the first subset
-            for s in out:
-                self._sub_radon.append(ParallelRadon(
-                    self.queue, (self.Nx, self.Ny), self.angles[s], self.My, image_width=self.image_width,
-                    detector_width=self.My, detector_shift=self.detector_shifts()[s],
-                    angle_weights=np.pi / R * getattr(self, '_bp_scale', 1.0),
-                    bins_per_item=3,
-                    kernel=self.radon_kernel, tiled=self._sub_radon[0].modes if self._sub_radon else "auto"))
+        self._sub_radon = self._subset_projectors(out)
         self._sub_prg = cl.Program(self.ctx, SUBSET_KERNELS).build(options=[f"-DSPMM_TY={SPMM_TY}"])
         self._sub_k = {n: cl.Kernel(self._sub_prg, n) for n in ("spmm_pf_forward_sub", "spmm_pf_adjoint_sub",
                                                                 "zero_rows")}
@@ -1456,6 +1446,21 @@ class SinglePhaseForwardOperator:
                     self._sub_caps[m][ib] = self.pf_gen.count_candidates([b], om)[0]
                 else:
                     self._sub_caps[m][ib] = self.pf_gen.count_subset_entries(sb, b["K_batch"], om)
+        return out
+
+    def _subset_projectors(self, subsets):
+        """The projector of every subset's angles (set_omega_subsets)."""
+        R = int(self.N_Omega)
+        if self.projector == "fft":           # sharing the 2D grid buffers and FFT plans of self.fradon
+            return [self.fradon.subset(s) for s in subsets]
+        out = []   # the kernels (tiled or plain, ParallelRadon tiled="auto") are timed for the first subset
+        for s in subsets:
+            out.append(ParallelRadon(
+                self.queue, (self.Nx, self.Ny), self.angles[s], self.My, image_width=self.image_width,
+                detector_width=self.My, detector_shift=self.detector_shifts()[s],
+                angle_weights=np.pi / R * getattr(self, '_bp_scale', 1.0),
+                bins_per_item=3,
+                kernel=self.radon_kernel, tiled=out[0].modes if out else "auto"))
         return out
 
     def detector_shifts(self):
