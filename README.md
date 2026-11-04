@@ -299,6 +299,70 @@ as large as with the global basis. `FISTASum` combines it with global operators 
 coarse basis for a fine-grained phase). Not supported: the TV prox, streaming (not
 needed), projectors other than the native one.
 
+### Orientations between the kernels, a Gram-form solver, the L-curve
+
+Three tools whose ideas come from textom (M. Frewein, M. Allain, T. Grünewald et al.,
+[gitlab.fresnel.fr/textom/textom](https://gitlab.fresnel.fr/textom/textom); Frewein et al., IUCrJ 11,
+809-820, 2024), implemented independently for diffractom's operators (no textom code is used):
+
+- `refine_orientations(coeffs, grid_mats, sigmas, symmetry)`: the orientation of each voxel as the
+  maximum of its ODF next to the strongest kernel, found by mean shift (Fukunaga & Hostetler 1975;
+  Cheng 1995), so that it can lie between the basis orientations. Also returns the shift from the
+  strongest kernel and the orientation spread of the dominant component.
+- `FISTAGram`: weighted least squares with FISTA in Gram form. Per rotation, G = P W P^T (K x K) and
+  B = b W P^T are formed once; an iteration projects the orientation images, multiplies by G and
+  backprojects, without touching the data array. Same iterates as `FISTAHuber` with
+  `huber_delta=inf` (0/1 weights); G takes N_Omega K^2 floats, so it suits bases of up to a few
+  thousand orientations.
+- `lcurve_scan(make_solver, x0, b, lams, niter)` and `lcurve_corner(residual, penalty)`: a
+  regularisation weight from the corner of the L-curve (Hansen 1992; Hansen & O'Leary 1993), taken as
+  the point of largest Menger curvature on the normalised log-log curve.
+
+```python
+from diffractom import FISTAGram, FISTAHuber, lcurve_scan, refine_orientations
+
+solver = FISTAGram(op, L=1.1 * L)                    # G and B are built on the first run
+x = solver.run(np.zeros(op.coeff_shape, np.float32), b, niter=200, weights=weights)
+
+res = refine_orientations(x, grid_mats, sigmas, symmetry="cubic")
+orientations = res["orientations"]                   # (Ny, Nx, 3, 3), NaN where empty
+
+scan = lcurve_scan(lambda lam: FISTAHuber(op, prox_kind="nonneg_tv", lam=lam, L=1.1 * L),
+                   x0, b, lams, niter=100, weights=weights)
+lam = scan["lam"]                                    # the weight at the corner
+```
+
+On the simulated aluminium samples of the article (99 x 99 voxels, 360 rotations, 180 eta bins x
+16 rings), median misorientation to the ground truth with the weighted medoid of the 24 strongest
+kernels and with `refine_orientations`:
+
+| sample, basis | K | medoid | mean shift |
+|---|---|---|---|
+| 1 deg, indexed (sigma 0.4 deg) | 345 | 0.216 | 0.194 |
+| 1 deg, bulk ODF | 2 320 | 0.237 | 0.209 |
+| 1 deg, uniform (sigma 1.3 deg) | 100 260 | 1.057 | 0.544 |
+| 10 deg, indexed | 3 025 | 0.329 | 0.291 |
+| 10 deg, bulk ODF | 14 719 | 0.325 | 0.308 |
+| 10 deg, uniform | 100 260 | 1.243 | 0.794 |
+
+The share of voxels more than 5 deg off rises slightly on the fine bases (e.g. 3.9 to 4.2 %, 10 deg
+indexed). FISTAGram on one V100 (100 iterations, iterates equal to FISTAHuber's to 1e-6):
+
+| sample, basis | K | FISTAHuber s/it | FISTAGram s/it | G |
+|---|---|---|---|---|
+| 1 deg, indexed (sigma 0.4 deg, sparse PF) | 345 | 0.027 | 0.010 | 0.17 GB |
+| 10 deg, cubochoric grid 10 deg (sigma 7.5 deg, dense PF) | 791 | 0.274 (0.084 with the PF kept in one batch) | 0.027 | 0.9 GB |
+| 10 deg, cubochoric grid 7.5 deg (sigma 5.6 deg, dense PF) | 1 975 | 0.608 (0.202 in one batch) | 0.098 | 5.6 GB |
+
+Building G and B took 0.7-2.2 s.
+
+The L-curve needs a problem that wants regularisation. On the 1 deg sample with the indexed basis and
+TV (`FISTAHuber`, `prox_kind="nonneg_tv"`, 100 iterations, 8 weights from 1e-4 to 3e-2 of the
+coefficients' 99th percentile) it does not: without noise and with Poisson noise of 200 counts in the
+brightest bin the best map is the unregularised one (median 0.221 / 0.223 deg), with 20 counts the
+smallest weight (0.227 vs 0.233 deg). The corner lay at 2.7-6.1e-3, where the maps are 6-12 % worse
+(0.247-0.249 deg): there it over-regularises. Check a weight chosen this way on held-out data.
+
 ## License
 
 Apache License 2.0
