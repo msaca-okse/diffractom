@@ -24,6 +24,8 @@ import pyopencl.array as clarray
 
 from ..utils.arrays import check_device
 
+BG_LMAX = 2048        # largest background basis per frame group summed in local memory by bg_scatter
+
 KERNELS = r"""
 inline void atomic_add_f(volatile __global float *p, const float v) {
     union { unsigned int u; float f; } old, nw;
@@ -63,6 +65,66 @@ __kernel void ev_scatter(__global float *M, __global const int *frame, __global 
     }
 }
 
+// background: mu[e] += exposure[frame] * sum_t bw[t] beta[group[frame] * L + bidx[t]]
+__kernel void bg_gather(__global const float *beta, __global const int *frame, __global const int *cell,
+                        __global const int *bptr, __global const int *bidx, __global const float *bw,
+                        __global const int *grp, __global const float *expo, __global float *mu, const ulong e0,
+                        const ulong n, const ulong L)
+{
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        const size_t e = e0 + i;
+        const int f = frame[e], c = cell[e];
+        const __global float *bb = beta + (size_t)grp[f] * L;
+        float acc = 0.0f;
+        for (int t = bptr[c]; t < bptr[c + 1]; ++t) acc += bw[t] * bb[bidx[t]];
+        mu[e] += expo[f] * acc;
+    }
+}
+
+inline void atomic_add_l(volatile __local float *p, const float v) {
+    union { unsigned int u; float f; } old, nw;
+    do { old.f = *p; nw.f = old.f + v; } while (atomic_cmpxchg((volatile __local unsigned int *)p, old.u, nw.u) != old.u);
+}
+
+// gbeta[group * L + bidx[t]] += exposure * bw[t] * r[e]: a work-group sums a block of `chunk` events in local
+// memory when the block lies in one frame group (events are ordered by frame), else adds to global memory directly
+__kernel void bg_scatter(__global float *gbeta, __global const int *frame, __global const int *cell,
+                         __global const int *bptr, __global const int *bidx, __global const float *bw,
+                         __global const int *grp, __global const float *expo, __global const float *r,
+                         const ulong e0, const ulong n, const ulong L, const ulong chunk)
+{
+    __local float acc[BG_LMAX];
+    const size_t a = get_group_id(0) * chunk;
+    if (a >= n) return;
+    const size_t b = min(a + chunk, n);
+    const size_t lid = get_local_id(0), ls = get_local_size(0);
+    const int g0 = grp[frame[e0 + a]], g1 = grp[frame[e0 + b - 1]];
+    if (g0 == g1 && L <= BG_LMAX) {
+        for (size_t l = lid; l < L; l += ls) acc[l] = 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (size_t i = a + lid; i < b; i += ls) {
+            const size_t e = e0 + i;
+            const float re = r[e];
+            if (re == 0.0f) continue;
+            const int f = frame[e], c = cell[e];
+            const float v = expo[f] * re;
+            for (int t = bptr[c]; t < bptr[c + 1]; ++t) atomic_add_l(acc + bidx[t], bw[t] * v);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (size_t l = lid; l < L; l += ls) if (acc[l] != 0.0f) atomic_add_f(gbeta + (size_t)g0 * L + l, acc[l]);
+    } else {
+        for (size_t i = a + lid; i < b; i += ls) {
+            const size_t e = e0 + i;
+            const float re = r[e];
+            if (re == 0.0f) continue;
+            const int f = frame[e], c = cell[e];
+            const float v = expo[f] * re;
+            for (int t = bptr[c]; t < bptr[c + 1]; ++t)
+                atomic_add_f(gbeta + (size_t)grp[f] * L + bidx[t], bw[t] * v);
+        }
+    }
+}
+
 // rows of the angles omegas[0 .. n_om - 1] (all angles: omegas = 0 .. N_Omega - 1): M[i] = exposure[frame] * tot[seg]
 __kernel void fill_sensitivity(__global float *M, __global const int *omegas, __global const float *expo,
                                __global const float *tot, const ulong My, const ulong nseg, const ulong n)
@@ -90,7 +152,7 @@ class RawDetectorModel:
     """
 
     def __init__(self, operator, cells, events, background=None, background_total=None, subsets=1, storage="gpu",
-                 chunk_events=1 << 24):
+                 chunk_events=1 << 24, background_basis=None):
         op = operator
         self.op = op
         self.queue = op.queue
@@ -122,8 +184,19 @@ class RawDetectorModel:
             raise ValueError("background: one value per event")
         self.background_total = float(background_total) if background_total is not None else (
             0.0 if background is None else float("nan"))
-        self.prg = cl.Program(self.ctx, KERNELS).build()
-        self.k = {n: cl.Kernel(self.prg, n) for n in ("ev_gather", "ev_scatter", "fill_sensitivity")}
+        self.prg = cl.Program(self.ctx, KERNELS).build(options=[f"-DBG_LMAX={BG_LMAX}"])
+        self.k = {n: cl.Kernel(self.prg, n) for n in ("ev_gather", "ev_scatter", "fill_sensitivity", "bg_gather",
+                                                      "bg_scatter")}
+        self.bgb = background_basis
+        if background_basis is not None:
+            bb = background_basis
+            if bb.n_cells != cells.n_cells or len(bb.group_of_frame) != int(op.N_Omega) * int(op.My):
+                raise ValueError("background basis: other cells or frames than the model")
+            q = op.queue
+            self.bptr_gpu = clarray.to_device(q, bb.ptr.astype(np.int32))
+            self.bidx_gpu = clarray.to_device(q, bb.idx.astype(np.int32))
+            self.bw_gpu = clarray.to_device(q, bb.w.astype(np.float32))
+            self.grp_gpu = clarray.to_device(q, bb.group_of_frame.astype(np.int32))
         self.expo_gpu = clarray.to_device(self.queue, events.exposure.ravel().astype(np.float32))
         self._upload_cells()
         self.M = clarray.zeros(self.queue, op.data_shape, np.float32)
@@ -166,6 +239,12 @@ class RawDetectorModel:
         self.ev_start = np.searchsorted(sub[self.order], np.arange(M + 1)).astype(np.int64)
         self._sub_omegas = [clarray.to_device(self.queue, s.astype(np.int32)) for s in self.subsets]
         q = self.queue
+        if self.bgb is not None:
+            om_of_frame = np.arange(self.n_frames) // op.My
+            expo = ev.exposure.ravel()
+            self.bg_sens_sub = [self.bgb.sensitivity(expo, np.flatnonzero(sub_of_omega[om_of_frame] == m))
+                                for m in range(M)]
+            self.bg_sens = self.bgb.sensitivity(expo)
         self._ev_arrays = {}
         self._work = None
         if self.storage == "gpu":
@@ -262,6 +341,23 @@ class RawDetectorModel:
                      self.seg_gpu.data, self.w_gpu.data, self.expo_gpu.data, arr["mu"].data, np.uint64(off),
                      np.uint64(n), np.uint64(self.n_seg))
 
+    def _bg_gather(self, beta, arr, off, n):
+        self._launch("bg_gather", n, beta.data, arr["frame"].data, arr["cell"].data, self.bptr_gpu.data,
+                     self.bidx_gpu.data, self.bw_gpu.data, self.grp_gpu.data, self.expo_gpu.data, arr["mu"].data,
+                     np.uint64(off), np.uint64(n), np.uint64(self.bgb.L))
+
+    def _bg_scatter(self, beta_out, arr, off, n):
+        if n == 0:
+            return
+        chunk = 8192
+        ls = 256
+        n_wg = (int(n) + chunk - 1) // chunk
+        k = self.k["bg_scatter"]
+        k.set_args(beta_out.data, arr["frame"].data, arr["cell"].data, self.bptr_gpu.data, self.bidx_gpu.data,
+                   self.bw_gpu.data, self.grp_gpu.data, self.expo_gpu.data, arr["mu"].data, np.uint64(off),
+                   np.uint64(n), np.uint64(self.bgb.L), np.uint64(chunk))
+        cl.enqueue_nd_range_kernel(self.queue, k, (n_wg * ls,), (ls,))
+
     def _zero_rows(self, target, subset):
         sub = self._op_subset(subset)
         if sub is None:
@@ -269,38 +365,50 @@ class RawDetectorModel:
         else:
             self.op.zero_subset_rows(target, sub)
 
-    def event_pass(self, coeffs, out, subset, fn, names=(), write_back=()):
+    def event_pass(self, coeffs, out, subset, fn, names=(), write_back=(), beta=None, beta_out=None):
         """One pass of a solver over the events of a subset:
             M = A_m x;  per chunk: mu = W M (arrays["mu"]), fn(arrays, off, n), back-projection of arrays["mu"];
             out = A_m^T (the back-projection).
         fn launches the per-event kernels on events off .. off + n - 1 of the device buffers in arrays ("frame",
         "cell", "count", "bg" if any, "mu" and the event arrays in names) and leaves the values to back-project in
-        "mu". Event arrays in write_back are copied back to host memory (storage "host")."""
+        "mu". Event arrays in write_back are copied back to host memory (storage "host"). With a background basis:
+        beta (GPU, (n_groups, L)) adds the background to mu before fn, and beta_out (if given) receives its
+        back-projection (overwritten)."""
         sub = self._op_subset(subset)
         self.op.direct_cl(coeffs, self.M, subset=sub)
         chunks = self.chunks(subset)
+        if beta_out is not None:
+            beta_out.fill(0.0)
         if self.storage == "gpu":
             for a, b in chunks:
                 arr, off, n = self._bind(a, b, names)
                 self._gather(arr, off, n)
+                if beta is not None:
+                    self._bg_gather(beta, arr, off, n)
                 fn(arr, off, n)
             self._zero_rows(self.M, subset)
             for a, b in chunks:
                 arr, off, n = self._bind(a, b, names)
                 self._scatter(arr, off, n, self.M)
+                if beta_out is not None:
+                    self._bg_scatter(beta_out, arr, off, n)
             self.op.adjoint_cl(self.M, out, subset=sub)
             return
         self._zero_rows(self.G, subset)
         for a, b in chunks:
             arr, off, n = self._bind(a, b, names)
             self._gather(arr, off, n)
+            if beta is not None:
+                self._bg_gather(beta, arr, off, n)
             fn(arr, off, n)
             self._scatter(arr, off, n, self.G)
+            if beta_out is not None:
+                self._bg_scatter(beta_out, arr, off, n)
             for nm in write_back:
                 cl.enqueue_copy(self.queue, self._ev_arrays[nm][a:b], arr[nm].data)
         self.op.adjoint_cl(self.G, out, subset=sub)
 
-    def event_values(self, coeffs, fn, reduce, subset=None):
+    def event_values(self, coeffs, fn, reduce, subset=None, beta=None):
         """sum over chunks of reduce(arrays, off, n) after mu = B x and fn(arrays, off, n) (fn may be None), over the
         subset's events (all events for None): e.g. the log-likelihood of the solvers' objective."""
         total = 0.0
@@ -311,31 +419,43 @@ class RawDetectorModel:
             for a, b in self.chunks(msub):
                 arr, off, n = self._bind(a, b, ())
                 self._gather(arr, off, n)
+                if beta is not None:
+                    self._bg_gather(beta, arr, off, n)
                 if fn is not None:
                     fn(arr, off, n)
                 total += float(reduce(arr, off, n))
         return total
 
     # ---------------------------------------------------------------- the model as arrays
-    def forward_cl(self, coeffs, mu, subset=None):
+    def forward_cl(self, coeffs, mu, subset=None, beta=None, weights=None, compute_M=True):
         """mu[events of the subset] = (B x) there (no background), in the model's event order: mu is an
         (n_events,) float32 pyopencl array (storage "gpu") or NumPy array (storage "host")."""
         if self.storage == "gpu":
             check_device(mu, (self.n_events,), "mu")
-        self.op.direct_cl(coeffs, self.M, subset=self._op_subset(subset))
+        if compute_M:
+            self.op.direct_cl(coeffs, self.M, subset=self._op_subset(subset))
         for a, b in self.chunks(subset):
             arr, off, n = self._bind(a, b, ())
             if self.storage == "gpu":
                 arr["mu"] = mu
-            self._gather(arr, off, n)
+            if weights is None:
+                self._gather(arr, off, n)
+            else:                                   # other cell weights (e.g. a derivative), aligned with cells.w
+                self._launch("ev_gather", n, self.M.data, arr["frame"].data, arr["cell"].data, self.ptr_gpu.data,
+                             self.seg_gpu.data, weights.data, self.expo_gpu.data, arr["mu"].data, np.uint64(off),
+                             np.uint64(n), np.uint64(self.n_seg))
+            if beta is not None:
+                self._bg_gather(beta, arr, off, n)
             if self.storage == "host":
                 cl.enqueue_copy(self.queue, mu[a:b], arr["mu"].data)
 
-    def adjoint_cl(self, r, coeffs, subset=None):
+    def adjoint_cl(self, r, coeffs, subset=None, beta_out=None):
         """coeffs = B_m^T r (r: (n_events,) in the model's order, a pyopencl array for storage "gpu", NumPy for
         "host"; only the subset's events are read)."""
         target = self.G
         self._zero_rows(target, subset)
+        if beta_out is not None:
+            beta_out.fill(0.0)
         for a, b in self.chunks(subset):
             arr, off, n = self._bind(a, b, ())
             if self.storage == "gpu":
@@ -344,6 +464,8 @@ class RawDetectorModel:
             else:
                 cl.enqueue_copy(self.queue, arr["mu"].data, np.ascontiguousarray(r[a:b], dtype=np.float32))
             self._scatter(arr, off, n, target)
+            if beta_out is not None:
+                self._bg_scatter(beta_out, arr, off, n)
         self.op.adjoint_cl(target, coeffs, subset=self._op_subset(subset))
 
     def sensitivity_cl(self, coeffs, subset=None):
@@ -359,28 +481,35 @@ class RawDetectorModel:
     def _host_events(self):
         return np.zeros(self.n_events, np.float32)
 
-    def forward(self, coeffs):
-        """(n_events,) B x in the model's event order (model.count_cpu has the counts in that order)."""
+    def forward(self, coeffs, beta=None):
+        """(n_events,) B x (+ the background for beta) in the model's event order (model.count_cpu has the counts
+        in that order)."""
         x = clarray.to_device(self.queue, np.ascontiguousarray(coeffs, dtype=np.float32))
+        bg = None if beta is None else clarray.to_device(self.queue, np.ascontiguousarray(beta, dtype=np.float32))
         if self.storage == "gpu":
             mu = clarray.zeros(self.queue, (self.n_events,), np.float32)
             for m in range(self.n_subsets):
-                self.forward_cl(x, mu, subset=m if self.n_subsets > 1 else None)
+                self.forward_cl(x, mu, subset=m if self.n_subsets > 1 else None, beta=bg)
             return mu.get()
         mu = self._host_events()
         for m in range(self.n_subsets):
-            self.forward_cl(x, mu, subset=m if self.n_subsets > 1 else None)
+            self.forward_cl(x, mu, subset=m if self.n_subsets > 1 else None, beta=bg)
         return mu
 
-    def adjoint(self, r):
+    def adjoint(self, r, background=False):
+        """B^T r (and, with background=True, the background block's back-projection too: (coeffs, beta))."""
         out = clarray.zeros(self.queue, self.op.coeff_shape, np.float32)
         acc = np.zeros(self.op.coeff_shape)
+        bout = clarray.zeros(self.queue, self.bgb.shape, np.float32) if background else None
+        bacc = np.zeros(self.bgb.shape) if background else None
         rr = np.ascontiguousarray(r, dtype=np.float32)
         rd = clarray.to_device(self.queue, rr) if self.storage == "gpu" else rr
         for m in range(self.n_subsets):
-            self.adjoint_cl(rd, out, subset=m if self.n_subsets > 1 else None)
+            self.adjoint_cl(rd, out, subset=m if self.n_subsets > 1 else None, beta_out=bout)
             acc += out.get()
-        return acc.astype(np.float32)
+            if background:
+                bacc += bout.get()
+        return (acc.astype(np.float32), bacc.astype(np.float32)) if background else acc.astype(np.float32)
 
     def sensitivity(self):
         out = clarray.zeros(self.queue, self.op.coeff_shape, np.float32)
@@ -400,16 +529,18 @@ class RawDetectorModel:
         out[self.order] = a
         return out
 
-    def deviance(self, coeffs, eps=1e-6):
+    def deviance(self, coeffs, eps=1e-6, beta=None):
         """Poisson deviance of all cells (>= 0): sum (mu - n + n log(n / mu)) = <s, x> + bg_total - sum n
         + sum_events n log(n / mu). NumPy, for checks (the solvers compute it on the GPU)."""
-        mu = self.forward(coeffs).astype(np.float64)
+        mu = self.forward(coeffs, beta=beta).astype(np.float64)
         bg = self.background_cpu
         if bg is not None:
             mu += bg
         n = self.count_cpu.astype(np.float64)
         s = self.sensitivity().astype(np.float64)
         lin = float((s * np.asarray(coeffs, np.float64)).sum()) + self.background_total
+        if beta is not None:
+            lin += float((self.bg_sens * np.asarray(beta, np.float64)).sum())
         mu = np.maximum(mu, eps)
         return lin - n.sum() + float(np.sum(np.where(n > 0, n * np.log(np.where(n > 0, n, 1.0) / mu), 0.0)))
 

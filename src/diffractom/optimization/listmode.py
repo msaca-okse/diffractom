@@ -146,16 +146,35 @@ class _Common:
             return float(self._sum(a).get())
         return float(self._sum(a[off:off + n]).get())
 
-    def objective(self, x):
-        """Poisson deviance of all cells at x (GPU, one full forward): <s, x> + bg_total - sum n
-        + sum_events n log(n / (mu + r))."""
+    def objective(self, x, xb=None):
+        """Poisson deviance of all cells at x (and background coefficients xb) (GPU, one full forward):
+        <s, x> + <s_b, xb> + bg_total - sum n + sum_events n log(n / (mu + r))."""
         def loglik(arr, off, n):
             bgd, hb = self._bg(arr)
             _launch(self.queue, self.kk["lm_loglik"], n, arr["mu"].data, arr["count"].data, bgd, hb,
                     np.float32(self.eps), np.uint64(off), np.uint64(n))
-        ll = self.model.event_values(x, loglik, lambda arr, off, n: self._sum_range(arr["mu"], off, n))
+        ll = self.model.event_values(x, loglik, lambda arr, off, n: self._sum_range(arr["mu"], off, n), beta=xb)
         lin = float(clarray.dot(self.s, x, dtype=np.float64).get())
+        if xb is not None:
+            lin += float(clarray.dot(self.sb, xb, dtype=np.float64).get())
         return lin + self.model.background_total - self.n_total + ll
+
+    def _bg_setup(self, beta0):
+        """The background block (model with a background basis): coefficients on the GPU, from beta0 or a flat
+        start that predicts a share of the counts."""
+        m, q = self.model, self.queue
+        if m.bgb is None:
+            self.has_bg = False
+            return
+        self.has_bg = True
+        self.sb = clarray.to_device(q, m.bg_sens.astype(np.float32))
+        if beta0 is None:
+            beta0 = np.zeros(m.bgb.shape, np.float32)
+        self.xb = clarray.to_device(q, np.ascontiguousarray(beta0, dtype=np.float32).reshape(m.bgb.shape))
+
+    @property
+    def beta(self):
+        return self.xb.get() if getattr(self, "has_bg", False) else None
 
 
 class ListModeSPDHG(_Common):
@@ -169,10 +188,12 @@ class ListModeSPDHG(_Common):
     eps : added to the model in the dual step and the objective (counts); seed : the random subset order.
     """
 
-    def __init__(self, model, subsets=8, rho="auto", rho_factor=0.1, lam=0.0, support="fov", eps=0.0, seed=0):
+    def __init__(self, model, subsets=8, rho="auto", rho_factor=0.1, lam=0.0, support="fov", eps=0.0, seed=0,
+                 beta0=None):
         if subsets is not None:
             model.set_subsets(subsets)
         self._setup(model, support)
+        self._bg_setup(beta0)
         self.lam = float(lam)
         self.eps = float(eps)
         self.rng = np.random.default_rng(seed)
@@ -193,19 +214,33 @@ class ListModeSPDHG(_Common):
         self.S = m.event_array("S", 0.0)
         col = clarray.zeros(q, self.op.coeff_shape, np.float32)
         T = clarray.zeros(q, self.op.coeff_shape, np.float32) + np.float32(np.inf)
+        if self.has_bg:
+            ones_b = clarray.zeros(q, m.bgb.shape, np.float32) + 1.0
+            colb = clarray.zeros(q, m.bgb.shape, np.float32)
+            Tb = clarray.zeros(q, m.bgb.shape, np.float32) + np.float32(np.inf)
+            supp_b = ones_b
+        else:
+            ones_b = colb = None
 
-        # one pass per subset: S = gamma / (B 1) from the forward of the support, and the column sums of the
-        # subset's events (T_j = min_m p / (gamma (B_m^T 1)_j))
+        # one pass per subset: S = gamma / (B 1) from the forward of the support (and of the background block), and
+        # the column sums of the subset's events (T_j = min_m p / (gamma (B_m^T 1)_j))
         def steps(arr, off, n):
             _launch(q, self.kk["lm_recip"], n, arr["S"].data, arr["mu"].data, np.float32(gamma), np.uint64(off),
                     np.uint64(n))
             _launch(q, self.kk["lm_ones"], n, arr["mu"].data, np.uint64(off), np.uint64(n))
         for sub in range(M):
-            m.event_pass(self.supp, col, sub if M > 1 else None, steps, names=("S",), write_back=("S",))
+            m.event_pass(self.supp, col, sub if M > 1 else None, steps, names=("S",), write_back=("S",),
+                         beta=ones_b, beta_out=colb)
             self._tmin(T, col, self.supp, np.float32(self.p / gamma))
+            if self.has_bg:
+                self._tmin(Tb, colb, supp_b, np.float32(self.p / gamma))
         self._tfin(T)
         self.T = T
         self.dz = col
+        if self.has_bg:
+            self._tfin(Tb)
+            self.Tb = Tb
+            self.dzb = colb
 
     def run(self, x0, n_epochs, verbose=0, diagnostics_interval=1, callback=None, state=None):
         """n_epochs epochs (each subset once, in random order) from x0 (NumPy or GPU, coefficient-shaped).
@@ -229,6 +264,8 @@ class ListModeSPDHG(_Common):
                 self.y.fill(0.0)
             z = clarray.zeros(q, self.op.coeff_shape, np.float32)
             epoch0 = 0
+        if self.has_bg:
+            zb = state["zb"] if (state is not None and "zb" in state) else clarray.zeros(q, m.bgb.shape, np.float32)
         self.setup_time = time.perf_counter() - t0
         eps = np.float32(self.eps)
 
@@ -240,31 +277,41 @@ class ListModeSPDHG(_Common):
             te = time.perf_counter()
             for sub in self.rng.permutation(M):
                 sub = int(sub) if M > 1 else None
-                m.event_pass(x, self.dz, sub, dual, names=("y", "S"), write_back=("y",))
+                if self.has_bg:
+                    m.event_pass(x, self.dz, sub, dual, names=("y", "S"), write_back=("y",), beta=self.xb,
+                                 beta_out=self.dzb)
+                    self._update(self.xb, zb, self.Tb, self.dzb, self.sb, np.float32(1.0 / self.p), np.float32(0.0))
+                else:
+                    m.event_pass(x, self.dz, sub, dual, names=("y", "S"), write_back=("y",))
                 self._update(x, z, self.T, self.dz, self.s, np.float32(1.0 / self.p), np.float32(self.lam))
             q.finish()
             stats = {"epoch": epoch0 + ep + 1, "time": time.perf_counter() - te, "f": None}
             last = ep == n_epochs - 1
             if diagnostics_interval and ((ep + 1) % diagnostics_interval == 0 or last):
-                stats["f"] = self.objective(x)
+                stats["f"] = self.objective(x, self.xb if self.has_bg else None)
                 if verbose:
                     print(f"epoch {stats['epoch']}: deviance {stats['f']:.6e} ({stats['time']:.2f} s)", flush=True)
             self.iter_stats.append(stats)
             if callback is not None:
                 callback(stats["epoch"], x)
         self.state = {"z": z, "epoch": epoch0 + n_epochs}
+        if self.has_bg:
+            self.state["zb"] = zb
         return x.get() if host else x
 
 
 class ListModeMLEM(_Common):
     """List-mode EM / OSEM (module docstring). x0 must be positive where coefficients may become non-zero."""
 
-    def __init__(self, model, subsets=1, support="fov", eps=0.0):
+    def __init__(self, model, subsets=1, support="fov", eps=0.0, beta0=None):
         if subsets is not None:
             model.set_subsets(subsets)
         self._setup(model, support)
         self.eps = float(eps)
         self.iter_stats = []
+        self._bg_setup(beta0)
+        if self.has_bg and beta0 is None:
+            self.xb.fill(np.float32(1.0))
 
     def run(self, x0, n_epochs, verbose=0, diagnostics_interval=1, callback=None):
         m, q = self.model, self.queue
@@ -280,6 +327,10 @@ class ListModeMLEM(_Common):
                 m.sensitivity_cl(a, subset=sub if M > 1 else None)
                 self.sm.append(a * self.supp)
             self.g = clarray.zeros(q, self.op.coeff_shape, np.float32)
+            if self.has_bg:
+                self.sbm = [clarray.to_device(q, a.astype(np.float32)) for a in m.bg_sens_sub]
+                self.gb = clarray.zeros(q, m.bgb.shape, np.float32)
+                self.ones_b = clarray.zeros(q, m.bgb.shape, np.float32) + 1.0
         eps = np.float32(self.eps)
 
         def ratio(arr, off, n):
@@ -290,12 +341,16 @@ class ListModeMLEM(_Common):
             te = time.perf_counter()
             for sub in range(M):
                 sub_arg = sub if M > 1 else None
-                m.event_pass(x, self.g, sub_arg, ratio)
+                if self.has_bg:
+                    m.event_pass(x, self.g, sub_arg, ratio, beta=self.xb, beta_out=self.gb)
+                    self._em(self.xb, self.gb, self.sbm[sub], self.ones_b)
+                else:
+                    m.event_pass(x, self.g, sub_arg, ratio)
                 self._em(x, self.g, self.sm[sub], self.supp)
             q.finish()
             stats = {"epoch": len(self.iter_stats) + 1, "time": time.perf_counter() - te, "f": None}
             if diagnostics_interval and ((ep + 1) % diagnostics_interval == 0 or ep == n_epochs - 1):
-                stats["f"] = self.objective(x)
+                stats["f"] = self.objective(x, self.xb if self.has_bg else None)
                 if verbose:
                     print(f"epoch {stats['epoch']}: deviance {stats['f']:.6e} ({stats['time']:.2f} s)", flush=True)
             self.iter_stats.append(stats)

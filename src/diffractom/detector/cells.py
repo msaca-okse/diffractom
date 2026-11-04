@@ -50,14 +50,18 @@ class DetectorCells:
     profiles : RadialProfiles (one per ring of the operator, in its order)
     n_eta, eta_angle_range : the operator's eta bins (op.N_eta, op.eta_angle_range in radians)
     ring_scales : (R,) s_r (default 1)
-    cell_of_pixel : (P,) cell number of every used pixel (>= 0), or None: every modelled pixel its own cell
+    cell_of_pixel : (P,) cell number of every used pixel (>= 0; -1: not used), or None: every modelled pixel its own
+        cell
+    fixed_cells : with cell_of_pixel: keep its numbering (n_cells = max + 1) even where a cell has no pixel inside a
+        ring's window (its row is empty), so that events stay valid when profiles or geometry change (refinement)
 
     Attributes: n_cells, n_rings, n_seg; pixel_cell (P,) cell of every used pixel (-1: not modelled);
     ptr (n_cells + 1,), seg (nnz,) int32, w (nnz,) float32 (CSR, sorted by cell, then segment); seg_total (n_seg,)
     = the sum of all cells' weights (a frame's total model is sum_seg seg_total[seg] M[frame, seg]).
     """
 
-    def __init__(self, pixels, profiles, n_eta, eta_angle_range, ring_scales=None, cell_of_pixel=None):
+    def __init__(self, pixels, profiles, n_eta, eta_angle_range, ring_scales=None, cell_of_pixel=None,
+                 fixed_cells=False):
         self.pixels = pixels
         self.profiles = profiles
         self.n_eta = int(n_eta)
@@ -79,6 +83,9 @@ class DetectorCells:
         j0, j1, w0, w1 = eta_interpolation(pixels.eta[pix], self.n_eta, self.eta_angle_range)
         ok = j0 >= 0
         pix, ring, val, j0, j1, w0, w1 = (a[ok] for a in (pix, ring, val, j0, j1, w0, w1))
+        # d w1 / d eta = 1 / bin (0 where the interpolation is clamped)
+        dbin = (float(self.eta_angle_range[1]) - float(self.eta_angle_range[0])) / self.n_eta
+        dw1 = np.where(j1 != j0, 1.0 / dbin, 0.0)
         modelled = np.zeros(P, dtype=bool)
         modelled[pix] = True
         if cell_of_pixel is None:
@@ -88,20 +95,32 @@ class DetectorCells:
             pixel_cell = np.asarray(cell_of_pixel, dtype=np.int64).copy()
             if pixel_cell.shape != (P,):
                 raise ValueError("cell_of_pixel needs one cell number per used pixel")
-            pixel_cell[~modelled] = -1
-            # renumber the cells that hold modelled pixels 0 .. C-1
-            used, inv = np.unique(pixel_cell[modelled], return_inverse=True)
-            pixel_cell[modelled] = inv
+            if not fixed_cells:
+                pixel_cell[~modelled] = -1
+                # renumber the cells that hold modelled pixels 0 .. C-1
+                used, inv = np.unique(pixel_cell[modelled], return_inverse=True)
+                pixel_cell[modelled] = inv
         self.pixel_cell = pixel_cell
-        self.n_cells = int(pixel_cell.max()) + 1 if modelled.any() else 0
+        if fixed_cells and cell_of_pixel is not None:
+            self.n_cells = int(pixel_cell.max()) + 1
+        else:
+            self.n_cells = int(pixel_cell.max()) + 1 if modelled.any() else 0
+        keep = pixel_cell[pix] >= 0
+        pix, ring, val, j0, j1, w0, w1, dw1 = (a[keep] for a in (pix, ring, val, j0, j1, w0, w1, dw1))
         # entries (cell, seg, value) for both interpolation nodes; the ring scale enters later (scaled weights)
         cell = pixel_cell[pix]
         self._cell = np.concatenate((cell, cell))
         self._seg = np.concatenate((j0 * self.n_rings + ring, j1 * self.n_rings + ring))
         self._ring = np.concatenate((ring, ring))
         self._val = np.concatenate((val * w0, val * w1))
-        nz = self._val > 0
-        self._cell, self._seg, self._ring, self._val = (a[nz] for a in (self._cell, self._seg, self._ring, self._val))
+        # per entry: the pixel, the radial factor (factor x rho) and the eta weight with its eta derivative
+        self._pixe = np.concatenate((pix, pix))
+        self._vbase = np.concatenate((val, val))
+        self._wnode = np.concatenate((w0, w1))
+        self._dwdeta = np.concatenate((-dw1, dw1))
+        nz = (self._val > 0) | (self._dwdeta != 0)
+        for name in ("_cell", "_seg", "_ring", "_val", "_pixe", "_vbase", "_wnode", "_dwdeta"):
+            setattr(self, name, getattr(self, name)[nz])
         self.set_ring_scales(np.ones(self.n_rings) if ring_scales is None else ring_scales)
 
     def set_ring_scales(self, ring_scales):
@@ -112,14 +131,60 @@ class DetectorCells:
         self.ring_scales = s.copy()
         key = self._cell * self.n_seg + self._seg
         uk, inv = np.unique(key, return_inverse=True)
+        self._inv = inv
         w = np.bincount(inv, weights=self._val * s[self._ring])
         cell = uk // self.n_seg
         self.seg = (uk % self.n_seg).astype(np.int32)
+        self.w64 = w
         self.w = w.astype(np.float32)
         self.ptr = np.searchsorted(cell, np.arange(self.n_cells + 1)).astype(np.int64)
         self.seg_total = np.bincount(self.seg, weights=w, minlength=self.n_seg)
         # the same weights without the ring scale, per ring (for scale updates: the part of a cell in ring r)
         self.ring_of_seg = (np.arange(self.n_seg) % self.n_rings).astype(np.int32)
+
+    def entry_derivative(self, dvbase=None, deta=None):
+        """Derivative of the CSR weights (aligned with self.seg / self.w, float64) for per-entry derivatives of
+        the radial factor (dvbase: d(factor x rho) / d parameter) and of the pixel's eta (deta)."""
+        d = np.zeros(len(self._cell))
+        if dvbase is not None:
+            d += dvbase * self._wnode
+        if deta is not None:
+            d += self._vbase * self._dwdeta * deta
+        d *= self.ring_scales[self._ring]
+        return np.bincount(self._inv, weights=d, minlength=len(self.w))
+
+    def profile_derivative(self, name, ring=None):
+        """CSR weight derivative for a profile parameter (profiles.gradients names: U, V, W, X, Y; "shift" of
+        ring `ring`). Needs profiles with a gradients method (PseudoVoigtProfiles)."""
+        tt = self.pixels.two_theta[self._pixe]
+        fac = self.pixels.factor[self._pixe]
+        dv = np.zeros(len(self._cell))
+        rings = range(self.n_rings) if ring is None else [ring]
+        for r in rings:
+            sel = self._ring == r
+            if not sel.any():
+                continue
+            g = self.profiles.gradients(r, tt[sel], names=(name,))[name]
+            dv[sel] = fac[sel] * g
+        return self.entry_derivative(dvbase=dv)
+
+    def geometry_derivative(self, dtt_pix, deta_pix):
+        """CSR weight derivative for a geometry parameter, from the per-used-pixel derivatives of two-theta and
+        eta (DetectorGeometry.jacobian on pixels.index). The pixel factor's derivative is neglected."""
+        tt = self.pixels.two_theta[self._pixe]
+        fac = self.pixels.factor[self._pixe]
+        dv = np.zeros(len(self._cell))
+        for r in range(self.n_rings):
+            sel = self._ring == r
+            if not sel.any():
+                continue
+            if hasattr(self.profiles, "gradients"):
+                g = self.profiles.gradients(r, tt[sel], names=("two_theta",))["two_theta"]
+            else:
+                h = 1e-6
+                g = (self.profiles(r, tt[sel] + h) - self.profiles(r, tt[sel] - h)) / (2 * h)
+            dv[sel] = fac[sel] * g * dtt_pix[self._pixe[sel]]
+        return self.entry_derivative(dvbase=dv, deta=deta_pix[self._pixe])
 
     def frame_cell_lookup(self):
         """(prod(frame shape),) int64: cell of every frame pixel, -1 where not modelled."""

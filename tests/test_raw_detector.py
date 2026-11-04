@@ -252,3 +252,153 @@ def test_pixel_events_to_cells():
     np.testing.assert_allclose(got.exposure, 2.0)
     sums = pev.unit_sums()
     assert sums.shape == (n_pix,) and abs(sums.sum() - pev.total) < 1e-6 * pev.total
+
+
+def _bg_dense(bgb):
+    G = np.zeros((bgb.n_cells, bgb.L))
+    for c in range(bgb.n_cells):
+        a, b = bgb.ptr[c], bgb.ptr[c + 1]
+        G[c, bgb.idx[a:b]] += bgb.w[a:b]
+    return G
+
+
+def test_background_block():
+    """Forward / adjoint / sensitivity of the background block against dense matrices, and the solvers with the
+    background reach the minimum of the full likelihood of texture + background."""
+    from diffractom import ListModeMLEM, ListModeSPDHG, RawDetectorModel, EventList
+    from diffractom.detector.background import BackgroundBasis
+    from scipy.optimize import minimize
+    ctx, queue = _context()
+    op = _operator(ctx, queue, K=3, n=6, n_omega=10)
+    pix = _pixels(op, n_pix=800)
+    _, cells = _model_parts(op, pix)
+    F = op.N_Omega * op.My
+    knots = np.linspace(pix.two_theta.min(), pix.two_theta.max(), 4)
+    groups = (np.arange(F) // op.My) // 2                      # pairs of rotation bins share the background
+    bgb = BackgroundBasis(pix, cells.pixel_cell, cells.n_cells, knots, n_eta_nodes=3, frame_groups=groups)
+    A = _dense_A(op)
+    W = _dense_W(cells)
+    G = _bg_dense(bgb)
+    B = np.kron(np.eye(F), W) @ A
+    Bb = np.zeros((F * cells.n_cells, bgb.n_groups * bgb.L))
+    for f in range(F):
+        Bb[f * cells.n_cells:(f + 1) * cells.n_cells, groups[f] * bgb.L:(groups[f] + 1) * bgb.L] = G
+    rng = np.random.default_rng(6)
+    supp = np.broadcast_to(op.support_mask()[None], op.coeff_shape).ravel() > 0
+    x_true = (rng.random(op.coeff_shape) * (rng.random(op.coeff_shape) < 0.5)).ravel() * supp
+    mu_t = B @ x_true
+    b_true = rng.random(bgb.n_groups * bgb.L) * 0.5 * mu_t.mean() / max(G.sum(axis=1).mean(), 1e-30)
+    scale = 3.0 / mu_t[mu_t > 0].mean()
+    counts = rng.poisson((mu_t + Bb @ b_true) * scale).astype(np.float64)
+    keep = counts > 0
+    idx = np.flatnonzero(keep)
+    ev = EventList(idx // cells.n_cells, idx % cells.n_cells, counts[keep], op.N_Omega, op.My, cells.n_cells)
+    for storage in ("gpu", "host"):
+        model = RawDetectorModel(op, cells, ev, subsets=2, storage=storage, chunk_events=300, background_basis=bgb)
+        xb = rng.random(bgb.shape).astype(np.float32)
+        xt = (x_true * scale).reshape(op.coeff_shape).astype(np.float32)
+        mu = model.to_input_order(model.forward(xt, beta=xb))
+        ref = (B @ xt.ravel() + Bb @ xb.ravel())[keep]
+        np.testing.assert_allclose(mu, ref, rtol=2e-4, atol=1e-5 * ref.max())
+        r = rng.random(len(ev)).astype(np.float32)
+        gx, gb = model.adjoint(r[model.order], background=True)
+        rfull = np.zeros(F * cells.n_cells)
+        rfull[keep] = r
+        np.testing.assert_allclose(gb.ravel(), Bb.T @ rfull, rtol=2e-4, atol=1e-5 * np.abs(Bb.T @ rfull).max())
+        np.testing.assert_allclose(model.bg_sens.ravel(), Bb.sum(axis=0), rtol=1e-6)
+    # reference minimiser over (x, beta)
+    s = B.sum(axis=0)
+    free = supp & (s > 0)
+    Bf = np.hstack([B[:, free], Bb])
+
+    def fun(v):
+        m_ = Bf @ v
+        val = np.sum(m_ - counts + np.where(counts > 0, counts * np.log(np.where(counts > 0, counts, 1) / np.maximum(m_, 1e-300)), 0))
+        return val, Bf.T @ (1 - np.where(counts > 0, counts / np.maximum(m_, 1e-300), 0))
+    v0 = np.full(Bf.shape[1], counts.sum() / Bf.sum())
+    res = minimize(fun, v0, jac=True, method="L-BFGS-B", bounds=[(0, None)] * Bf.shape[1],
+                   options={"maxiter": 30000, "ftol": 1e-15, "gtol": 1e-12})
+    model = RawDetectorModel(op, cells, ev, background_basis=bgb)
+    sp = ListModeSPDHG(model, subsets=2, rho_factor=0.3, seed=1)
+    x = sp.run(np.zeros(op.coeff_shape, np.float32), 600, diagnostics_interval=600)
+    f = sp.iter_stats[-1]["f"]
+    assert abs(f - model.deviance(x, beta=sp.beta)) <= 1e-4 * f
+    assert f <= res.fun * (1 + 1e-3), (f, res.fun)
+    em = ListModeMLEM(model, subsets=1)
+    em.run(np.full(op.coeff_shape, counts.sum() / s.sum(), np.float32), 1500, diagnostics_interval=1500)
+    assert em.iter_stats[-1]["f"] <= res.fun * (1 + 1e-3), (em.iter_stats[-1]["f"], res.fun)
+
+
+def test_weight_derivatives():
+    """Cell-weight derivatives (pseudo-Voigt parameters, ring shifts, geometry through two-theta and eta) equal
+    central differences of rebuilt cells."""
+    from diffractom import DetectorCells, DetectorPixels
+    from diffractom.detector.profiles import PseudoVoigtProfiles
+    rng = np.random.default_rng(3)
+    n_pix = 4000
+    rings = np.array([0.10, 0.14])
+    tt = rings[rng.integers(0, 2, n_pix)] + rng.uniform(-3e-3, 3e-3, n_pix)
+    eta = rng.uniform(0, 2 * np.pi, n_pix)
+    ext = np.full(n_pix, 1e-3)
+    pix = DetectorPixels(tt, eta, rng.uniform(0.5, 1, n_pix), np.arange(n_pix), (1, n_pix), ext, ext)
+    prof = PseudoVoigtProfiles(rings, U=2e-7, V=-1e-8, W=3e-7, X=2e-4, Y=1e-4, cut=6.0)
+    cof = np.arange(n_pix) // 2
+
+    def build(pr=prof, px=pix):
+        return DetectorCells(px, pr, 72, np.deg2rad([0, 360]), ring_scales=np.array([1.0, 0.7]),
+                             cell_of_pixel=cof, fixed_cells=True)
+    base = build()
+
+    def dense(c):
+        W = np.zeros((c.n_cells, c.n_seg))
+        for k in range(c.n_cells):
+            a, b = c.ptr[k], c.ptr[k + 1]
+            W[k, c.seg[a:b]] += c.w64[a:b]
+        return W
+
+    def csr_to_dense(c, vals):
+        W = np.zeros((c.n_cells, c.n_seg))
+        for k in range(c.n_cells):
+            a, b = c.ptr[k], c.ptr[k + 1]
+            W[k, c.seg[a:b]] += vals[a:b]
+        return W
+    # compare cells away from the profile cut (pixels entering or leaving a window are not in the derivative)
+    ring_of = np.argmin(np.abs(tt[:, None] - rings[None, :]), axis=1)
+    off = np.abs(tt - rings[ring_of]) / np.array([prof.cut * prof.fwhm(r) for r in range(2)])[ring_of]
+    inner = np.zeros(base.n_cells, bool)
+    inner[cof] = True
+    np.logical_and.at(inner, cof, off < 0.8)
+    for name, h in (("U", 2e-9), ("W", 3e-9), ("X", 2e-6)):
+        d = csr_to_dense(base, base.profile_derivative(name))[inner]
+        fd = (dense(build(prof.copy(**{name: prof.p[name] + h}))) - dense(build(prof.copy(**{name: prof.p[name] - h}))))[inner] / (2 * h)
+        assert np.abs(d - fd).max() <= 2e-3 * np.abs(fd).max(), name
+    # geometry: shift every pixel's two-theta by a * (1 + eta) and eta by b
+    a = 1e-6
+    dtt = 1.0 + 0.1 * np.cos(eta)
+    deta = 0.3 + 0.0 * eta
+    d = csr_to_dense(base, base.geometry_derivative(dtt, deta))
+
+    def moved(sign):
+        return DetectorPixels(tt + sign * a * dtt, eta + sign * a * deta, pix.factor, pix.index, pix.shape, ext, ext)
+    fd = (dense(build(px=moved(1))) - dense(build(px=moved(-1)))) / (2 * a)
+    d, fd = d[inner], fd[inner]
+    assert np.abs(d - fd).max() <= 2e-3 * np.abs(fd).max()
+
+
+def test_detector_geometry_matches_pyfai():
+    pyFAI = pytest.importorskip("pyFAI")
+    from diffractom.detector.geometry import DetectorGeometry
+    from pyFAI.detectors import Detector
+    det = Detector(pixel1=172e-6, pixel2=172e-6, max_shape=(300, 260))
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+    ai = AzimuthalIntegrator(dist=0.25, poni1=0.021, poni2=0.019, rot1=0.004, rot2=-0.003, rot3=0.02, detector=det,
+                             wavelength=0.35e-10)
+    g = DetectorGeometry.from_pyfai(ai, (300, 260))
+    idx = np.arange(300 * 260)
+    tt, eta = g.angles(idx)
+    np.testing.assert_allclose(tt, ai.center_array((300, 260), unit="2th_rad").ravel(), atol=1e-12)
+    chi = ai.center_array((300, 260), unit="chi_rad").ravel()
+    np.testing.assert_allclose(np.angle(np.exp(1j * (eta - chi - np.pi))), 0, atol=1e-12)
+    # parallax and distortion move the angles the expected way
+    t2, _ = g.copy(parallax=50e-6).angles(idx)
+    assert np.all(t2 <= tt + 1e-15)

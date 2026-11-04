@@ -123,3 +123,95 @@ class RadialProfiles:
             grids.append(g)
             values.append(v)
         return cls(grids, values)
+
+
+def tch_pseudo_voigt(x, sigma, gamma):
+    """Pseudo-Voigt of unit area at offsets x (radians) from the peak: Gaussian standard deviation sigma and
+    Lorentzian FWHM gamma combined by the Thompson-Cox-Hastings rule (total FWHM and mixing eta), as GSAS-II and
+    MIDAS's peak fits."""
+    fg = 2.0 * np.sqrt(2.0 * np.log(2.0)) * sigma
+    fl = gamma
+    f = (fg ** 5 + 2.69269 * fg ** 4 * fl + 2.42843 * fg ** 3 * fl ** 2 + 4.47163 * fg ** 2 * fl ** 3
+         + 0.07842 * fg * fl ** 4 + fl ** 5) ** 0.2
+    q = fl / f
+    eta = np.clip(1.36603 * q - 0.47719 * q ** 2 + 0.11116 * q ** 3, 0.0, 1.0)
+    g = (2.0 * np.sqrt(np.log(2.0) / np.pi) / f) * np.exp(-4.0 * np.log(2.0) * (x / f) ** 2)
+    lor = (f / (2.0 * np.pi)) / (x ** 2 + (f / 2.0) ** 2)
+    return eta * lor + (1.0 - eta) * g, f
+
+
+PV_PARAMETERS = ("U", "V", "W", "X", "Y")
+
+
+class PseudoVoigtProfiles:
+    """Parametric ring profiles: a TCH pseudo-Voigt of unit area at every ring's two-theta, with the widths of
+    GSAS-II's instrument model (Caglioti), in radians:
+
+        sigma^2 = U tan^2(theta) + V tan(theta) + W,    gamma = X / cos(theta) + Y tan(theta)
+
+    centres : (R,) ring positions (radians); shifts (R,) are added to them (refinable, e.g. from the lattice
+    parameters: d(2theta) = -2 tan(theta) da / a for a cubic lattice). The profile is cut at `cut` total FWHMs from
+    the centre (zero beyond; the cut removes a few percent of a Lorentzian's area, which the ring scales absorb).
+    Same interface as RadialProfiles (window, __call__), plus gradients for refinement.
+    """
+
+    def __init__(self, centres, U=0.0, V=0.0, W=1e-8, X=0.0, Y=0.0, shifts=None, cut=6.0):
+        self.centres = np.atleast_1d(np.asarray(centres, dtype=np.float64))
+        self.shifts = np.zeros_like(self.centres) if shifts is None else np.asarray(shifts, np.float64).copy()
+        self.p = {"U": float(U), "V": float(V), "W": float(W), "X": float(X), "Y": float(Y)}
+        self.cut = float(cut)
+
+    @property
+    def n_rings(self):
+        return len(self.centres)
+
+    def copy(self, **changes):
+        out = PseudoVoigtProfiles(self.centres, shifts=self.shifts, cut=self.cut, **{**self.p, **changes})
+        return out
+
+    def centre(self, r):
+        return float(self.centres[r] + self.shifts[r])
+
+    def _widths(self, r, p=None):
+        p = self.p if p is None else p
+        th = 0.5 * self.centre(r)
+        t = np.tan(th)
+        s2 = p["U"] * t * t + p["V"] * t + p["W"]
+        sigma = np.sqrt(max(s2, 1e-20))
+        gamma = max(p["X"] / np.cos(th) + p["Y"] * t, 0.0)
+        return sigma, gamma
+
+    def fwhm(self, r):
+        sigma, gamma = self._widths(r)
+        return float(tch_pseudo_voigt(np.zeros(1), sigma, gamma)[1])
+
+    def window(self, r):
+        h = self.cut * self.fwhm(r)
+        c = self.centre(r)
+        return c - h, c + h
+
+    def __call__(self, r, two_theta, p=None, shift=0.0):
+        sigma, gamma = self._widths(r, p)
+        x = np.asarray(two_theta, dtype=np.float64) - (self.centre(r) + shift)
+        v, f = tch_pseudo_voigt(x, sigma, gamma)
+        return np.where(np.abs(x) <= self.cut * f, v, 0.0)
+
+    def width(self, r):
+        return self.fwhm(r) / 2.3548
+
+    def gradients(self, r, two_theta, names=PV_PARAMETERS + ("shift", "two_theta"), rel_step=1e-4):
+        """{name: d rho_r / d name} at the given two-theta values (central differences; "shift": this ring's shift,
+        "two_theta": the derivative along two-theta = -d/d shift)."""
+        out = {}
+        tt = np.asarray(two_theta, dtype=np.float64)
+        f = self.fwhm(r)
+        for n in names:
+            if n in ("shift", "two_theta"):
+                h = 1e-3 * f
+                d = (self(r, tt, shift=h) - self(r, tt, shift=-h)) / (2 * h)
+                out[n] = d if n == "shift" else -d
+                continue
+            base = self.p[n]
+            h = rel_step * max(abs(base), {"U": 1e-8, "V": 1e-8, "W": 1e-8, "X": 1e-5, "Y": 1e-5}[n])
+            out[n] = (self(r, tt, p={**self.p, n: base + h}) - self(r, tt, p={**self.p, n: base - h})) / (2 * h)
+        return out

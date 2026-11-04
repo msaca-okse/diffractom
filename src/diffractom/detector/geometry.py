@@ -102,3 +102,109 @@ class DetectorPixels:
         idx = np.flatnonzero(use.ravel())
         f = lambda a: np.ascontiguousarray(a.ravel()[idx])
         return cls(f(tth), f(eta), f(factor), idx.astype(np.int64), shape, f(chi_ext), f(tth_ext))
+
+
+GEOMETRY_PARAMETERS = ("dist", "poni1", "poni2", "rot1", "rot2", "rot3", "wavelength", "p2", "p5", "p4", "p0", "phi0",
+                       "p1", "phi1", "parallax")
+
+
+class DetectorGeometry:
+    """A flat detector with pyFAI's geometry (dist, poni1, poni2 in m; rot1, rot2, rot3 in rad; the same formulas as
+    pyFAI, so a .poni file gives the same two-theta and chi) plus the corrections of MIDAS's calibration model
+    (FF_Calibration.md, CalibrantIntegratorOMP), as parameters that can be refined from the data:
+
+        radial distortion   tan(2theta) -> tan(2theta) (1 + D),  D = p2 r^2 + p5 r^4 + p4 r^6
+                            + p0 r^2 cos(2 eta + phi0) + p1 r^4 cos(4 eta + phi1),   r = tan(2theta) / tan_max
+        parallax            a photon converting at depth in the sensor lands farther out: R = L tan(2theta)
+                            + parallax sin(2theta) (MIDAS), so the true angle of a pixel at radius R is smaller
+        wavelength          (m), sets the Bragg angles of the rings (Material) - not used for the pixel angles
+
+    eta = eta_sign * chi + eta_offset (DetectorPixels). All corrections are 0 by default (= pyFAI).
+    """
+
+    def __init__(self, dist, poni1, poni2, rot1=0.0, rot2=0.0, rot3=0.0, pixel1=75e-6, pixel2=75e-6, shape=(2048, 2048),
+                 wavelength=None, tan_max=None, eta_offset=np.pi, eta_sign=1.0, **corrections):
+        self.params = {"dist": float(dist), "poni1": float(poni1), "poni2": float(poni2), "rot1": float(rot1),
+                       "rot2": float(rot2), "rot3": float(rot3),
+                       "wavelength": float(wavelength) if wavelength is not None else float("nan")}
+        for k in ("p0", "p1", "p2", "p4", "p5", "phi0", "phi1", "parallax"):
+            self.params[k] = float(corrections.pop(k, 0.0))
+        if corrections:
+            raise ValueError(f"unknown geometry parameters {sorted(corrections)}")
+        self.pixel1, self.pixel2 = float(pixel1), float(pixel2)
+        self.shape = tuple(int(s) for s in shape)
+        self.eta_offset, self.eta_sign = float(eta_offset), float(eta_sign)
+        self.tan_max = tan_max
+
+    @classmethod
+    def from_pyfai(cls, ai, shape=None, **kw):
+        if isinstance(ai, str):
+            import pyFAI
+            ai = pyFAI.load(ai)
+        if shape is None:
+            shape = tuple(ai.detector.shape)
+        return cls(ai.dist, ai.poni1, ai.poni2, ai.rot1, ai.rot2, ai.rot3, ai.detector.pixel1, ai.detector.pixel2,
+                   shape, wavelength=ai.wavelength, **kw)
+
+    def copy(self, **changes):
+        g = DetectorGeometry.__new__(DetectorGeometry)
+        g.__dict__ = {**self.__dict__, "params": {**self.params, **{k: float(v) for k, v in changes.items()}}}
+        return g
+
+    def _tilted(self, index, p):
+        i, j = np.divmod(np.asarray(index, dtype=np.int64), self.shape[1])
+        p1 = (i + 0.5) * self.pixel1 - p["poni1"]
+        p2 = (j + 0.5) * self.pixel2 - p["poni2"]
+        L = p["dist"]
+        c1, s1 = np.cos(p["rot1"]), np.sin(p["rot1"])
+        c2, s2 = np.cos(p["rot2"]), np.sin(p["rot2"])
+        c3, s3 = np.cos(p["rot3"]), np.sin(p["rot3"])
+        t1 = p1 * c2 * c3 + p2 * (c3 * s1 * s2 - c1 * s3) - L * (c1 * c3 * s2 + s1 * s3)
+        t2 = p1 * c2 * s3 + p2 * (c1 * c3 + s1 * s2 * s3) - L * (-c3 * s1 + c1 * s2 * s3)
+        t3 = p1 * s2 - p2 * c2 * s1 + L * c1 * c2
+        return t1, t2, t3
+
+    def angles(self, index, params=None):
+        """(two_theta, eta) in radians at the centres of the frame pixels `index` (flat), with the corrections."""
+        p = self.params if params is None else {**self.params, **params}
+        t1, t2, t3 = self._tilted(index, p)
+        tan2t = np.hypot(t1, t2) / t3
+        chi = np.arctan2(t1, t2)
+        eta = np.mod(self.eta_sign * chi + self.eta_offset, 2 * np.pi)
+        tmax = self.tan_max if self.tan_max is not None else float(np.max(tan2t))
+        if self.tan_max is None:
+            self.tan_max = tmax
+        if p["p0"] or p["p1"] or p["p2"] or p["p4"] or p["p5"]:
+            r = tan2t / tmax
+            r2 = r * r
+            D = (p["p2"] * r2 + p["p5"] * r2 * r2 + p["p4"] * r2 * r2 * r2
+                 + p["p0"] * r2 * np.cos(2 * eta + p["phi0"]) + p["p1"] * r2 * r2 * np.cos(4 * eta + p["phi1"]))
+            tan2t = tan2t * (1.0 + D)
+        two_theta = np.arctan(tan2t)
+        if p["parallax"]:
+            # L tan(2t) + par sin(2t) = L tan(2t_geom): two Newton steps from the geometric angle
+            Lp = p["dist"]
+            target = Lp * tan2t
+            tt = two_theta
+            for _ in range(2):
+                f = Lp * np.tan(tt) + p["parallax"] * np.sin(tt) - target
+                df = Lp / np.cos(tt) ** 2 + p["parallax"] * np.cos(tt)
+                tt = tt - f / df
+            two_theta = tt
+        return two_theta, eta
+
+    def jacobian(self, index, names, steps=None):
+        """d two_theta / d param and d eta / d param at the pixels (central differences), as dicts of arrays."""
+        default = {"dist": 1e-6, "poni1": 1e-7, "poni2": 1e-7, "rot1": 1e-6, "rot2": 1e-6, "rot3": 1e-6,
+                   "p0": 1e-5, "p1": 1e-5, "p2": 1e-5, "p4": 1e-5, "p5": 1e-5, "phi0": 1e-4, "phi1": 1e-4,
+                   "parallax": 1e-6}
+        steps = {**default, **(steps or {})}
+        dtt, deta = {}, {}
+        for n in names:
+            h = steps[n]
+            a = self.angles(index, {n: self.params[n] + h})
+            b = self.angles(index, {n: self.params[n] - h})
+            dtt[n] = (a[0] - b[0]) / (2 * h)
+            de = a[1] - b[1]
+            deta[n] = (de - 2 * np.pi * np.round(de / (2 * np.pi))) / (2 * h)
+        return dtt, deta
