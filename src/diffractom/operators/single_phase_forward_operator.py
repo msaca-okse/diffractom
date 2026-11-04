@@ -178,7 +178,11 @@ class SinglePhaseForwardOperator:
         ----------
         cfg : dict
             Experiment configuration (keys: Nx, Ny, My, N_Omega, N_eta, angle_range,
-            wavelength, detector_direction_origin, etc.).
+            wavelength, detector_direction_origin, etc.). Optional ``voxel_size``: the edge of a
+            reconstruction pixel in translation steps (detector bins), e.g. 0.5 for a grid twice as
+            fine as the scan (Nx, Ny then count the finer pixels; the image stays centred on the
+            rotation axis; coefficients are densities, so their scale does not change with it).
+            Not given: the image is Nx bins wide (pixel = one step for Nx >= Ny), as before.
         material : Material
             Crystallographic material with reflections and symmetry.
         grid : Grid
@@ -351,6 +355,10 @@ class SinglePhaseForwardOperator:
         self.My = self.cfg['My']
         self.N_Omega = self.cfg['N_Omega']
         self.cor_offset = self.cfg['cor_offset']
+        vs = self.cfg.get('voxel_size')
+        # width of the image in detector bins (legacy: Nx, i.e. one bin per pixel for Nx >= Ny)
+        self.voxel_size = None if vs is None else float(vs)
+        self.image_width = float(self.Nx) if vs is None else float(vs) * max(self.Nx, self.Ny)
         self.angle_range = np.array(self.cfg['angle_range'])/180*np.pi
         delta = (self.angle_range[1] - self.angle_range[0]) / self.N_Omega
         # Coarse angles centered in their intervals (for gratopy projection)
@@ -400,13 +408,20 @@ class SinglePhaseForwardOperator:
         # 2026-11) made it (angle range / pi) x the transpose, so the effective weight of a regulariser and any
         # test that combines function values with gradients depended on the angle range and on the projector.
         angle_weight = np.pi / self.N_Omega
+        # the projectors scale the forward projection by delta_x^2 / delta_s (delta_s = 1 here) but not the
+        # backprojection: with voxel_size the backprojection gets the same factor, so that the adjoint stays the
+        # transpose (legacy grids without voxel_size are unchanged)
+        self._bp_scale = 1.0 if self.voxel_size is None else self.voxel_size ** 2
+        angle_weight = angle_weight * self._bp_scale
+        if projector == "gratopy" and self.voxel_size is not None:
+            raise NotImplementedError("voxel_size with the gratopy projector (use 'native' or 'fft')")
         if projector == "fft":
             self.fradon = fourier_radon.FourierRadon(
                 self.queue,
                 (self.Nx, self.Ny),
                 self.angles,
                 self.My,
-                image_width=self.Nx,
+                image_width=self.image_width,
                 detector_width=self.My,
                 detector_shift=self.cor_offset,
                 angle_weights=angle_weight,
@@ -419,7 +434,7 @@ class SinglePhaseForwardOperator:
                 (self.Nx, self.Ny),
                 self.angles,
                 self.My,
-                image_width=self.Nx,
+                image_width=self.image_width,
                 detector_width=self.My,
                 detector_shift=self.cor_offset,
                 angle_weights=angle_weight,
@@ -445,9 +460,12 @@ class SinglePhaseForwardOperator:
         self.pf_storage = None
         if sparse_max_gb is None:
             sparse_max_gb = self.default_sparse_budget_gb()
+        # how the PF matrix was set up (differentiable.set_pf_parameters rebuilds it the same way)
+        self._pf_build = dict(mode=pf_mode, max_fill=sparse_max_fill, max_gb=sparse_max_gb,
+                              max_fill_partial=sparse_max_fill_partial)
+        self._pf_version = 0
         if pf_mode != "dense":
-            self.build_sparse_pf(mode=pf_mode, max_fill=sparse_max_fill, max_gb=sparse_max_gb,
-                                 max_fill_partial=sparse_max_fill_partial)
+            self.build_sparse_pf(**self._pf_build)
         if self.verbose:
             if self.pf_mode == "generated":
                 how = f"{len(self.batches)} batches, stored: {self.pf_storage}, the others generated in every call"
@@ -465,7 +483,7 @@ class SinglePhaseForwardOperator:
             (self.Nx, self.Ny, self.K_batch_max),
             self.angles,
             n_detectors=self.My,
-            image_width=self.Nx,
+            image_width=self.image_width,
             detector_width=self.My,
             detector_shift=self.cor_offset,
             angle_weights=np.full(len(self.angles), np.pi / len(self.angles)),  # adjoint = transpose (see above)
@@ -474,7 +492,7 @@ class SinglePhaseForwardOperator:
 
     def support_mask(self):
         """(Ny, Nx) bool mask of the pixels inside the field of view at every projection angle."""
-        return fov_support_mask(self.Nx, self.Ny, self.My, angles=self.angles, image_width=self.Nx,
+        return fov_support_mask(self.Nx, self.Ny, self.My, angles=self.angles, image_width=self.image_width,
                                 detector_width=self.My, detector_shift=self.cor_offset)
 
     def detector_coordinates(self):
@@ -674,6 +692,7 @@ class SinglePhaseForwardOperator:
             counts.append(cnt)
             start.append(start[-1] + len(uniq))
         axes = np.concatenate(axes)
+        self.pole_axes_cpu = axes          # (N_axes, 3) unit axes in the crystal frame (for the differentiable model)
         self.N_axes = len(axes)
         self.axis_start_cpu = np.asarray(start, dtype=np.int32)
         self.axis_count_cpu = np.concatenate(counts).astype(np.float32)
@@ -1419,8 +1438,10 @@ class SinglePhaseForwardOperator:
         else:   # the kernels (tiled or plain, ParallelRadon tiled="auto") are timed for the first subset
             for s in out:
                 self._sub_radon.append(ParallelRadon(
-                    self.queue, (self.Nx, self.Ny), self.angles[s], self.My, image_width=self.Nx,
-                    detector_width=self.My, detector_shift=self.cor_offset, angle_weights=np.pi / R, bins_per_item=3,
+                    self.queue, (self.Nx, self.Ny), self.angles[s], self.My, image_width=self.image_width,
+                    detector_width=self.My, detector_shift=self.detector_shifts()[s],
+                    angle_weights=np.pi / R * getattr(self, '_bp_scale', 1.0),
+                    bins_per_item=3,
                     kernel=self.radon_kernel, tiled=self._sub_radon[0].modes if self._sub_radon else "auto"))
         self._sub_prg = cl.Program(self.ctx, SUBSET_KERNELS).build(options=[f"-DSPMM_TY={SPMM_TY}"])
         self._sub_k = {n: cl.Kernel(self._sub_prg, n) for n in ("spmm_pf_forward_sub", "spmm_pf_adjoint_sub",
@@ -1436,6 +1457,12 @@ class SinglePhaseForwardOperator:
                 else:
                     self._sub_caps[m][ib] = self.pf_gen.count_subset_entries(sb, b["K_batch"], om)
         return out
+
+    def detector_shifts(self):
+        """The detector shift of every projection angle (N_Omega,): cor_offset minus the per-angle shifts set by
+        differentiable.set_proj_parameters (in detector bins; none by default)."""
+        shift = getattr(self, "angle_shift", None)
+        return np.full(int(self.N_Omega), float(self.cor_offset)) - (0.0 if shift is None else np.asarray(shift))
 
     def release_omega_subsets(self):
         """Free what set_omega_subsets allocated."""
