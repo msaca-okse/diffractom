@@ -402,3 +402,42 @@ def test_detector_geometry_matches_pyfai():
     # parallax and distortion move the angles the expected way
     t2, _ = g.copy(parallax=50e-6).angles(idx)
     assert np.all(t2 <= tt + 1e-15)
+
+
+def test_dense_counts_equal_event_list():
+    """DenseRawDetectorModel (every cell of the frames used, counts in host memory) == RawDetectorModel with the same
+    cells as events: forward, adjoint (incl. background), OSEM iterates; held-out frames excluded by `frames`."""
+    from diffractom import ListModeMLEM, RawDetectorModel, EventList
+    from diffractom.detector.raw_model import DenseRawDetectorModel
+    from diffractom.detector.background import BackgroundBasis
+    ctx, queue = _context()
+    op = _operator(ctx, queue, K=3, n=6, n_omega=10)
+    pix = _pixels(op, n_pix=600)
+    _, cells = _model_parts(op, pix)
+    F = op.N_Omega * op.My
+    rng = np.random.default_rng(8)
+    counts = rng.poisson(2.0, (F, cells.n_cells)).astype(np.uint16)
+    frames = np.flatnonzero(np.arange(F) % 3 != 1)
+    knots = np.linspace(pix.two_theta.min(), pix.two_theta.max(), 3)
+    bgb = BackgroundBasis(pix, cells.pixel_cell, cells.n_cells, knots, n_eta_nodes=2, n_frames=F,
+                          frame_groups=np.arange(F) % op.My)
+    expo = np.ones(F, np.float32)
+    expo[np.arange(F) % 3 == 1] = 0.0
+    fr = np.repeat(frames, cells.n_cells)
+    ce = np.tile(np.arange(cells.n_cells), len(frames))
+    ct = counts[frames].ravel().astype(np.float32)
+    keep = ct > 0
+    ev = EventList(fr[keep], ce[keep], ct[keep], op.N_Omega, op.My, cells.n_cells, expo.reshape(op.N_Omega, op.My))
+    xs = {}
+    for name in ("list", "dense"):
+        if name == "list":
+            m = RawDetectorModel(op, cells, ev, subsets=2, background_basis=bgb)
+        else:
+            m = DenseRawDetectorModel(op, cells, counts, exposure=expo, frames=frames, subsets=2, chunk_frames=4,
+                                      background_basis=bgb)
+        em = ListModeMLEM(m, subsets=None, subset_sensitivity="exact")
+        x0 = np.full(op.coeff_shape, 0.5, np.float32)
+        xs[name] = (em.run(x0, 20, diagnostics_interval=20), em.beta, em.iter_stats[-1]["f"])
+    np.testing.assert_allclose(xs["dense"][0], xs["list"][0], rtol=1e-3, atol=1e-5 * np.abs(xs["list"][0]).max())
+    np.testing.assert_allclose(xs["dense"][1], xs["list"][1], rtol=1e-3, atol=1e-5 * np.abs(xs["list"][1]).max())
+    assert abs(xs["dense"][2] - xs["list"][2]) <= 1e-4 * abs(xs["list"][2])

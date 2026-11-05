@@ -118,6 +118,9 @@ class _Common:
         self._tfin = ElementwiseKernel(ctx, "float *T", "if (isinf(T[i])) T[i] = 0.0f;", "lm_tfin")
         self._em = ElementwiseKernel(ctx, "float *x, const float *g, const float *s, const float *supp",
                                      "x[i] = (supp[i] > 0.0f && s[i] > 0.0f) ? x[i] * g[i] / s[i] : 0.0f;", "lm_em")
+        self._em_scaled = ElementwiseKernel(
+            ctx, "float *x, const float *g, const float *s, const float *supp, float share",
+            "x[i] = (supp[i] > 0.0f && s[i] > 0.0f) ? x[i] * g[i] / (share * s[i]) : 0.0f;", "lm_em_scaled")
         self._sum = ReductionKernel(ctx, np.float64, neutral="0", reduce_expr="a+b", map_expr="(double)v[i]",
                                     arguments="const float *v")
         shape = self.op.coeff_shape
@@ -128,7 +131,8 @@ class _Common:
         else:
             m = np.broadcast_to(np.asarray(support, np.float32), shape)
         self.supp = clarray.to_device(q, np.ascontiguousarray(m, dtype=np.float32))
-        self.n_total = float(model.events.count.astype(np.float64).sum())
+        self.n_total = float(model.n_total) if hasattr(model, "n_total") else \
+            float(model.events.count.astype(np.float64).sum())
         self.eps = 0.0
 
     def _sens(self):
@@ -154,6 +158,8 @@ class _Common:
             _launch(self.queue, self.kk["lm_loglik"], n, arr["mu"].data, arr["count"].data, bgd, hb,
                     np.float32(self.eps), np.uint64(off), np.uint64(n))
         ll = self.model.event_values(x, loglik, lambda arr, off, n: self._sum_range(arr["mu"], off, n), beta=xb)
+        if not hasattr(self, "s"):
+            self.s = self._sens()
         lin = float(clarray.dot(self.s, x, dtype=np.float64).get())
         if xb is not None:
             lin += float(clarray.dot(self.sb, xb, dtype=np.float64).get())
@@ -303,15 +309,27 @@ class ListModeSPDHG(_Common):
 class ListModeMLEM(_Common):
     """List-mode EM / OSEM (module docstring). x0 must be positive where coefficients may become non-zero."""
 
-    def __init__(self, model, subsets=1, support="fov", eps=0.0, beta0=None):
+    def __init__(self, model, subsets=1, support="fov", eps=0.0, beta0=None, subset_sensitivity="exact", fix_x=False):
+        """subset_sensitivity: "exact" (B_m^T 1 per subset, one coefficient-sized array each) or "scaled" (the full
+        sensitivity times the subset's share of the exposure: one array; for interleaved angle subsets they are
+        nearly equal)."""
+        self.subset_sensitivity = subset_sensitivity
+        self.fix_x = bool(fix_x)          # only the background block is updated (x fixed)
         if subsets is not None:
             model.set_subsets(subsets)
         self._setup(model, support)
         self.eps = float(eps)
         self.iter_stats = []
         self._bg_setup(beta0)
+        self.sbm = None
         if self.has_bg and beta0 is None:
             self.xb.fill(np.float32(1.0))
+
+    def reset_sensitivity(self):
+        """Recompute the sensitivities in the next run (after the model's weights changed, e.g. ring scales)."""
+        for name in ("sm", "s"):
+            if hasattr(self, name):
+                delattr(self, name)
 
     def run(self, x0, n_epochs, verbose=0, diagnostics_interval=1, callback=None):
         m, q = self.model, self.queue
@@ -320,17 +338,26 @@ class ListModeMLEM(_Common):
         x *= self.supp
         M = m.n_subsets
         if not hasattr(self, "sm"):
+            if hasattr(self, "s"):
+                del self.s
             self.s = self._sens()
             self.sm = []
+            expo = m.events.exposure.ravel().astype(np.float64)
+            om = np.arange(len(expo)) // m.op.My
             for sub in range(M):
+                if self.subset_sensitivity == "scaled":
+                    self.sm.append(float(expo[np.isin(om, m.subsets[sub])].sum() / max(expo.sum(), 1e-300)))
+                    continue
                 a = clarray.zeros(q, self.op.coeff_shape, np.float32)
                 m.sensitivity_cl(a, subset=sub if M > 1 else None)
                 self.sm.append(a * self.supp)
-            self.g = clarray.zeros(q, self.op.coeff_shape, np.float32)
+            if not hasattr(self, "g"):
+                self.g = clarray.zeros(q, self.op.coeff_shape, np.float32)
             if self.has_bg:
                 self.sbm = [clarray.to_device(q, a.astype(np.float32)) for a in m.bg_sens_sub]
-                self.gb = clarray.zeros(q, m.bgb.shape, np.float32)
-                self.ones_b = clarray.zeros(q, m.bgb.shape, np.float32) + 1.0
+                if not hasattr(self, "gb"):
+                    self.gb = clarray.zeros(q, m.bgb.shape, np.float32)
+                    self.ones_b = clarray.zeros(q, m.bgb.shape, np.float32) + 1.0
         eps = np.float32(self.eps)
 
         def ratio(arr, off, n):
@@ -346,7 +373,11 @@ class ListModeMLEM(_Common):
                     self._em(self.xb, self.gb, self.sbm[sub], self.ones_b)
                 else:
                     m.event_pass(x, self.g, sub_arg, ratio)
-                self._em(x, self.g, self.sm[sub], self.supp)
+                if not self.fix_x:
+                    if isinstance(self.sm[sub], float):
+                        self._em_scaled(x, self.g, self.s, self.supp, np.float32(self.sm[sub]))
+                    else:
+                        self._em(x, self.g, self.sm[sub], self.supp)
             q.finish()
             stats = {"epoch": len(self.iter_stats) + 1, "time": time.perf_counter() - te, "f": None}
             if diagnostics_interval and ((ep + 1) % diagnostics_interval == 0 or ep == n_epochs - 1):

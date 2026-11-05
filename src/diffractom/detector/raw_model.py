@@ -152,7 +152,7 @@ class RawDetectorModel:
     """
 
     def __init__(self, operator, cells, events, background=None, background_total=None, subsets=1, storage="gpu",
-                 chunk_events=1 << 24, background_basis=None):
+                 chunk_events=1 << 24, background_basis=None, buffers=None):
         op = operator
         self.op = op
         self.queue = op.queue
@@ -199,8 +199,11 @@ class RawDetectorModel:
             self.grp_gpu = clarray.to_device(q, bb.group_of_frame.astype(np.int32))
         self.expo_gpu = clarray.to_device(self.queue, events.exposure.ravel().astype(np.float32))
         self._upload_cells()
-        self.M = clarray.zeros(self.queue, op.data_shape, np.float32)
-        self.G = clarray.zeros(self.queue, op.data_shape, np.float32) if storage == "host" else self.M
+        if buffers is not None:                  # data-sized work arrays shared with another model (not used at once)
+            self.M, self.G = buffers[0], (buffers[1] if storage == "host" else buffers[0])
+        else:
+            self.M = clarray.zeros(self.queue, op.data_shape, np.float32)
+            self.G = clarray.zeros(self.queue, op.data_shape, np.float32) if storage == "host" else self.M
         self._all_omegas = clarray.to_device(self.queue, np.arange(op.N_Omega, dtype=np.int32))
         self.set_subsets(subsets)
 
@@ -577,3 +580,118 @@ def powder_ring_scales(cells, events):
     unscaled = np.bincount(c.ring_of_seg, weights=c.seg_total, minlength=c.n_rings) / np.maximum(c.ring_scales, 1e-300)
     weight = unscaled * float(events.exposure.astype(np.float64).sum())
     return counts / np.maximum(weight, 1e-300)
+
+
+class DenseRawDetectorModel(RawDetectorModel):
+    """RawDetectorModel for counts of EVERY cell of every frame (background-dominated detectors, where nearly all
+    cells count): counts (n_frames, n_cells) in host memory (NumPy, any numeric dtype; frame = i_omega * My + i_y),
+    no frame / cell index per event. Events are the cells of the frames used, ordered by subset, then frame, then
+    cell; the GPU receives blocks of whole frames (chunk_frames) in every pass. Only solvers without per-event state
+    run on it (ListModeMLEM / OSEM).
+
+    frames : the frames used (e.g. the training frames; default all); exposure (n_frames,) (0 for unused frames is
+    set automatically).
+    """
+
+    def __init__(self, operator, cells, counts, exposure=None, frames=None, subsets=1, chunk_frames=32,
+                 background_basis=None, buffers=None):
+        from .events import EventList
+        op = operator
+        n_frames = int(op.N_Omega) * int(op.My)
+        counts = counts.reshape(n_frames, -1)
+        if counts.shape[1] != cells.n_cells:
+            raise ValueError("counts: one column per cell")
+        self.counts_host = counts
+        self.frames_used = np.arange(n_frames) if frames is None else np.unique(np.asarray(frames, np.int64))
+        expo = np.ones(n_frames, np.float32) if exposure is None else np.asarray(exposure, np.float32).ravel().copy()
+        mask = np.zeros(n_frames, bool)
+        mask[self.frames_used] = True
+        expo[~mask] = 0.0
+        self.chunk_frames = int(chunk_frames)
+        # a stand-in EventList with no events carries the shape and the exposure for the base class
+        stub = EventList(np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, np.float32), op.N_Omega, op.My,
+                         cells.n_cells, expo.reshape(op.N_Omega, op.My))
+        self._dense_ready = False
+        super().__init__(op, cells, stub, subsets=subsets, storage="host", chunk_events=self.chunk_frames * cells.n_cells,
+                         background_basis=background_basis, buffers=buffers)
+        self.n_events = len(self.frames_used) * cells.n_cells
+        self._dense_ready = True
+        self.set_subsets(subsets)
+        self.n_total = float(sum(np.asarray(counts[f], np.float64).sum() for f in self.frames_used))
+
+    def set_subsets(self, subsets):
+        if not getattr(self, "_dense_ready", False):
+            return super().set_subsets(subsets)
+        op = self.op
+        if np.isscalar(subsets) and int(subsets) == 1:
+            self.subsets = [np.arange(op.N_Omega)]
+            self._op_subsets = False
+        else:
+            self.subsets = op.set_omega_subsets(subsets)
+            self._op_subsets = True
+        M = len(self.subsets)
+        sub_of_omega = np.full(op.N_Omega, -1, np.int64)
+        for m, s in enumerate(self.subsets):
+            sub_of_omega[s] = m
+        om = self.frames_used // op.My
+        self.sub_frames = [self.frames_used[sub_of_omega[om] == m] for m in range(M)]
+        nc = self.cells.n_cells
+        self.ev_start = np.concatenate(([0], np.cumsum([len(f) * nc for f in self.sub_frames]))).astype(np.int64)
+        self._sub_omegas = [clarray.to_device(self.queue, s.astype(np.int32)) for s in self.subsets]
+        self._all_frames = np.concatenate(self.sub_frames)
+        expo = self.events.exposure.ravel()
+        if self.bgb is not None:
+            om_all = np.arange(self.n_frames) // op.My
+            self.bg_sens_sub = [self.bgb.sensitivity(expo, np.flatnonzero((sub_of_omega[om_all] == m) & (expo > 0)))
+                                for m in range(M)]
+            self.bg_sens = self.bgb.sensitivity(expo)
+        self._ev_arrays = {}
+        self._work = None
+        n = self.chunk_frames * nc
+        self._chunk_n = n
+        q = self.queue
+        self._dev = {"frame": clarray.empty(q, n, np.int32), "count": clarray.empty(q, n, np.float32),
+                     "mu": clarray.empty(q, n, np.float32),
+                     "cell": clarray.to_device(q, np.tile(np.arange(nc, dtype=np.int32), self.chunk_frames))}
+        self.bg_gpu = None
+        self.order = None
+
+    def chunks(self, subset=None):
+        a, b = self.ev_range(subset)
+        step = self._chunk_n
+        return [(i, min(i + step, b)) for i in range(a, b, step)]
+
+    def _bind(self, a, b, names, upload=True):
+        if names:
+            raise NotImplementedError("per-event solver arrays (SPDHG) are not kept for dense counts: use OSEM / MLEM")
+        nc = self.cells.n_cells
+        frames = self._all_frames[a // nc: (b + nc - 1) // nc]
+        if upload:
+            cl.enqueue_copy(self.queue, self._dev["frame"].data, np.repeat(frames.astype(np.int32), nc))
+            cl.enqueue_copy(self.queue, self._dev["count"].data,
+                            np.ascontiguousarray(self.counts_host[frames], dtype=np.float32).ravel())
+        return dict(self._dev), 0, b - a
+
+    @property
+    def count_cpu(self):
+        raise NotImplementedError("dense counts: use counts_host")
+
+    def event_array(self, name, fill=0.0):
+        raise NotImplementedError("per-event solver arrays are not kept for dense counts: use OSEM / MLEM")
+
+    def forward_frames(self, coeffs, beta=None):
+        """(n_frames_used, n_cells) expected counts of the frames used (in the order of _all_frames), NumPy."""
+        x = clarray.to_device(self.queue, np.ascontiguousarray(coeffs, dtype=np.float32))
+        bg = None if beta is None else clarray.to_device(self.queue, np.ascontiguousarray(beta, dtype=np.float32))
+        out = np.zeros((len(self._all_frames), self.cells.n_cells), np.float32)
+        nc = self.cells.n_cells
+        for m in range(self.n_subsets):
+            msub = m if self.n_subsets > 1 else None
+            self.op.direct_cl(x, self.M, subset=self._op_subset(msub))
+            for a, b in self.chunks(msub):
+                arr, off, n = self._bind(a, b, ())
+                self._gather(arr, off, n)
+                if bg is not None:
+                    self._bg_gather(bg, arr, off, n)
+                out[a // nc: b // nc] = arr["mu"].get()[:n].reshape(-1, nc)
+        return out
