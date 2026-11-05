@@ -441,3 +441,43 @@ def test_dense_counts_equal_event_list():
     np.testing.assert_allclose(xs["dense"][0], xs["list"][0], rtol=1e-3, atol=1e-5 * np.abs(xs["list"][0]).max())
     np.testing.assert_allclose(xs["dense"][1], xs["list"][1], rtol=1e-3, atol=1e-5 * np.abs(xs["list"][1]).max())
     assert abs(xs["dense"][2] - xs["list"][2]) <= 1e-4 * abs(xs["list"][2])
+
+
+def test_parallax_term():
+    """The parallax channel of a single voxel is its depth cos(a) X + sin(a) Y times its prediction at every angle,
+    and the model adds W' M1 with W' built from rho' sin 2theta cos 2theta / L (checked against NumPy)."""
+    import pyopencl.array as clarray
+    from diffractom import RawDetectorModel, EventList
+    ctx, queue = _context()
+    op = _operator(ctx, queue, K=3, n=6, n_omega=10)
+    pix = _pixels(op, n_pix=600)
+    _, cells = _model_parts(op, pix)
+    F = op.N_Omega * op.My
+    fr = np.repeat(np.arange(F), cells.n_cells)
+    ce = np.tile(np.arange(cells.n_cells), F)
+    ev = EventList(fr, ce, np.ones(len(fr), np.float32), op.N_Omega, op.My, cells.n_cells)
+    model = RawDetectorModel(op, cells, ev)
+    Xi = np.tile(np.arange(op.Nx) - (op.Nx - 1) / 2.0, (op.Ny, 1)) * 0.01
+    Yi = np.tile((np.arange(op.Ny) - (op.Ny - 1) / 2.0)[:, None], (1, op.Nx)) * 0.01
+    L = 250.0
+    model.set_parallax(Xi, Yi, np.cos(op.angles), np.sin(op.angles), L, kappa=1.0)
+    x = np.zeros(op.coeff_shape, np.float32)
+    iy, ix = 2, 4
+    x[1, iy, ix] = 1.0
+    xg = clarray.to_device(queue, x)
+    op.direct_cl(xg, model.M)
+    model._parallax_M1(xg, None)
+    M0 = model.M.get().reshape(op.N_Omega, -1)
+    M1 = model.parallax["M1"].get().reshape(op.N_Omega, -1)
+    d = np.cos(op.angles) * Xi[iy, ix] + np.sin(op.angles) * Yi[iy, ix]
+    np.testing.assert_allclose(M1, d[:, None] * M0, rtol=1e-4, atol=1e-6 * np.abs(M0).max() * 0.05)
+    # model = W M + W' M1 (NumPy)
+    mu = model.to_input_order(model.forward(x)).reshape(F, cells.n_cells)
+    W = _dense_W(cells)
+    W1 = np.zeros_like(W)
+    w1 = model.parallax["w1_cpu"]
+    for c in range(cells.n_cells):
+        a, b = cells.ptr[c], cells.ptr[c + 1]
+        W1[c, cells.seg[a:b]] += w1[a:b]
+    ref = M0.reshape(F, -1) @ W.T + M1.reshape(F, -1) @ W1.T
+    np.testing.assert_allclose(mu, ref, rtol=2e-4, atol=1e-6 * np.abs(ref).max())

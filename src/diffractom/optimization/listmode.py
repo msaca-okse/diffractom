@@ -161,6 +161,8 @@ class _Common:
         if not hasattr(self, "s"):
             self.s = self._sens()
         lin = float(clarray.dot(self.s, x, dtype=np.float64).get())
+        if getattr(self.model, "parallax", None) is not None:
+            lin += self.model.parallax_total(x)
         if xb is not None:
             lin += float(clarray.dot(self.sb, xb, dtype=np.float64).get())
         return lin + self.model.background_total - self.n_total + ll

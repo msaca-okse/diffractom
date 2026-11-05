@@ -125,6 +125,41 @@ __kernel void bg_scatter(__global float *gbeta, __global const int *frame, __glo
     }
 }
 
+// mu[e] += exposure[frame] * sum_t w[t] M[frame * nseg + seg[t]]   (a second channel, e.g. parallax)
+__kernel void ev_gather_add(__global const float *M, __global const int *frame, __global const int *cell,
+                            __global const int *ptr, __global const int *seg, __global const float *w,
+                            __global const float *expo, __global float *mu, const ulong e0, const ulong n,
+                            const ulong nseg)
+{
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        const size_t e = e0 + i;
+        const int f = frame[e], c = cell[e];
+        const __global float *row = M + (size_t)f * nseg;
+        float acc = 0.0f;
+        for (int t = ptr[c]; t < ptr[c + 1]; ++t) acc += w[t] * row[seg[t]];
+        mu[e] += expo[f] * acc;
+    }
+}
+
+// rows of the angles omegas[0 .. n_om - 1]: M1 = (acc ? M1 : 0) + fac[omega] * T
+__kernel void rows_combine(__global float *M1, __global const float *T, __global const int *omegas,
+                           __global const float *fac, const int acc, const ulong row, const ulong n)
+{
+    for (size_t t = get_global_id(0); t < n; t += get_global_size(0)) {
+        const size_t s = t / row;
+        const size_t i = (size_t)omegas[s] * row + (t - s * row);
+        const float v = fac[omegas[s]] * T[i];
+        M1[i] = acc ? M1[i] + v : v;
+    }
+}
+
+// coefficients times a per-pixel image (broadcast over the orientations): out = img[i % npix] * c
+__kernel void coef_mul(__global float *out, __global const float *c, __global const float *img, const ulong npix,
+                       const ulong n)
+{
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) out[i] = img[i % npix] * c[i];
+}
+
 // rows of the angles omegas[0 .. n_om - 1] (all angles: omegas = 0 .. N_Omega - 1): M[i] = exposure[frame] * tot[seg]
 __kernel void fill_sensitivity(__global float *M, __global const int *omegas, __global const float *expo,
                                __global const float *tot, const ulong My, const ulong nseg, const ulong n)
@@ -186,7 +221,8 @@ class RawDetectorModel:
             0.0 if background is None else float("nan"))
         self.prg = cl.Program(self.ctx, KERNELS).build(options=[f"-DBG_LMAX={BG_LMAX}"])
         self.k = {n: cl.Kernel(self.prg, n) for n in ("ev_gather", "ev_scatter", "fill_sensitivity", "bg_gather",
-                                                      "bg_scatter")}
+                                                      "bg_scatter", "ev_gather_add", "rows_combine", "coef_mul")}
+        self.parallax = None
         self.bgb = background_basis
         if background_basis is not None:
             bb = background_basis
@@ -209,6 +245,8 @@ class RawDetectorModel:
 
     # ---------------------------------------------------------------- setup
     def _upload_cells(self):
+        if getattr(self, "parallax", None) is not None:
+            self.update_parallax_weights()
         c = self.cells
         self.ptr_gpu = clarray.to_device(self.queue, c.ptr.astype(np.int32))
         self.seg_gpu = clarray.to_device(self.queue, c.seg.astype(np.int32))
@@ -368,6 +406,92 @@ class RawDetectorModel:
         else:
             self.op.zero_subset_rows(target, sub)
 
+    # ---------------------------------------------------------------- parallax (first order)
+    def set_parallax(self, depth_x, depth_y, cos_a, sin_a, distance, kappa=1.0):
+        """Sample-position parallax to first order: a voxel at depth d along the beam (downstream > 0) puts its
+        spots at the two-theta  2theta - (d / L) sin(2theta) cos(2theta)  (L = sample-detector distance), so a pixel
+        sees  rho(2theta_p) + (d / L) sin 2theta cos 2theta rho'(2theta_p)  per unit of the ring's density. The
+        depth of image pixel (row, col) at projection angle a is cos(a) X + sin(a) Y (depth_x, depth_y: (Ny, Nx)
+        images in the units of `distance`; with the native projector's convention X = (col - c) dx, Y = (row - c) dx,
+        and the sign of the downstream direction is the caller's: kappa = -1 flips it). The model gains
+            mu += kappa * W' M1,   M1[omega] = cos(a) A(X c) + sin(a) A(Y c),
+        with W' the cells' weights with rho replaced by rho' sin 2theta_r cos 2theta_r / L (rebuilt with the ring
+        scales). The solvers use it in the predictions; ListModeMLEM back-projects only the non-negative part
+        (a correction term, as scatter estimates in PET EM)."""
+        q = self.queue
+        op = self.op
+        P = dict(X=clarray.to_device(q, np.ascontiguousarray(depth_x, np.float32).ravel()),
+                 Y=clarray.to_device(q, np.ascontiguousarray(depth_y, np.float32).ravel()),
+                 cos=clarray.to_device(q, np.asarray(cos_a, np.float32)), sin=clarray.to_device(q, np.asarray(sin_a, np.float32)),
+                 L=float(distance), kappa=float(kappa))
+        P["M1"] = clarray.zeros(q, op.data_shape, np.float32)
+        P["T"] = clarray.zeros(q, op.data_shape, np.float32)
+        P["tc"] = clarray.zeros(q, op.coeff_shape, np.float32)
+        self.parallax = P
+        self.update_parallax_weights()
+
+    def update_parallax_weights(self):
+        """Rebuild W' from the cells (after ring scales, profiles or geometry changed)."""
+        P = self.parallax
+        if P is None:
+            return
+        c = self.cells
+        tt = c.pixels.two_theta[c._pixe]
+        fac = c.pixels.factor[c._pixe]
+        dv = np.zeros(len(c._cell))
+        ring_tt = np.asarray(self.op.two_theta_peaks, np.float64)
+        for r in range(c.n_rings):
+            sel = c._ring == r
+            if not sel.any():
+                continue
+            if hasattr(c.profiles, "gradients"):
+                g = c.profiles.gradients(r, tt[sel], names=("two_theta",))["two_theta"]
+            else:
+                h = 1e-6
+                g = (c.profiles(r, tt[sel] + h) - c.profiles(r, tt[sel] - h)) / (2 * h)
+            dv[sel] = fac[sel] * g * np.sin(ring_tt[r]) * np.cos(ring_tt[r]) / P["L"]
+        w1 = c.entry_derivative(dvbase=dv) * P["kappa"]
+        P["w1_cpu"] = w1
+        P["w1"] = clarray.to_device(self.queue, w1.astype(np.float32))
+        P["tot1"] = clarray.to_device(self.queue, np.bincount(c.seg, weights=w1, minlength=c.n_seg).astype(np.float32))
+
+    def set_parallax_kappa(self, kappa):
+        self.parallax["kappa"] = float(kappa)
+        self.update_parallax_weights()
+
+    def _parallax_M1(self, coeffs, subset):
+        """M1 = cos(a) A(X c) + sin(a) A(Y c) on the rows of the subset."""
+        P = self.parallax
+        op = self.op
+        sub = self._op_subset(subset)
+        om = self._all_omegas if sub is None else self._sub_omegas[subset]
+        n_om = op.N_Omega if sub is None else len(self.subsets[subset])
+        row = op.My * self.n_seg
+        npix = op.Nx * op.Ny
+        for j, (img, f) in enumerate(((P["X"], P["cos"]), (P["Y"], P["sin"]))):
+            self._launch("coef_mul", coeffs.size, P["tc"].data, coeffs.data, img.data, np.uint64(npix),
+                         np.uint64(coeffs.size))
+            op.direct_cl(P["tc"], P["T"], subset=sub)
+            self._launch("rows_combine", n_om * row, P["M1"].data, P["T"].data, om.data, f.data, np.int32(j),
+                         np.uint64(row), np.uint64(n_om * row))
+
+    def _parallax_gather(self, arr, off, n):
+        P = self.parallax
+        self._launch("ev_gather_add", n, P["M1"].data, arr["frame"].data, arr["cell"].data, self.ptr_gpu.data,
+                     self.seg_gpu.data, P["w1"].data, self.expo_gpu.data, arr["mu"].data, np.uint64(off),
+                     np.uint64(n), np.uint64(self.n_seg))
+
+    def parallax_total(self, coeffs):
+        """sum over all cells of all frames of the parallax term at coeffs (for the objective's linear part)."""
+        P = self.parallax
+        if P is None:
+            return 0.0
+        self._parallax_M1(coeffs, None if self.n_subsets == 1 else None)
+        e = self.expo_gpu.get().astype(np.float64)
+        M1 = P["M1"].get().reshape(-1, self.n_seg)
+        tot1 = P["tot1"].get().astype(np.float64)
+        return float(e @ (M1.astype(np.float64) @ tot1))
+
     def event_pass(self, coeffs, out, subset, fn, names=(), write_back=(), beta=None, beta_out=None):
         """One pass of a solver over the events of a subset:
             M = A_m x;  per chunk: mu = W M (arrays["mu"]), fn(arrays, off, n), back-projection of arrays["mu"];
@@ -379,6 +503,8 @@ class RawDetectorModel:
         back-projection (overwritten)."""
         sub = self._op_subset(subset)
         self.op.direct_cl(coeffs, self.M, subset=sub)
+        if self.parallax is not None:
+            self._parallax_M1(coeffs, subset)
         chunks = self.chunks(subset)
         if beta_out is not None:
             beta_out.fill(0.0)
@@ -386,6 +512,8 @@ class RawDetectorModel:
             for a, b in chunks:
                 arr, off, n = self._bind(a, b, names)
                 self._gather(arr, off, n)
+                if self.parallax is not None:
+                    self._parallax_gather(arr, off, n)
                 if beta is not None:
                     self._bg_gather(beta, arr, off, n)
                 fn(arr, off, n)
@@ -401,6 +529,8 @@ class RawDetectorModel:
         for a, b in chunks:
             arr, off, n = self._bind(a, b, names)
             self._gather(arr, off, n)
+            if self.parallax is not None:
+                self._parallax_gather(arr, off, n)
             if beta is not None:
                 self._bg_gather(beta, arr, off, n)
             fn(arr, off, n)
@@ -419,9 +549,13 @@ class RawDetectorModel:
         for m in subs:
             msub = m if self.n_subsets > 1 else None
             self.op.direct_cl(coeffs, self.M, subset=self._op_subset(msub))
+            if self.parallax is not None:
+                self._parallax_M1(coeffs, msub)
             for a, b in self.chunks(msub):
                 arr, off, n = self._bind(a, b, ())
                 self._gather(arr, off, n)
+                if self.parallax is not None:
+                    self._parallax_gather(arr, off, n)
                 if beta is not None:
                     self._bg_gather(beta, arr, off, n)
                 if fn is not None:
@@ -437,12 +571,16 @@ class RawDetectorModel:
             check_device(mu, (self.n_events,), "mu")
         if compute_M:
             self.op.direct_cl(coeffs, self.M, subset=self._op_subset(subset))
+            if self.parallax is not None and weights is None:
+                self._parallax_M1(coeffs, subset)
         for a, b in self.chunks(subset):
             arr, off, n = self._bind(a, b, ())
             if self.storage == "gpu":
                 arr["mu"] = mu
             if weights is None:
                 self._gather(arr, off, n)
+                if self.parallax is not None:
+                    self._parallax_gather(arr, off, n)
             else:                                   # other cell weights (e.g. a derivative), aligned with cells.w
                 self._launch("ev_gather", n, self.M.data, arr["frame"].data, arr["cell"].data, self.ptr_gpu.data,
                              self.seg_gpu.data, weights.data, self.expo_gpu.data, arr["mu"].data, np.uint64(off),
@@ -688,9 +826,13 @@ class DenseRawDetectorModel(RawDetectorModel):
         for m in range(self.n_subsets):
             msub = m if self.n_subsets > 1 else None
             self.op.direct_cl(x, self.M, subset=self._op_subset(msub))
+            if self.parallax is not None:
+                self._parallax_M1(x, msub)
             for a, b in self.chunks(msub):
                 arr, off, n = self._bind(a, b, ())
                 self._gather(arr, off, n)
+                if self.parallax is not None:
+                    self._parallax_gather(arr, off, n)
                 if bg is not None:
                     self._bg_gather(bg, arr, off, n)
                 out[a // nc: b // nc] = arr["mu"].get()[:n].reshape(-1, nc)
