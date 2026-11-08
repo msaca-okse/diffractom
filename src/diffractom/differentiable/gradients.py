@@ -65,16 +65,20 @@ class PFGradient:
         self.dv = {}
 
     def _dv(self, groups):
-        need = [g for g in ("eta_offset", "axis_tilt", "two_theta") if g in groups and g not in self.dv]
+        axis_mode = getattr(self.op, "reflection_two_theta", False)
+        # with one Bragg angle per pole axis the kernel forms dv/d(2 theta) itself from u and w
+        need = [g for g in ("eta_offset", "axis_tilt", "two_theta") if g in groups and g not in self.dv
+                and not (axis_mode and g == "two_theta")]
         if need:
             ref = ReferenceModel(self.op)
-            d = ref.probed_derivatives(ref.params0(), need)
+            d = ref.probed_parts(ref.params0(), need) if axis_mode else ref.probed_derivatives(ref.params0(), need)
             dev = lambda a: clarray.to_device(self.q, np.ascontiguousarray(a, dtype=np.float32))
             for key, val in d.items():
                 self.dv[key] = dev(val)
             if "axis_tilt" in need:
                 self.dv["axis_tilt"] = True
         get = lambda key: self.dv[key].data if key in self.dv else self.dummy.data
+        self._dw = (get(("axis_tilt_w", 0)), get(("axis_tilt_w", 1)))
         return get("eta_offset"), get(("axis_tilt", 0)), get(("axis_tilt", 1)), get("two_theta")
 
     def _project(self, c, ib):
@@ -149,7 +153,11 @@ class PFGradient:
                        op.quad_weights_gpu.data, op.intens_gpu.data, self.rows.data, np.int32(My), np.int32(Kb),
                        np.int32(Kmax), np.int32(k0), np.int32(op.N_eta), np.int32(self.P), np.int32(op.N_axes),
                        np.int32(op.N_Omega_subdivisions), np.int32(op.N_eta_subdivisions), np.int32(op.normalized),
-                       np.int32(flags), cl.LocalMemory(4 * My))
+                       np.int32(flags), cl.LocalMemory(4 * My),
+                       (op.w_gpu_or_dummy if getattr(op, "reflection_two_theta", False) else self.dummy).data,
+                       self._dw[0], self._dw[1],
+                       (op.axis_sin_gpu if getattr(op, "reflection_two_theta", False) else self.dummy).data,
+                       (op.axis_cos_gpu if getattr(op, "reflection_two_theta", False) else self.dummy).data)
             n = Kb * self.NQ
             self.k_sum(q, (-(-n // 64) * 64,), (64,), self.rows.data, self.per_k.data, np.int32(R), np.int32(Kb))
             per_k[k0:k0 + Kb] = self.per_k[:n].get().reshape(Kb, self.NQ)

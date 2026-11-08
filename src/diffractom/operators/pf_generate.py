@@ -74,7 +74,8 @@ class SparsePFGenerator:
                            ("detector_direction_origin", "detector_direction_positive_90", "p_direction_0", "k_direction_0"))
         Rm = Rotation.from_rotvec(op.angles_subdivided[:, None] * kd).as_matrix()
         frames = np.concatenate([np.einsum("oij,i->oj", Rm, v) for v in (d0, d90, p0)], axis=1)
-        theta = op.two_theta_peaks.astype(np.float64) / 2.0
+        # per ring, or per pole axis if the operator gives every reflection its own Bragg angle
+        theta = (op.axis_two_theta_cpu if op.reflection_two_theta else op.two_theta_peaks).astype(np.float64) / 2.0
         dev = lambda a: clarray.to_device(q, np.ascontiguousarray(a, dtype=np.float32))
         self.frames, self.sin_th, self.cos_th = dev(frames), dev(np.sin(theta)), dev(np.cos(theta))
         e0, e1 = (float(v) for v in op.eta_angle_range)
@@ -229,7 +230,8 @@ class SparsePFGenerator:
                              self.cand_val.data, self.flag.data,
                              *self._ints(n_rows, n_flags, Kb, k0, C, P, op.N_axes, op.N_Omega_subdivisions,
                                          op.N_eta_subdivisions, op.normalized),
-                             (sub if sub is not None else self.cnt).data, np.int32(sub is not None))
+                             (sub if sub is not None else self.cnt).data, np.int32(sub is not None),
+                             op.w_gpu_or_dummy.data, op.axis_sin_gpu.data, op.axis_cos_gpu.data)
         self.scan(self.flag[:n_flags], self.pos[:n_flags], allocator=self.pool)
         k["pf_gen_compact"](q, (_ceil(max(cap, n_rows + 1)),), (_LOCAL,),
                             self.cand_j.data, self.cand_row.data, self.cand_val.data, self.flag.data,

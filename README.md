@@ -279,6 +279,18 @@ Unnormalised intensities need the background under the rings removed in the
 data reduction and segments partly off the detector excluded
 (`diffractom.utils.segment_coverage`).
 
+A data channel can also be an integration window that holds several reflections
+(`rings=[(reflection indices, weights), ...]`, e.g. a rock's phase windows). By
+default all reflections of a window are evaluated at its mean two-theta. For
+low-symmetry phases the reflections of one window can lie tenths of a degree
+apart, which moves their spots in (omega, eta) by more than a narrow kernel's
+width. `reflection_two_theta=True` evaluates every reflection at its own Bragg
+angle. The probed directions are then stored once for all channels instead of
+once per channel, so the memory of the quadrature nodes no longer grows with the
+number of windows. The PF modes, the local basis and the gradients
+(`differentiable.PFGradient`, `set_pf_parameters`) support it. The default keeps
+earlier results bitwise.
+
 ### Local basis: orientations only where they occur
 
 With a global basis every orientation has an image on the whole grid (K x Ny x Nx

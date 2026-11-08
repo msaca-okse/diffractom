@@ -17,7 +17,8 @@ def set_pf_parameters(op, rotations=None, sigma=None, two_theta=None, eta_offset
     directions, the sparse PF matrix as it was set up: stored or generated, same budget).
 
     rotations: (K, 3, 3) orientations (crystal to sample) of the basis; sigma: (K,) widths (radians); two_theta: (P,)
-    Bragg angles of the rings (radians); eta_offset: added to the azimuths (radians); axis_tilt: (2,) rotation of the
+    Bragg angles of the rings (radians; with reflection_two_theta the channel's mean: every reflection of the channel
+    moves by the channel's change); eta_offset: added to the azimuths (radians); axis_tilt: (2,) rotation of the
     rotation axis about the two directions perpendicular to it (ReferenceModel.e_tilt), applied to the current axis.
     The quadrature rule is kept (it was chosen for the widths at construction). Coefficient batches may change
     (the sparse batch size depends on the fill): coefficient arrays keep their (K, Ny, Nx) shape.
@@ -102,7 +103,11 @@ def _rebuild(op, pf_changed, geo_changed):
     if geo_changed:
         if getattr(op, "coords_gpu", None) is not None:
             op.coords_gpu.base_data.release()
+        if getattr(op, "reflection_two_theta", False):
+            op.w_gpu.base_data.release()
         op.detector_coordinates()
+        if getattr(op, "reflection_two_theta", False):
+            op._transfer_axis_theta()               # the rotated p0 and the Bragg angles of the axes
     # everything built from the PF parameters
     op.release_streamer()
     op.release_omega_subsets()

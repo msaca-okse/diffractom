@@ -124,7 +124,10 @@ __kernel void pfmatrix_eval_poles(
     const int S,                       // number of omega subdivisions
     const int S_eta,                   // number of eta subdivisions
     const int k0,                      // first orientation of this batch
-    const int Kb                       // orientations in this batch; rows Kb .. Kmax-1 are set to zero
+    const int Kb,                      // orientations in this batch; rows Kb .. Kmax-1 are set to zero
+    __global const float *w,           // AXIS_THETA: (R * S, 3) the rotated p0; coords then (R, S_omega, C, S_eta, 3) = u
+    __global const float *ax_st,       // AXIS_THETA: (A,) sin and cos of the Bragg angle of every axis
+    __global const float *ax_ct
 ){
     int gid = get_global_id(0);
     int total = R * Kmax * C * P;
@@ -151,7 +154,12 @@ __kernel void pfmatrix_eval_poles(
     float w_total = 0.0f;
     for (int s = 0; s < S; ++s) {
         for (int se = 0; se < S_eta; ++se) {
+#ifdef AXIS_THETA
+            long coord_base = (((long)(r * S + s) * C + c) * S_eta + se) * 3;
+            __global const float *wv = w + (long)(r * S + s) * 3;
+#else
             long coord_base = ((((long)(r * S + s) * C + c) * S_eta + se) * P + p) * 3;  // 64 bit: many nodes
+#endif
             float vx = coords[coord_base + 0];
             float vy = coords[coord_base + 1];
             float vz = coords[coord_base + 2];
@@ -160,7 +168,12 @@ __kernel void pfmatrix_eval_poles(
 #endif
             for (int a = a0; a < a1; ++a) {
                 int b = pole_base + a * 3;
+#ifdef AXIS_THETA
+                float d = fabs(ax_ct[a] * (poles[b + 0]*vx + poles[b + 1]*vy + poles[b + 2]*vz)
+                               - ax_st[a] * (poles[b + 0]*wv[0] + poles[b + 1]*wv[1] + poles[b + 2]*wv[2]));
+#else
                 float d = fabs(poles[b + 0]*vx + poles[b + 1]*vy + poles[b + 2]*vz);
+#endif
                 float t = 0.0f;
                 float e1 = (1.0f - d) * inv_sig2;
                 if (e1 < PF_CUT) t += exp(-e1);

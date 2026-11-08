@@ -14,6 +14,10 @@ Model (docs/differentiable_model.md): data d[a, s, j], projection angle a, detec
     v_n           = R(omega_n)^T u(eta_n, theta_p),        u = cos(theta) (cos(eta) d0 + sin(eta) d90) - sin(theta) p0
     t_a(x)        = X_a x + Y_a y + T0_a - cor / delta_s + shift_a       (detector coordinate of pixel x, in bins)
 
+With op.reflection_two_theta every pole axis h has its own theta_h: v_n = cos(theta_h) U_n - sin(theta_h) W_n, where
+U_n = R(omega_n)^T (cos(eta_n) d0 + sin(eta_n) d90) and W_n = R(omega_n)^T p0; prm["two_theta"] (P,) is then the channels'
+mean Bragg angle and every axis of channel p moves by the change of its mean.
+
 Parameters (ReferenceModel.params0): c (K, Ny, Nx) coefficients; rot (K, 3) rotation of every orientation, a left
 increment U_k <- exp([rot_k]x) U_k (the derivative is taken at rot = 0); sigma (K,) kernel widths; two_theta (P,)
 Bragg angles 2 theta_p; eta_offset (detector azimuth zero, eta <- eta + eta_offset); axis_tilt (2,) rotation of the
@@ -65,6 +69,10 @@ class ReferenceModel:
         self.start = np.asarray(op.axis_start_cpu)
         self.intens = np.asarray(op.intens_cpu, np.float64)
         self.two_theta0 = np.asarray(op.two_theta_peaks, np.float64)
+        self.axis_mode = bool(getattr(op, "reflection_two_theta", False))
+        if self.axis_mode:
+            self.axis_tth0 = np.asarray(op.axis_two_theta_cpu, np.float64)
+            self.axis_ring = np.repeat(np.arange(self.P), np.diff(self.start))
         if cut == "operator":
             cut = 6.0 if op.pf_cutoff_sigma is None else float(op.pf_cutoff_sigma) ** 2 / 2
         self.cut = cut
@@ -112,12 +120,16 @@ class ReferenceModel:
 
     def probed(self, prm):
         """v (R, S, C, Se, P, 3) = R(omega)^T u (the operator's coords)."""
+        if self.axis_mode:
+            raise ValueError("reflection_two_theta: every pole axis has its own probed direction (use probed_parts)")
         u, _, _ = self._u(prm)
         return np.einsum("rsij,cepi->rscepj", self._rot_om(prm), u)
 
     def probed_derivatives(self, prm, groups=("eta_offset", "axis_tilt", "two_theta")):
         """Derivatives of the probed directions, each shaped like probed(): "eta_offset", ("axis_tilt", 0),
         ("axis_tilt", 1) and "two_theta" (ring p's slice holds d v / d (2 theta_p))."""
+        if self.axis_mode:
+            raise ValueError("reflection_two_theta: use probed_parts")
         Rot = self._rot_om(prm)
         u, du_eta, du_tth = self._u(prm)
         out = {}
@@ -131,6 +143,34 @@ class ReferenceModel:
                 eu = np.cross(e[None, None, None, :], u)
                 out[("axis_tilt", i)] = np.cross(e, v) - np.einsum("rsij,cepi->rscepj", Rot, eu)
         return out
+
+    def _axis_theta(self, prm):
+        """theta (A,) of every pole axis (reflection_two_theta)."""
+        return 0.5 * (self.axis_tth0 + (np.asarray(prm["two_theta"], np.float64) - self.two_theta0)[self.axis_ring])
+
+    def probed_parts(self, prm, groups=()):
+        """reflection_two_theta: "u" (R, S, C, Se, 3) and "w" (R, S, 3) with v = cos(theta) u - sin(theta) w, and their
+        derivatives: "eta_offset" (du), ("axis_tilt", i) (du), ("axis_tilt_w", i) (dw)."""
+        Rot = self._rot_om(prm)
+        eta = self.eta_nodes + prm["eta_offset"]
+        e = np.cos(eta)[..., None] * self.d0 + np.sin(eta)[..., None] * self.d90
+        u = np.einsum("rsij,cei->rscej", Rot, e)
+        w = np.einsum("rsij,i->rsj", Rot, self.p0)
+        out = {"u": u, "w": w}
+        if "eta_offset" in groups:
+            de = -np.sin(eta)[..., None] * self.d0 + np.cos(eta)[..., None] * self.d90
+            out["eta_offset"] = np.einsum("rsij,cei->rscej", Rot, de)
+        if "axis_tilt" in groups:
+            for i, a in enumerate(self.e_tilt):
+                out[("axis_tilt", i)] = np.cross(a, u) - np.einsum("rsij,cei->rscej", Rot, np.cross(a[None, None, :], e))
+                out[("axis_tilt_w", i)] = np.cross(a, w) - np.einsum("rsij,i->rsj", Rot, np.cross(a, self.p0))
+        return out
+
+    def _axis_dots(self, n, u, w, ct, st):
+        """n.v (R, S, C, Se, K, A_p) for poles n (K, A_p, 3)."""
+        du = np.einsum("rscex,kax->rsceka", u, n)
+        dw = np.einsum("rsx,kax->rska", w, n)[:, :, None, None]
+        return ct * du - st * dw
 
     def poles(self, prm):
         rot = Rotation.from_rotvec(prm["rot"]).as_matrix() @ self.U0                   # (K, 3, 3)
@@ -148,7 +188,12 @@ class ReferenceModel:
 
     def pf(self, prm, derivs=False):
         """PF (R, K, C, P); with derivs also the per-node factors needed for the derivatives (see _pf_grads)."""
-        v = self.probed(prm)
+        axm = self.axis_mode
+        if axm:
+            th = self._axis_theta(prm)
+            parts = self.probed_parts(prm)
+        else:
+            v = self.probed(prm)
         n = self.poles(prm)
         sig = np.asarray(prm["sigma"], np.float64)
         s = 1.0 / sig ** 2
@@ -156,7 +201,10 @@ class ReferenceModel:
         out = np.zeros((self.R, self.K, self.C, self.P))
         for p in range(self.P):
             a0, a1 = self.start[p], self.start[p + 1]
-            d = np.einsum("rscex,kax->rsceka", v[..., p, :], n[:, a0:a1])
+            if axm:
+                d = self._axis_dots(n[:, a0:a1], parts["u"], parts["w"], np.cos(th[a0:a1]), np.sin(th[a0:a1]))
+            else:
+                d = np.einsum("rscex,kax->rsceka", v[..., p, :], n[:, a0:a1])
             g, _, _ = self._g(d, s[:, None])
             node = np.einsum("rsceka,a->rscek", g, self.counts[a0:a1])
             out[..., p] = self.intens[p] * norm[None, :, None] * np.einsum("rscek,se->rkc", node, self.qw)
@@ -224,6 +272,8 @@ class ReferenceModel:
 
     def _pf_grads(self, prm, G, groups):
         """sum over (a, k, c, p) of G * dPF/dparameter for the PF parameter groups."""
+        if self.axis_mode:
+            return self._pf_grads_axis(prm, G, groups)
         Rot = self._rot_om(prm)
         u, du_eta, du_tth = self._u(prm)
         v = np.einsum("rsij,cepi->rscepj", Rot, u)
@@ -260,6 +310,48 @@ class ReferenceModel:
                     out["eta_offset"] += val
                 else:
                     out["axis_tilt"][key[1]] += val
+        return {k: out[k] for k in groups}
+
+
+    def _pf_grads_axis(self, prm, G, groups):
+        """_pf_grads with one Bragg angle per pole axis."""
+        th = self._axis_theta(prm)
+        parts = self.probed_parts(prm, groups)
+        u, w = parts["u"], parts["w"]
+        n = self.poles(prm)
+        sig = np.asarray(prm["sigma"], np.float64)
+        s = 1.0 / sig ** 2
+        norm = 1.0 / (8.0 * np.pi * sig ** 2)
+        out = {"rot": np.zeros((self.K, 3)), "sigma": np.zeros(self.K), "two_theta": np.zeros(self.P),
+               "eta_offset": 0.0, "axis_tilt": np.zeros(2)}
+        for p in range(self.P):
+            a0, a1 = self.start[p], self.start[p + 1]
+            np_, ct, st = n[:, a0:a1], np.cos(th[a0:a1]), np.sin(th[a0:a1])
+            d = self._axis_dots(np_, u, w, ct, st)
+            g, dgd, dgs = self._g(d, s[None, None, None, None, :, None])
+            wc = self.counts[a0:a1]
+            W = (G[..., p].transpose(0, 2, 1)[:, None, :, None, :] * self.qw[None, :, None, :, None]
+                 * (self.intens[p] * norm)[None, None, None, None, :])
+            Wd = W[..., None] * wc * dgd
+            dotu = np.einsum("rscex,kax->rsceka", u, np_)
+            dotw = np.einsum("rsx,kax->rska", w, np_)[:, :, None, None]
+            if "rot" in groups:
+                vv = ct[..., None] * u[:, :, :, :, None, None, :] - st[..., None] * w[:, :, None, None, None, None, :]
+                cr = np.cross(np_[None, None, None, None], vv)                   # n x v, (R, S, C, Se, K, A, 3)
+                out["rot"] += np.einsum("rsceka,rscekax->kx", Wd, cr)
+            if "sigma" in groups:
+                node = np.einsum("rsceka,a->rscek", g, wc)
+                dnode = np.einsum("rsceka,a->rscek", dgs, wc)
+                out["sigma"] += np.einsum("rscek,rscek->k", W, -2.0 / sig * node - 2.0 / sig ** 3 * dnode)
+            if "two_theta" in groups:
+                out["two_theta"][p] += np.sum(Wd * 0.5 * (-st * dotu - ct * dotw))
+            if "eta_offset" in groups:
+                out["eta_offset"] += np.sum(Wd * ct * np.einsum("rscex,kax->rsceka", parts["eta_offset"], np_))
+            if "axis_tilt" in groups:
+                for i in range(2):
+                    dU = np.einsum("rscex,kax->rsceka", parts[("axis_tilt", i)], np_)
+                    dW = np.einsum("rsx,kax->rska", parts[("axis_tilt_w", i)], np_)[:, :, None, None]
+                    out["axis_tilt"][i] += np.sum(Wd * (ct * dU - st * dW))
         return {k: out[k] for k in groups}
 
 
