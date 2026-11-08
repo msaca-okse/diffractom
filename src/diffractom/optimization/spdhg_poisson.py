@@ -229,6 +229,26 @@ __kernel void tv_value_local(__global const float *x, __global const float *T, _
     }
 }
 
+// hierarchical total variation: sums over the orientations of a tree node per pixel (CSR ptr / idx into the flat
+// coefficients) and the transposed scatter (map: the node-pixel of a flat coefficient, -1: none)
+__kernel void tree_sums(__global const float *x, __global const int *ptr, __global const int *idx, __global float *s,
+                        const ulong n)
+{
+    for (size_t j = get_global_id(0); j < n; j += get_global_size(0)) {
+        float a = 0.0f;
+        for (int p = ptr[j]; p < ptr[j + 1]; p++) a += x[idx[p]];
+        s[j] = a;
+    }
+}
+
+__kernel void tree_scatter(__global const float *w, __global const int *map, __global float *dz, const ulong n)
+{
+    for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) {
+        const int m = map[i];
+        if (m >= 0) dz[i] += w[m];
+    }
+}
+
 __kernel void tinit(__global float *T, const ulong to, const ulong n)
 {
     for (size_t i = get_global_id(0); i < n; i += get_global_size(0)) T[to + i] = INFINITY;
@@ -279,7 +299,7 @@ class SPDHGPoisson:
     """SPDHG over omega subsets for the Poisson deviance (module docstring)."""
 
     def __init__(self, operator, subsets=8, prox_kind="nonneg", lam=0.0, support="fov", eps_counts=1e-3, rho="auto",
-                 seed=0, resident="auto", tv=0.0, tv_prob=None):
+                 seed=0, resident="auto", tv=0.0, tv_prob=None, tv_tree=None):
         """subsets: the number of interleaved angle subsets, or a list of angle-index arrays (both passed to
         operator.set_omega_subsets, which needs the native or FFT projector and a sparse PF mode; also the
         local-basis operator). Angles in no subset are not fitted (e.g. held out for validation). seed: the order of
@@ -299,7 +319,9 @@ class SPDHGPoisson:
         epochs) and lowered the held-out deviance by 0.8 %; c 0.1 and more smoothed too much. Sandstone (DanMAX 2026,
         porous, local basis, 12 refinement steps): no gain (held-out deviance +0.04 / +0.4 / +3.4 % at c 0.001 / 0.01
         / 0.1; it fills low-density voxels the data prefer empty). Hence tv = 0 by default. tv_prob: the probability
-        of the TV block (default 1 / (M + 1); 0.5 gave the same results there at more TV iterations)."""
+        of the TV block (default 1 / (M + 1); 0.5 gave the same results there at more TV iterations). tv_tree: an
+        OrientationTree (optimization/orientation_tree.py): the hierarchical total variation over its nested orientation
+        cells instead of one image per orientation (local coefficient layout only); tv is then per degree."""
         if prox_kind not in ("nonneg", "nonneg_l1"):
             raise ValueError("SPDHGPoisson supports prox_kind 'nonneg' and 'nonneg_l1'")
         if not (resident in ("auto", "all", "none") or set(resident) <= set(NAMES + TV_NAMES)):
@@ -316,6 +338,9 @@ class SPDHGPoisson:
         self.tv = float(tv)
         if self.tv < 0:
             raise ValueError("tv must be >= 0")
+        self.tv_tree = tv_tree                    # optimization.orientation_tree.OrientationTree: hierarchical TV (local basis)
+        if tv_tree is not None and self.tv <= 0:
+            raise ValueError("tv_tree needs tv > 0")
         self.tv_prob = (1.0 / (self.M + 1) if tv_prob is None else float(tv_prob)) if self.tv > 0 else 0.0
         if self.tv > 0 and not 0 < self.tv_prob < 1:
             raise ValueError("tv_prob must be in (0, 1)")
@@ -328,7 +353,7 @@ class SPDHGPoisson:
         self.support_gpu = support_mask_to_gpu(self.queue, operator, support)
         self.k = _K(cl.Program(self.ctx, KERNELS).build(),
                     ("dual_update_sub", "spdhg_update", "tinit", "tmin", "tfinal", "tv_dual_dense",
-                     "tv_adjoint_dense", "tv_value_dense", "tv_dual_local", "tv_adjoint_local", "tv_value_local"))
+                     "tv_adjoint_dense", "tv_value_dense", "tv_dual_local", "tv_adjoint_local", "tv_value_local", "tree_sums", "tree_scatter"))
         self.pk = _K(cl.Program(self.ctx, POISSON_KERNELS).build(),
                      ("poisson_value_grad", "support_ones", "project_support"))
         self.dk = _K(cl.Program(self.ctx, PDHG_KERNELS).build(), ("dual_steps", "set_mask_ones", "mean_counted"))
@@ -498,6 +523,8 @@ class SPDHGPoisson:
         if getattr(self.op, "coefficient_layout", "dense") == "local":
             return self._run_local(x0, b, n_epochs, weights, gain, background, verbose, diagnostics_interval,
                                    callback, state)
+        if self.tv_tree is not None:
+            raise NotImplementedError("tv_tree needs an operator with the local coefficient layout")
         if self.tv > 0 and state is not None and state.get("z") is None:
             raise ValueError("continuing a TV run needs the state's z")
         t_start = time.perf_counter()
@@ -789,7 +816,13 @@ class SPDHGPoisson:
             qx, qy = clarray.zeros(q, cshape, np.float32), clarray.zeros(q, cshape, np.float32)
             dqx, dqy = clarray.empty(q, cshape, np.float32), clarray.empty(q, cshape, np.float32)
             nbr = [clarray.to_device(q, a) for a in _patch_neighbours(op)]   # right, down, left, up
-            tv_args = (np.float32(self.tv), np.float32(TV_SAFETY * self.tv_prob))
+            levels = _tree_levels(q, op, self.tv_tree, T, elementwise) if self.tv_tree is not None else []
+            leaf_edge = float(self.tv_tree.leaf_edge) if self.tv_tree is not None else 1.0
+            ps_lev = np.float32(TV_SAFETY * self.tv_prob / (1 + len(levels)))   # the step shared among the levels
+            tv_args = (np.float32(self.tv * leaf_edge), ps_lev)
+            if levels:
+                nmax = max(lev["n"] for lev in levels)
+                scr = {name: clarray.empty(q, (nmax,), np.float32) for name in ("s", "w", "dqx", "dqy")}
         if state is not None:
             if self.tv > 0 and state.get("z") is None:
                 raise ValueError("continuing a TV run needs the state's z")
@@ -802,11 +835,31 @@ class SPDHGPoisson:
                 for a, nm in ((qx, "qx"), (qy, "qy")):
                     if state.get(nm) is not None:
                         a.set(as_host(state[nm], cshape, f"state['{nm}']"))
+                for lev, (qa, qb) in zip(levels, state.get("tree_q", [])):
+                    lev["qx"].set(qa)
+                    lev["qy"].set(qb)
         t_setup = time.perf_counter() - t_start
 
         def tv_value():
             self.k.tv_value_local(q, gc, None, x.data, T.data, dz.data, nbr[0].data, nbr[1].data, ncc)
-            return float(clarray.sum(dz, dtype=np.float64).get())
+            v = float(clarray.sum(dz, dtype=np.float64).get()) * leaf_edge
+            for lev in levels:
+                self.k.tree_sums(q, lev["g"], None, x.data, lev["ptr"].data, lev["idx"].data, scr["s"].data, lev["nn"])
+                self.k.tv_value_local(q, lev["g"], None, scr["s"].data, lev["A"].data, scr["w"].data, lev["right"].data,
+                                      lev["down"].data, lev["nn"])
+                v += float(clarray.sum(scr["w"][:lev["n"]], dtype=np.float64).get()) * lev["edge"]
+            return v
+
+        def tree_step():
+            """Adds the levels' D^T dq to dz (after the leaf level has written it)."""
+            for lev in levels:
+                self.k.tree_sums(q, lev["g"], None, x.data, lev["ptr"].data, lev["idx"].data, scr["s"].data, lev["nn"])
+                self.k.tv_dual_local(q, lev["g"], None, scr["s"].data, lev["A"].data, lev["qx"].data, lev["qy"].data,
+                                     scr["dqx"].data, scr["dqy"].data, lev["right"].data, lev["down"].data,
+                                     np.float32(self.tv * lev["edge"]), ps_lev, lev["nn"])
+                self.k.tv_adjoint_local(q, lev["g"], None, scr["dqx"].data, scr["dqy"].data, scr["w"].data, lev["left"].data,
+                                        lev["up"].data, lev["nn"])
+                self.k.tree_scatter(q, gc, None, scr["w"].data, lev["map"].data, dz.data, ncc)
 
         inv_p, lam = np.float32(self._inv_p_data), np.float32(self.lam)
         ep0 = int(state["epoch"]) if state is not None else 0
@@ -829,6 +882,7 @@ class SPDHGPoisson:
                     self.k.tv_dual_local(q, gc, None, x.data, T.data, qx.data, qy.data, dqx.data, dqy.data,
                                          nbr[0].data, nbr[1].data, *tv_args, ncc)
                     self.k.tv_adjoint_local(q, gc, None, dqx.data, dqy.data, dz.data, nbr[2].data, nbr[3].data, ncc)
+                    tree_step()
                     ip = np.float32(1.0 / self.tv_prob)
                 self.k.spdhg_update(q, gc, None, x.data, np.uint64(0), z.data, np.uint64(0), T.data, np.uint64(0),
                                     dz.data, ip, lam, ncc)
@@ -869,6 +923,13 @@ class SPDHGPoisson:
             self.state.update(qx=qx.get(), qy=qy.get())
             for a in [qx, qy, dqx, dqy] + nbr:
                 a.base_data.release()
+            if levels:
+                self.state["tree_q"] = [(lev["qx"].get(), lev["qy"].get()) for lev in levels]
+                for lev in levels:
+                    for name in ("ptr", "idx", "map", "right", "down", "left", "up", "A", "qx", "qy"):
+                        lev[name].base_data.release()
+                for a in scr.values():
+                    a.base_data.release()
         self.final_stats = {"epochs": len(self.iter_stats), "final_f": f, "setup_s": t_setup, "rho": self.rho_used,
                             "subsets": self.M, "resident": self.resident_used, "time": time.perf_counter() - t_start,
                             "tv": self.tv, "tv_prob": self.tv_prob, **self.scales}
@@ -880,6 +941,42 @@ class SPDHGPoisson:
         del uploaded
         self.b = self.w = self.g = self.bg = self._part = self.y = self.sig = self.D = None
         return x if x_on_gpu else host_x
+
+
+def _tree_levels(q, op, tree, T, elementwise):
+    """The device arrays of the hierarchical TV's levels (OrientationTree.levels()) on the local operator's coefficients:
+    per level the node-pixels (a node with at least one coefficient in the pixel), CSR ptr / idx from the node-pixels to
+    the flat coefficients, map = the node-pixel of a flat coefficient, right / down / left / up neighbours of a
+    node-pixel (-1: none), A = the sum of the coefficients' primal steps T over the node-pixel, which takes the place of
+    T in the dual step (module docstring), and the duals qx, qy."""
+    k, iy, ix, pi = op._pairs()
+    k, iy, ix, pi = (np.asarray(a, np.int64) for a in (k, iy, ix, pi))
+    Ny, Nx = int(op.Ny), int(op.Nx)
+    nc = int(op.n_coef)
+    Th = T.get()
+    out = []
+    for node, edge in tree.levels():
+        key = (node[k] * Ny + iy) * Nx + ix
+        u, inv = np.unique(key, return_inverse=True)
+        n = len(u)
+        order = np.argsort(inv, kind="stable")
+        ptr = np.r_[0, np.cumsum(np.bincount(inv, minlength=n))]
+        map_ = np.full(nc, -1, np.int32)
+        map_[pi] = inv
+        uix, uiy = u % Nx, (u // Nx) % Ny
+
+        def neighbour(key2, ok):
+            j = np.minimum(np.searchsorted(u, key2), n - 1)
+            return np.where(ok & (u[j] == key2), j, -1).astype(np.int32)
+        arrays = {"ptr": ptr.astype(np.int32), "idx": pi[order].astype(np.int32), "map": map_,
+                  "right": neighbour(u + 1, uix < Nx - 1), "down": neighbour(u + Nx, uiy < Ny - 1),
+                  "left": neighbour(u - 1, uix > 0), "up": neighbour(u - Nx, uiy > 0),
+                  "A": np.bincount(inv, weights=np.asarray(Th[pi], np.float64), minlength=n).astype(np.float32)}
+        lev = {name: clarray.to_device(q, a) for name, a in arrays.items()}
+        lev.update(n=n, edge=float(edge), qx=clarray.zeros(q, (n,), np.float32), qy=clarray.zeros(q, (n,), np.float32))
+        lev["g"], lev["nn"] = elementwise(n)
+        out.append(lev)
+    return out
 
 
 def _patch_neighbours(op):
