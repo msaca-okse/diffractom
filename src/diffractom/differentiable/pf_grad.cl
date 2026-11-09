@@ -20,6 +20,22 @@
 #define Q_TTH (Q_TILT + 2)
 #define NQ (Q_TTH + PMAX)
 
+// WINDOW_PARALLAX (as pf_generate.cl): the axis weights carry the window fraction of the orientation at this angle. It
+// does not depend on the rotation or the width, so their derivatives just carry it; the two-theta derivative ignores it.
+#ifdef WINDOW_PARALLAX
+#define WP_DECL , __global const float2 *wp_pos, __global const float4 *wp_cov, __global const float2 *wp_b, \
+                __global const float4 *wp_ax, __global const float2 *wp_ch, const float wp_invD
+inline float wp_frac(const float4 aw, const float wx, const float wvar, const float2 wlh, const float invD)
+{
+    const float sh = aw.x - wx * invD * aw.y, g = aw.y * invD;
+    const float is = rsqrt(2.0f * (aw.z + g * g * wvar));
+    const float zh = (wlh.y - sh) * is, zl = (wlh.x - sh) * is;
+    return (zl > 0.0f) ? 0.5f * (erfc(zl) - erfc(zh)) : (zh < 0.0f) ? 0.5f * (erfc(-zh) - erfc(-zl)) : 0.5f * (erf(zh) - erf(zl));
+}
+#else
+#define WP_DECL
+#endif
+
 __kernel void pf_param_vjp(
     __global const int *row_ptr, __global const ushort *col_j,
     __global const float *res, __global const float *curv, __global const float *sino,
@@ -31,7 +47,7 @@ __kernel void pf_param_vjp(
     const int My, const int Kb, const int Kstride, const int k0, const int C, const int P, const int A,
     const int S, const int S_eta, const int normalized, const int flags, __local float *lS,
     __global const float *w_rot, __global const float *dw_t1, __global const float *dw_t2,
-    __global const float *ax_st, __global const float *ax_ct)
+    __global const float *ax_st, __global const float *ax_ct WP_DECL)
 {
     __local float red[LS];
     const int row = get_group_id(0);
@@ -41,6 +57,12 @@ __kernel void pf_param_vjp(
     for (int y = lid; y < My; y += LS) lS[y] = sino[((size_t)r * My + y) * Kstride + k];
     barrier(CLK_LOCAL_MEM_FENCE);
 
+#ifdef WINDOW_PARALLAX
+    const float2 wpb = wp_b[r], wpq = wp_pos[kg];
+    const float4 wpc = wp_cov[kg];
+    const float wpx = wpq.x * wpb.x + wpq.y * wpb.y;
+    const float wpv = wpc.x * wpb.x * wpb.x + 2.0f * wpc.y * wpb.x * wpb.y + wpc.z * wpb.y * wpb.y;
+#endif
     const float sinv = inv_sigma2[kg];
     const float sig = rsqrt(sinv);
     const int w_eta = flags & 1, w_tilt = flags & 2, w_tth = flags & 4;
@@ -89,7 +111,11 @@ __kernel void pf_param_vjp(
                     const float x1 = (1.0f - ad) * sinv, x2 = (1.0f + ad) * sinv;
                     const float e1 = x1 < PF_CUT ? exp(-x1) : 0.0f;
                     const float e2 = x2 < PF_CUT ? exp(-x2) : 0.0f;
+#ifdef WINDOW_PARALLAX
+                    const float cw = w * axis_count[a] * wp_frac(wp_ax[a], wpx, wpv, wp_ch[p], wp_invD);
+#else
                     const float cw = w * axis_count[a];
+#endif
                     const float gd = cw * copysign(sinv, D) * (e1 - e2);
                     dr0 += gd * (ny * vz - nz * vy);
                     dr1 += gd * (nz * vx - nx * vz);

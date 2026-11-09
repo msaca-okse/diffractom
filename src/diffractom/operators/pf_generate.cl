@@ -42,15 +42,38 @@
 #define TH_IDX p
 #endif
 
+// WINDOW_PARALLAX: the data channels are windows [lo, hi] in 2theta that cut the radial profile of a reflection; a
+// grain at depth x along the beam (downstream > 0) sees its ring shifted by -(x / D) sin(2theta) cos(2theta). The weight
+// of every pole axis is multiplied by the fraction of a Gaussian radial profile inside the window at the shifted angle,
+// for the orientation's mean depth at this angle; the spread of its depths (variance along the beam) widens the profile:
+// sd^2 = sigma_a^2 + (sin 2theta cos 2theta / D)^2 var(x). wp_pos (K): mean position, wp_cov (K): covariance (xx, xy, yy)
+// in the image plane (translation bins, relative to the rotation axis); wp_b (R): the beam direction in the image plane per
+// angle; wp_ax (A): (2theta, sin 2theta cos 2theta, sigma^2, 0); wp_ch (P): (lo, hi); wp_invD = 1 / D.
+#ifdef WINDOW_PARALLAX
+#define WP_DECL , __global const float2 *wp_pos, __global const float4 *wp_cov, __global const float2 *wp_b, \
+                __global const float4 *wp_ax, __global const float2 *wp_ch, const float wp_invD
+#define WP_PASS , wp_pos, wp_cov, wp_b, wp_ax, wp_ch, wp_invD
+#else
+#define WP_DECL
+#define WP_PASS
+#endif
+
 inline float pf_entry(__global const float *coords, __global const float *poles, __global const int *axis_start,
                       __global const float *axis_count, __global const float *qw, float inv_sig2, float norm, int r,
                       int kg, int c, int p, int S, int C, int S_eta, int P, int A,
-                      __global const float *w, __global const float *ax_st, __global const float *ax_ct)
+                      __global const float *w, __global const float *ax_st, __global const float *ax_ct WP_DECL)
 {
     // the loop body of pfmatrix_eval_poles
     int a0 = axis_start[p], a1 = axis_start[p + 1];
     int pole_base = kg * A * 3;
     float w_total = 0.0f;
+#ifdef WINDOW_PARALLAX
+    const float2 wb = wp_b[r], wq = wp_pos[kg];
+    const float4 wc = wp_cov[kg];
+    const float wx = wq.x * wb.x + wq.y * wb.y;
+    const float wvar = wc.x * wb.x * wb.x + 2.0f * wc.y * wb.x * wb.y + wc.z * wb.y * wb.y;
+    const float2 wlh = wp_ch[p];
+#endif
     for (int s = 0; s < S; ++s) {
         for (int se = 0; se < S_eta; ++se) {
 #ifdef AXIS_THETA
@@ -78,6 +101,17 @@ inline float pf_entry(__global const float *coords, __global const float *poles,
                 if (e1 < PF_CUT) t += exp(-e1);
                 float e2 = (1.0f + d) * inv_sig2;
                 if (e2 < PF_CUT) t += exp(-e2);
+#ifdef WINDOW_PARALLAX
+                {
+                    const float4 aw = wp_ax[a];
+                    const float sh = aw.x - wx * wp_invD * aw.y;
+                    const float g = aw.y * wp_invD;
+                    const float is = rsqrt(2.0f * (aw.z + g * g * wvar));
+                    const float zh = (wlh.y - sh) * is, zl = (wlh.x - sh) * is;      // fraction in [lo, hi]; erfc in the tails
+                    t *= (zl > 0.0f) ? 0.5f * (erfc(zl) - erfc(zh)) : (zh < 0.0f) ? 0.5f * (erfc(-zh) - erfc(-zl))
+                                                                    : 0.5f * (erf(zh) - erf(zl));
+                }
+#endif
 #ifdef QUAD_WEIGHTED
                 w_node += axis_count[a] * t;
 #else
@@ -241,7 +275,7 @@ __kernel void pf_gen_evaluate(
     __global const float *qw, __global const float *intens, __global float *cand_val, __global int *flag,
     const int n_rows, const int n_flags, const int Kb, const int k0, const int C, const int P, const int A,
     const int S, const int S_eta, const int normalized, __global const int *omegas, const int use_om,
-    __global const float *w, __global const float *ax_st, __global const float *ax_ct)
+    __global const float *w, __global const float *ax_st, __global const float *ax_ct WP_DECL)
 {
     int i = get_global_id(0);
     if (i >= n_flags) return;
@@ -250,7 +284,7 @@ __kernel void pf_gen_evaluate(
     int r = row / Kb, kg = k0 + row % Kb, c = j / P, p = j % P;
     if (use_om) r = omegas[r];
     float v = pf_entry(coords, poles, axis_start, axis_count, qw, inv_sigma2[kg], norm_factor[kg], r, kg, c, p,
-                       S, C, S_eta, P, A, w, ax_st, ax_ct);
+                       S, C, S_eta, P, A, w, ax_st, ax_ct WP_PASS);
     if (!normalized) v *= intens[p];   // as SCALE_PF_BY_INTENSITY_INPLACE
     cand_val[i] = v;
     flag[i] = (v != 0.0f);
