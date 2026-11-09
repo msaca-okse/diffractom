@@ -1749,6 +1749,71 @@ class SinglePhaseForwardOperator:
             self._adjoint_batch(data, ib, out_batch, 0, self.K_batch_max)
             update(b["k_start"], b["K_batch"])
 
+    def adjoint_multi_cl(self, datas, consume, row_masks=(None,), batch_done=None):
+        """Several adjoints in one pass over the orientation batches, sharing each batch's PF matrix.
+
+        For every orientation batch k0 .. k0+Kb-1 the PF matrix is made once (stored, or generated once) and its
+        transpose applied to every array in ``datas`` (all angle rows); each product is then back-projected once per
+        entry of ``row_masks`` (None: all rows; else an (N_Omega,) bool array of the rows that count) and handed to
+        ``consume(i, s, k0, Kb, img_k)``: data array i, row mask s, img_k = the batch image block (Nx*Ny, K_batch_max),
+        pixel-major (img_k[p, k], pixel p = x + Nx*y, columns k < Kb valid), overwritten by the next call.
+        ``batch_done(k0, Kb)`` follows every batch.
+
+        consume(i, s, ...) receives the values adjoint_cl(datas[i] with the rows outside mask s set to zero) has for
+        these orientations, bitwise: the PF product of an angle row depends only on that row's data, and the other
+        rows reach the back-projection as zeros in both cases. The difference is the cost: the PF matrix is made once
+        for all len(datas) x len(row_masks) adjoints, and the product runs once per data array.
+
+        Needs pf_mode "sparse" or "generated", the native projector and the (K, Ny, Nx) coefficient layout.
+        """
+        if self.pf_mode not in ("sparse", "generated") or self.projector != "native" \
+                or getattr(self, "coefficient_layout", "dense") != "dense":
+            raise NotImplementedError("adjoint_multi_cl needs pf_mode 'sparse' or 'generated', the native projector and "
+                                      "the (K, Ny, Nx) coefficient layout")
+        for d in datas:
+            check_device(d, self.data_shape, "data")
+        R, My, Kmax = int(self.N_Omega), int(self.My), self.K_batch_max
+        CP = int(self.N_eta * self.N_peaks)
+        alpha = R / np.pi
+        masks = []
+        for m in row_masks:
+            if m is None:
+                masks.append(None)
+                continue
+            m = np.asarray(m, dtype=bool).reshape(-1)
+            if m.size != R:
+                raise ValueError(f"a row mask needs {R} entries (one per rotation angle), not {m.size}")
+            masks.append(clarray.to_device(self.queue, m.astype(np.int8)))
+        sino_m = None
+        if any(m is not None for m in masks):
+            from pyopencl.elementwise import ElementwiseKernel
+            if getattr(self, "_k_mask_rows", None) is None:
+                self._k_mask_rows = ElementwiseKernel(self.ctx, "float *out, const float *inp, const char *keep, const long row",
+                                                      "out[i] = keep[i / row] ? inp[i] : 0.0f;", "mask_rows")
+            sino_m = clarray.empty(self.queue, self.coeffs_sino_C.shape, np.float32)
+        ls, chunk = self._spmm_setup()
+        jc = min(CP, chunk)
+        for ib, b in enumerate(self.batches):
+            k0, Kb = b["k_start"], b["K_batch"]
+            sb = self._pf_batch(ib, forward=False)          # made once for all the data arrays of this batch
+            for i, data in enumerate(datas):
+                self.k.spmm_pf_adjoint_c(
+                    self.queue, (-(-Kb // ls) * ls, -(-My // SPMM_TY), R), (ls, 1, 1),
+                    data.data, sb["row_ptr_a"].data, sb["col_j"].data, sb["val_a"].data, self.coeffs_sino_C.data,
+                    np.int32(R), np.int32(My), np.int32(Kb), np.int32(CP), np.int32(Kmax), np.float32(alpha),
+                    np.int32(jc), cl.LocalMemory(4 * SPMM_TY * jc))
+                for s, m in enumerate(masks):
+                    src = self.coeffs_sino_C
+                    if m is not None:
+                        self._k_mask_rows(sino_m, self.coeffs_sino_C, m, np.int64(My * Kmax))
+                        src = sino_m
+                    self.radon.backward(src, self._img_k, Kmax)
+                    consume(i, s, k0, Kb, self._img_k)
+            if batch_done is not None:
+                batch_done(k0, Kb)
+        if sino_m is not None:
+            sino_m.base_data.release()
+
     def _adjoint_batch(self, data, ib, target, k_target, K_target, subset=None):
         """A^T data for orientation batch ib, written to orientations k_target .. k_target+Kb-1
         of target, a (K_target, Ny, Nx) C-order array. subset=m: A_m^T (the rows of the angles of

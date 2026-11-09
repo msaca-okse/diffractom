@@ -328,6 +328,35 @@ as large as with the global basis. All solvers run on it except the TV prox;
 `FISTASum` combines it with global operators (e.g. a coarse basis for a fine-grained
 phase). Not supported: streaming (not needed), projectors other than the native one.
 
+### Searching the residual for missing orientations
+
+A basis built from indexing or from a bulk texture misses crystals. `diffractom.orientation_search`
+looks for them in the residual of a fit: for every candidate orientation (e.g. a uniform grid over
+the fundamental zone) and every pixel of a coarse image grid it computes the Poisson score test
+z = (A^T e) / sqrt(A^T d), with e = w/g (b/mu - 1) and d = w/(g mu) from the data b, the fit's
+prediction mu, the gain g and the weights w (`poisson_score_inputs`), and keeps the best candidates
+per pixel (`score_candidates`). A real crystal scores high on the fitted angles and on held-out angles;
+the same residual with its azimuths scrambled (`scramble_eta`) gives the size of z that orientation-free
+structure reaches. Candidates that pass go into the basis and the model is refitted.
+
+```python
+import pyopencl.array as cl_array
+from diffractom.orientation_search import poisson_score_inputs, scramble_eta, score_candidates
+
+e, d = poisson_score_inputs(b, mu, gain, weights)
+e0, d0 = scramble_eta(e, N_eta, N_rings), scramble_eta(d, N_eta, N_rings)
+make_op = lambda R: SinglePhaseForwardOperator(cfg_coarse, material, MatrixGrid(R, np.full(len(R), sigma)),
+                                               max_gb, pf_mode="generated", ctx=ctx, queue=queue)
+dev = [cl_array.to_device(queue, a) for a in (e, d, e0, d0)]
+fitted = (np.arange(N_Omega) // 5) % 5 != 2
+real, null = score_candidates(make_op, grid_rotations, [(dev[0], dev[1]), (dev[2], dev[3])],
+                              [fitted, ~fitted], pixels)
+```
+
+Each chunk of candidates makes its PF matrix once for all inputs and row sets
+(`SinglePhaseForwardOperator.adjoint_multi_cl`), with the same values as one adjoint per masked input:
+on a V100, 30 000 candidates against two (e, d) pairs and two row sets took 50 s instead of 147 s.
+
 ## License
 
 Apache License 2.0
