@@ -31,8 +31,8 @@ def test_wide_windows_are_the_plain_operator(pf_mode):
     assert np.array_equal(plain.direct(c), wp.direct(c))
 
 
-@pytest.mark.parametrize("pf_mode", ["sparse", "generated"])
-def test_every_angle_is_a_plain_operator_with_its_window_fractions(pf_mode):
+@pytest.mark.parametrize("pf_mode,lorentz", [("sparse", 0.0), ("generated", 0.0), ("sparse", 0.5)])
+def test_every_angle_is_a_plain_operator_with_its_window_fractions(pf_mode, lorentz):
     ctx, queue = _context()
     from diffractom.differentiable.absorption import image_direction
     plain = _op(ctx, queue, "sparse")
@@ -49,7 +49,9 @@ def test_every_angle_is_a_plain_operator_with_its_window_fractions(pf_mode):
     K = plain.K
     pos = np.tile([[col, row]], (K, 1)).astype(np.float64)
     ones = [(ix, [1.0] * len(ix)) for ix, _ in WINDOWS]                     # full intensities: the fractions replace the overlaps
-    wp = _op(ctx, queue, pf_mode, rings=ones, window_parallax=dict(windows=win, sigma=sig, distance=D, positions=pos, covariances=np.zeros((K, 3))))
+    gam = np.radians(0.07)
+    wp = _op(ctx, queue, pf_mode, rings=ones, window_parallax=dict(windows=win, sigma=sig, distance=D, positions=pos, covariances=np.zeros((K, 3)),
+                                                              lorentz=lorentz, gamma=gam))
     c = _point_coeffs(plain, col, row)
     d = wp.direct(c).reshape(plain.N_Omega, plain.My, plain.N_eta, plain.N_peaks)
     px = plain.image_width / max(plain.Nx, plain.Ny)
@@ -62,6 +64,7 @@ def test_every_angle_is_a_plain_operator_with_its_window_fractions(pf_mode):
         for p, (ix, _) in enumerate(WINDOWS):
             t = tth_f[ix]; sh = t - (x / D) * np.sin(t) * np.cos(t)
             fr = 0.5 * (erf((win[p, 1] - sh) / (np.sqrt(2) * sig)) - erf((win[p, 0] - sh) / (np.sqrt(2) * sig)))
+            fr = (1 - lorentz) * fr + lorentz * (np.arctan((win[p, 1] - sh) / gam) - np.arctan((win[p, 0] - sh) / gam)) / np.pi
             fr = np.maximum(fr, 1e-12)
             rings_r.append((list(ix), fr.tolist()))
             corr.append((m[ix] * fr).sum() / m[ix].sum())        # normalized: shares are m w / sum(m w)

@@ -48,11 +48,12 @@
 // for the orientation's mean depth at this angle; the spread of its depths (variance along the beam) widens the profile:
 // sd^2 = sigma_a^2 + (sin 2theta cos 2theta / D)^2 var(x). wp_pos (K): mean position, wp_cov (K): covariance (xx, xy, yy)
 // in the image plane (translation bins, relative to the rotation axis); wp_b (R): the beam direction in the image plane per
-// angle; wp_ax (A): (2theta, sin 2theta cos 2theta, sigma^2, 0); wp_ch (P): (lo, hi); wp_invD = 1 / D.
+// angle; wp_ax (A): (2theta, sin 2theta cos 2theta, sigma^2, gamma); wp_ch (P): (lo, hi); wp_invD = 1 / D; wp_eta: the
+// Lorentzian share of a pseudo-Voigt profile (half width gamma; 0: Gaussian).
 #ifdef WINDOW_PARALLAX
 #define WP_DECL , __global const float2 *wp_pos, __global const float4 *wp_cov, __global const float2 *wp_b, \
-                __global const float4 *wp_ax, __global const float2 *wp_ch, const float wp_invD
-#define WP_PASS , wp_pos, wp_cov, wp_b, wp_ax, wp_ch, wp_invD
+                __global const float4 *wp_ax, __global const float2 *wp_ch, const float wp_invD, const float wp_eta
+#define WP_PASS , wp_pos, wp_cov, wp_b, wp_ax, wp_ch, wp_invD, wp_eta
 #else
 #define WP_DECL
 #define WP_PASS
@@ -108,8 +109,11 @@ inline float pf_entry(__global const float *coords, __global const float *poles,
                     const float g = aw.y * wp_invD;
                     const float is = rsqrt(2.0f * (aw.z + g * g * wvar));
                     const float zh = (wlh.y - sh) * is, zl = (wlh.x - sh) * is;      // fraction in [lo, hi]; erfc in the tails
-                    t *= (zl > 0.0f) ? 0.5f * (erfc(zl) - erfc(zh)) : (zh < 0.0f) ? 0.5f * (erfc(-zh) - erfc(-zl))
+                    float fr = (zl > 0.0f) ? 0.5f * (erfc(zl) - erfc(zh)) : (zh < 0.0f) ? 0.5f * (erfc(-zh) - erfc(-zl))
                                                                     : 0.5f * (erf(zh) - erf(zl));
+                    if (wp_eta > 0.0f)                                   // pseudo-Voigt: a Lorentzian share (half width aw.w)
+                        fr = (1.0f - wp_eta) * fr + wp_eta * (atan((wlh.y - sh) / aw.w) - atan((wlh.x - sh) / aw.w)) * 0.31830988618f;
+                    t *= fr;
                 }
 #endif
 #ifdef QUAD_WEIGHTED

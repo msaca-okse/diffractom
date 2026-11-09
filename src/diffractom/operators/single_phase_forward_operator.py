@@ -249,7 +249,9 @@ class SinglePhaseForwardOperator:
             ``windows`` (N_rings, 2) two-theta limits [rad]; ``sigma`` radial profile width [rad], scalar or per
             channel; ``distance`` D, sample-detector distance in translation steps; ``positions`` (K, 2) the
             orientations' mean (col, row) image coordinates and ``covariances`` (K, 3) their spatial covariance
-            (col-col, col-row, row-row) in pixels^2 (grid order; default: the image centre, no spread). The ``rings``
+            (col-col, col-row, row-row) in pixels^2 (grid order; default: the image centre, no spread); ``lorentz``
+            the Lorentzian share of a pseudo-Voigt radial profile (default 0: Gaussian) with half width ``gamma``
+            [rad] (default the Gaussian's half width, sigma sqrt(2 ln 2)). The ``rings``
             weights should then be the reflections' full intensities (overlap 1): the window fraction replaces them.
             Needs a sparse PF mode ("sparse", "generated", "auto" without the dense fallback).
         ctx, queue : optional
@@ -699,7 +701,7 @@ class SinglePhaseForwardOperator:
 
 
 
-    def set_window_parallax(self, windows, sigma, distance, positions=None, covariances=None):
+    def set_window_parallax(self, windows, sigma, distance, positions=None, covariances=None, lorentz=0.0, gamma=None):
         """Window fractions with sample parallax (see the ``window_parallax`` option). Call before the PF matrix is
         built, or rebuild it afterwards (positions in grid order: the operator's orientations)."""
         from ..differentiable.absorption import image_direction
@@ -715,14 +717,17 @@ class SinglePhaseForwardOperator:
         cov = np.zeros((K, 3)) if covariances is None else np.asarray(covariances, np.float64).reshape(K, 3) * px ** 2
         p0 = np.asarray(self.cfg["p_direction_0"], np.float64)[:2]
         b = image_direction(self, p0, np.asarray(self.angles))                # (R, 2) beam (downstream) in (col, row)
-        self.window_parallax = dict(windows=win, sigma=sig_a, distance=float(distance), positions=positions, covariances=covariances)
+        self.window_parallax = dict(windows=win, sigma=sig_a, distance=float(distance), positions=positions, covariances=covariances,
+                                    lorentz=float(lorentz), gamma=gamma)
         self.wp_options = ["-DWINDOW_PARALLAX"]
         f2 = lambda a: clarray.to_device(self.queue, np.ascontiguousarray(a, np.float32).view(cl.cltypes.float2).reshape(-1))
         f4 = lambda a: clarray.to_device(self.queue, np.ascontiguousarray(a, np.float32).view(cl.cltypes.float4).reshape(-1))
         self.wp_pos = f2(pos)
         self.wp_cov = f4(np.concatenate([cov, np.zeros((K, 1))], 1))
         self.wp_b = f2(b)
-        self.wp_ax = f4(np.stack([tth, np.sin(tth) * np.cos(tth), sig_a ** 2, np.zeros(A)], 1))
+        gam = np.sqrt(2 * np.log(2)) * sig_a if gamma is None else np.broadcast_to(np.asarray(gamma, np.float64), (A,))
+        self.wp_ax = f4(np.stack([tth, np.sin(tth) * np.cos(tth), sig_a ** 2, gam], 1))
+        self.wp_eta = np.float32(lorentz)
         self.wp_ch = f2(win)
         self.wp_invD = np.float32(1.0 / float(distance))
         if getattr(self, "pf_gen", None) is not None:                         # the generator's program needs the option
@@ -732,7 +737,7 @@ class SinglePhaseForwardOperator:
         """Extra arguments of the PF generator's evaluate kernel (window_parallax)."""
         if not self.wp_options:
             return []
-        return [self.wp_pos.data, self.wp_cov.data, self.wp_b.data, self.wp_ax.data, self.wp_ch.data, self.wp_invD]
+        return [self.wp_pos.data, self.wp_cov.data, self.wp_b.data, self.wp_ax.data, self.wp_ch.data, self.wp_invD, self.wp_eta]
 
     def transfer_pole_axes_to_gpu(self):
         """

@@ -24,13 +24,16 @@
 // does not depend on the rotation or the width, so their derivatives just carry it; the two-theta derivative ignores it.
 #ifdef WINDOW_PARALLAX
 #define WP_DECL , __global const float2 *wp_pos, __global const float4 *wp_cov, __global const float2 *wp_b, \
-                __global const float4 *wp_ax, __global const float2 *wp_ch, const float wp_invD
-inline float wp_frac(const float4 aw, const float wx, const float wvar, const float2 wlh, const float invD)
+                __global const float4 *wp_ax, __global const float2 *wp_ch, const float wp_invD, const float wp_eta
+inline float wp_frac(const float4 aw, const float wx, const float wvar, const float2 wlh, const float invD, const float eta)
 {
     const float sh = aw.x - wx * invD * aw.y, g = aw.y * invD;
     const float is = rsqrt(2.0f * (aw.z + g * g * wvar));
     const float zh = (wlh.y - sh) * is, zl = (wlh.x - sh) * is;
-    return (zl > 0.0f) ? 0.5f * (erfc(zl) - erfc(zh)) : (zh < 0.0f) ? 0.5f * (erfc(-zh) - erfc(-zl)) : 0.5f * (erf(zh) - erf(zl));
+    float fr = (zl > 0.0f) ? 0.5f * (erfc(zl) - erfc(zh)) : (zh < 0.0f) ? 0.5f * (erfc(-zh) - erfc(-zl)) : 0.5f * (erf(zh) - erf(zl));
+    if (eta > 0.0f)
+        fr = (1.0f - eta) * fr + eta * (atan((wlh.y - sh) / aw.w) - atan((wlh.x - sh) / aw.w)) * 0.31830988618f;
+    return fr;
 }
 #else
 #define WP_DECL
@@ -112,7 +115,7 @@ __kernel void pf_param_vjp(
                     const float e1 = x1 < PF_CUT ? exp(-x1) : 0.0f;
                     const float e2 = x2 < PF_CUT ? exp(-x2) : 0.0f;
 #ifdef WINDOW_PARALLAX
-                    const float cw = w * axis_count[a] * wp_frac(wp_ax[a], wpx, wpv, wp_ch[p], wp_invD);
+                    const float cw = w * axis_count[a] * wp_frac(wp_ax[a], wpx, wpv, wp_ch[p], wp_invD, wp_eta);
 #else
                     const float cw = w * axis_count[a];
 #endif
