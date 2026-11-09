@@ -38,8 +38,8 @@ class PFGradient:
         self.q_eta, self.q_tilt, self.q_tth = 4 + nh, 5 + nh, 7 + nh
         self.NQ = self.q_tth + self.P
         src = Path(__file__).with_name("pf_grad.cl").read_text()
-        opts = list(op.pf_cut_options) + list(op.quad_options) + [f"-DPMAX={self.P}", f"-DHESS={int(self.hessian)}",
-                                                                   f"-DLS={self.ls}"]
+        opts = list(op.pf_cut_options) + list(op.quad_options) + list(getattr(op, "wp_options", [])) + [
+            f"-DPMAX={self.P}", f"-DHESS={int(self.hessian)}", f"-DLS={self.ls}"]
         prg = cl.Program(op.ctx, src).build(options=opts)
         self.k_vjp = cl.Kernel(prg, "pf_param_vjp")
         self.k_sum = cl.Kernel(prg, "rows_to_orientations")
@@ -157,7 +157,8 @@ class PFGradient:
                        (op.w_gpu_or_dummy if getattr(op, "reflection_two_theta", False) else self.dummy).data,
                        self._dw[0], self._dw[1],
                        (op.axis_sin_gpu if getattr(op, "reflection_two_theta", False) else self.dummy).data,
-                       (op.axis_cos_gpu if getattr(op, "reflection_two_theta", False) else self.dummy).data)
+                       (op.axis_cos_gpu if getattr(op, "reflection_two_theta", False) else self.dummy).data,
+                       *(op.wp_args() if hasattr(op, "wp_args") else []))
             n = Kb * self.NQ
             self.k_sum(q, (-(-n // 64) * 64,), (64,), self.rows.data, self.per_k.data, np.int32(R), np.int32(Kb))
             per_k[k0:k0 + Kb] = self.per_k[:n].get().reshape(Kb, self.NQ)

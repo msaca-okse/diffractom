@@ -192,6 +192,7 @@ class SinglePhaseForwardOperator:
         rings=None,
         ring_two_theta=None,
         reflection_two_theta: bool = False,
+        window_parallax=None,
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -239,6 +240,20 @@ class SinglePhaseForwardOperator:
             directions are then stored once for all channels, n(eta, omega, theta) = cos(theta) u(eta, omega) -
             sin(theta) w(omega), so the memory of the quadrature nodes no longer grows with the number of channels.
             Default False: results are bitwise those of earlier versions.
+        window_parallax : dict, optional
+            Channels are integration windows that cut reflections' radial profiles, and a grain's depth x along the beam
+            (downstream > 0) shifts its rings by -(x / D) sin(2 theta) cos(2 theta) (sample parallax). Every pole
+            axis's weight is then multiplied by the fraction of a Gaussian radial profile (width ``sigma``) inside its
+            window at the shifted angle, for every orientation at every rotation angle; the spread of the orientation's
+            depths widens the profile (sd^2 = sigma^2 + (sin 2theta cos 2theta / D)^2 var(x)). Keys:
+            ``windows`` (N_rings, 2) two-theta limits [rad]; ``sigma`` radial profile width [rad], scalar or per
+            channel; ``distance`` D, sample-detector distance in translation steps; ``positions`` (K, 2) the
+            orientations' mean (col, row) image coordinates and ``covariances`` (K, 3) their spatial covariance
+            (col-col, col-row, row-row) in pixels^2 (grid order; default: the image centre, no spread); ``lorentz``
+            the Lorentzian share of a pseudo-Voigt radial profile (default 0: Gaussian) with half width ``gamma``
+            [rad] (default the Gaussian's half width, sigma sqrt(2 ln 2)). The ``rings``
+            weights should then be the reflections' full intensities (overlap 1): the window fraction replaces them.
+            Needs a sparse PF mode ("sparse", "generated", "auto" without the dense fallback).
         ctx, queue : optional
             Existing OpenCL context/queue; created automatically if None.
         pf_mode : {"auto", "sparse", "generated", "dense"}
@@ -419,6 +434,10 @@ class SinglePhaseForwardOperator:
         self.detector_coordinates()
         self.transfer_grid_parameters_to_gpu()
         self.transfer_pole_axes_to_gpu()
+        self.wp_options = []
+        self.window_parallax = None
+        if window_parallax is not None:
+            self.set_window_parallax(**dict(window_parallax))
         self.get_pf_batches_for_material()  # list of dicts
 
 
@@ -681,6 +700,44 @@ class SinglePhaseForwardOperator:
             )
 
 
+
+    def set_window_parallax(self, windows, sigma, distance, positions=None, covariances=None, lorentz=0.0, gamma=None):
+        """Window fractions with sample parallax (see the ``window_parallax`` option). Call before the PF matrix is
+        built, or rebuild it afterwards (positions in grid order: the operator's orientations)."""
+        from ..differentiable.absorption import image_direction
+        P, A, K = self.N_peaks, self.N_axes, self.K
+        win = np.asarray(windows, np.float64).reshape(P, 2)
+        st = np.asarray(self.axis_start_cpu); ch = np.repeat(np.arange(P), np.diff(st))
+        tth = np.asarray(self.axis_two_theta_built, np.float64) if self.reflection_two_theta else np.asarray(self.two_theta_peaks, np.float64)[ch]
+        sig = np.asarray(sigma, np.float64)
+        sig_a = np.broadcast_to(sig, (A,)) if sig.ndim == 0 or sig.size == A and sig.size != P else sig.reshape(P)[ch]
+        px = self.image_width / max(self.Nx, self.Ny)                         # translation steps per pixel
+        cxy = np.array([(self.Nx - 1) / 2, (self.Ny - 1) / 2])
+        pos = np.zeros((K, 2)) if positions is None else (np.asarray(positions, np.float64).reshape(K, 2) - cxy) * px
+        cov = np.zeros((K, 3)) if covariances is None else np.asarray(covariances, np.float64).reshape(K, 3) * px ** 2
+        p0 = np.asarray(self.cfg["p_direction_0"], np.float64)[:2]
+        b = image_direction(self, p0, np.asarray(self.angles))                # (R, 2) beam (downstream) in (col, row)
+        self.window_parallax = dict(windows=win, sigma=sig_a, distance=float(distance), positions=positions, covariances=covariances,
+                                    lorentz=float(lorentz), gamma=gamma)
+        self.wp_options = ["-DWINDOW_PARALLAX"]
+        f2 = lambda a: clarray.to_device(self.queue, np.ascontiguousarray(a, np.float32).view(cl.cltypes.float2).reshape(-1))
+        f4 = lambda a: clarray.to_device(self.queue, np.ascontiguousarray(a, np.float32).view(cl.cltypes.float4).reshape(-1))
+        self.wp_pos = f2(pos)
+        self.wp_cov = f4(np.concatenate([cov, np.zeros((K, 1))], 1))
+        self.wp_b = f2(b)
+        gam = np.sqrt(2 * np.log(2)) * sig_a if gamma is None else np.broadcast_to(np.asarray(gamma, np.float64), (A,))
+        self.wp_ax = f4(np.stack([tth, np.sin(tth) * np.cos(tth), sig_a ** 2, gam], 1))
+        self.wp_eta = np.float32(lorentz)
+        self.wp_ch = f2(win)
+        self.wp_invD = np.float32(1.0 / float(distance))
+        if getattr(self, "pf_gen", None) is not None:                         # the generator's program needs the option
+            self.pf_gen = None
+
+    def wp_args(self):
+        """Extra arguments of the PF generator's evaluate kernel (window_parallax)."""
+        if not self.wp_options:
+            return []
+        return [self.wp_pos.data, self.wp_cov.data, self.wp_b.data, self.wp_ax.data, self.wp_ch.data, self.wp_invD, self.wp_eta]
 
     def transfer_pole_axes_to_gpu(self):
         """
@@ -1078,6 +1135,8 @@ class SinglePhaseForwardOperator:
         C = int(self.N_eta)
         P = int(self.N_peaks)
         Kmax = self.K_batch_max
+        if self.wp_options:
+            raise ValueError("window_parallax needs a sparse PF mode (the dense PF path does not apply window fractions)")
         self.pfpoles_kernel(
             self.queue,
             (R * Kmax * C * P,),

@@ -74,6 +74,22 @@ def _grid_arrays(grid):
     return mats, sigmas
 
 
+def spatial_moments(k, iy, ix, v, K):
+    """Per orientation (grid order, K of them) the mean (col, row) and the covariance (col-col, col-row, row-row) of its
+    voxels, weighted by v (default 1): positions for the ``window_parallax`` option, e.g. from a fit's coefficients
+    (``to_coo``). Orientations without weight get the image origin and no spread."""
+    k = np.asarray(k, np.int64); x = np.asarray(ix, np.float64); y = np.asarray(iy, np.float64)
+    w = np.ones(len(k)) if v is None else np.clip(np.asarray(v, np.float64), 0, None)
+    W = np.bincount(k, w, minlength=K); Wn = np.maximum(W, 1e-300)
+    mx, my = np.bincount(k, w * x, minlength=K) / Wn, np.bincount(k, w * y, minlength=K) / Wn
+    dx, dy = x - mx[k], y - my[k]
+    cov = np.stack([np.bincount(k, w * dx * dx, minlength=K), np.bincount(k, w * dx * dy, minlength=K),
+                    np.bincount(k, w * dy * dy, minlength=K)], 1) / Wn[:, None]
+    pos = np.stack([mx, my], 1)
+    pos[W <= 0] = 0.0; cov[W <= 0] = 0.0
+    return pos, cov
+
+
 class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
     """
     data = PF @ Radon(coeffs) with a local basis.
@@ -169,6 +185,13 @@ class LocalSinglePhaseForwardOperator(SinglePhaseForwardOperator):
         t_patch = time.perf_counter() - t0
 
         inner = MatrixGrid(mats[self.orientation_index], sigmas[self.orientation_index])
+        if kwargs.get("window_parallax") is not None:            # positions in grid order -> operator order
+            wp = dict(kwargs["window_parallax"])
+            if wp.get("positions") is None:                      # default: the support's centroid and spread
+                wp["positions"], wp["covariances"] = spatial_moments(support.k, support.iy, support.ix, None, self.K_basis)
+            pos = np.asarray(wp["positions"], np.float64).reshape(self.K_basis, 2)[self.orientation_index]
+            cov = None if wp.get("covariances") is None else np.asarray(wp["covariances"], np.float64).reshape(self.K_basis, 3)[self.orientation_index]
+            kwargs["window_parallax"] = {**wp, "positions": pos, "covariances": cov}
         super().__init__(cfg, material, inner, max_gb, verbose=verbose, projector="native", **kwargs)
         if self.pf_mode == "dense":
             self.free_memory()

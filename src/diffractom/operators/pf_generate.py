@@ -59,7 +59,7 @@ class SparsePFGenerator:
             x, _ = nodes_weights(op.quadrature.p_eta, op.quadrature.k_eta)
             quad += [f"-DQX_LO={float(x.min())!r}f", f"-DQX_HI={float(x.max())!r}f"]
         prg = cl.Program(op.ctx, src).build(options=[f"-DMAXWC={maxwc}", f"-DPPW={self.ppw}", f"-DRPG={self.rpg}",
-                                                     *op.pf_cut_options, *quad])
+                                                     *op.pf_cut_options, *quad, *getattr(op, "wp_options", [])])
         self.k = {n: cl.Kernel(prg, n) for n in ("pf_gen_candidates", "pf_gen_evaluate", "pf_gen_compact",
                                                   "pf_gen_count_fwd", "pf_gen_fill_fwd", "pf_gen_rank_rows",
                                                   "pf_gen_row_of", "pf_gen_sub_counts", "pf_gen_sub_lengths",
@@ -239,7 +239,7 @@ class SparsePFGenerator:
                              *self._ints(n_rows, n_flags, Kb, k0, C, P, op.N_axes, op.N_Omega_subdivisions,
                                          op.N_eta_subdivisions, op.normalized),
                              (sub if sub is not None else self.cnt).data, np.int32(sub is not None),
-                             op.w_gpu_or_dummy.data, op.axis_sin_gpu.data, op.axis_cos_gpu.data)
+                             op.w_gpu_or_dummy.data, op.axis_sin_gpu.data, op.axis_cos_gpu.data, *op.wp_args())
         self.scan(self.flag[:n_flags], self.pos[:n_flags], allocator=self.pool)
         k["pf_gen_compact"](q, (_ceil(max(cap, n_rows + 1)),), (_LOCAL,),
                             self.cand_j.data, self.cand_row.data, self.cand_val.data, self.flag.data,
