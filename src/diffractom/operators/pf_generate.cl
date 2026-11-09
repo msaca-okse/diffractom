@@ -34,9 +34,18 @@
 
 #define MARK(c) { int _c = (c); _Pragma("unroll") for (int _w = 0; _w < MAXWC; ++_w) if (_w == (_c >> 5)) mask[_w] |= 1u << (_c & 31); }
 
+// AXIS_THETA: every pole axis has its own Bragg angle: coords = u (R, S, C, S_eta, 3), w = the rotated p0 (R * S, 3),
+// v = cos(theta_a) u - sin(theta_a) w
+#ifdef AXIS_THETA
+#define TH_IDX a
+#else
+#define TH_IDX p
+#endif
+
 inline float pf_entry(__global const float *coords, __global const float *poles, __global const int *axis_start,
                       __global const float *axis_count, __global const float *qw, float inv_sig2, float norm, int r,
-                      int kg, int c, int p, int S, int C, int S_eta, int P, int A)
+                      int kg, int c, int p, int S, int C, int S_eta, int P, int A,
+                      __global const float *w, __global const float *ax_st, __global const float *ax_ct)
 {
     // the loop body of pfmatrix_eval_poles
     int a0 = axis_start[p], a1 = axis_start[p + 1];
@@ -44,7 +53,12 @@ inline float pf_entry(__global const float *coords, __global const float *poles,
     float w_total = 0.0f;
     for (int s = 0; s < S; ++s) {
         for (int se = 0; se < S_eta; ++se) {
+#ifdef AXIS_THETA
+            long coord_base = (((long)(r * S + s) * C + c) * S_eta + se) * 3;
+            __global const float *wv = w + (long)(r * S + s) * 3;
+#else
             long coord_base = ((((long)(r * S + s) * C + c) * S_eta + se) * P + p) * 3;  // 64 bit: many nodes
+#endif
             float vx = coords[coord_base + 0];
             float vy = coords[coord_base + 1];
             float vz = coords[coord_base + 2];
@@ -53,7 +67,12 @@ inline float pf_entry(__global const float *coords, __global const float *poles,
 #endif
             for (int a = a0; a < a1; ++a) {
                 int b = pole_base + a * 3;
+#ifdef AXIS_THETA
+                float d = fabs(ax_ct[a] * (poles[b + 0]*vx + poles[b + 1]*vy + poles[b + 2]*vz)
+                               - ax_st[a] * (poles[b + 0]*wv[0] + poles[b + 1]*wv[1] + poles[b + 2]*wv[2]));
+#else
                 float d = fabs(poles[b + 0]*vx + poles[b + 1]*vy + poles[b + 2]*vz);
+#endif
                 float t = 0.0f;
                 float e1 = (1.0f - d) * inv_sig2;
                 if (e1 < PF_CUT) t += exp(-e1);
@@ -86,7 +105,7 @@ __kernel void pf_gen_candidates(
     __global const int *axis_start,    // (P+1,)
     __global const float *inv_sigma2,  // (Ktot,)
     __global const float *frames,      // (R*S, 9): d0, d90, p0 rotated like the probed directions
-    __global const float *sin_th,      // (P,) sin and cos of the Bragg angle
+    __global const float *sin_th,      // (P,) sin and cos of the Bragg angle ((A,) per axis with AXIS_THETA)
     __global const float *cos_th,
     __global int *counts,              // mode 0: (n_rows + 1,)
     __global const int *cand_ptr,      // mode 1: (n_rows + 1,)
@@ -113,8 +132,8 @@ __kernel void pf_gen_candidates(
     if (active) {
         // relaxed threshold: candidates are a superset of the entries with (1 - |n.v|) * inv_sig2 < PF_CUT
         float tau = 1.0f - PF_CUT / inv_sigma2[kg] - 1e-4f;
-        float st = sin_th[p], ct = cos_th[p];
         for (int a = axis_start[p]; a < axis_start[p + 1]; ++a) {
+            float st = sin_th[TH_IDX], ct = cos_th[TH_IDX];
             int b = (kg * A + a) * 3;
             float nx = poles[b], ny = poles[b + 1], nz = poles[b + 2];
             for (int s = 0; s < S; ++s) {
@@ -219,7 +238,8 @@ __kernel void pf_gen_evaluate(
     __global const float *axis_count, __global const float *inv_sigma2, __global const float *norm_factor,
     __global const float *qw, __global const float *intens, __global float *cand_val, __global int *flag,
     const int n_rows, const int n_flags, const int Kb, const int k0, const int C, const int P, const int A,
-    const int S, const int S_eta, const int normalized, __global const int *omegas, const int use_om)
+    const int S, const int S_eta, const int normalized, __global const int *omegas, const int use_om,
+    __global const float *w, __global const float *ax_st, __global const float *ax_ct)
 {
     int i = get_global_id(0);
     if (i >= n_flags) return;
@@ -228,7 +248,7 @@ __kernel void pf_gen_evaluate(
     int r = row / Kb, kg = k0 + row % Kb, c = j / P, p = j % P;
     if (use_om) r = omegas[r];
     float v = pf_entry(coords, poles, axis_start, axis_count, qw, inv_sigma2[kg], norm_factor[kg], r, kg, c, p,
-                       S, C, S_eta, P, A);
+                       S, C, S_eta, P, A, w, ax_st, ax_ct);
     if (!normalized) v *= intens[p];   // as SCALE_PF_BY_INTENSITY_INPLACE
     cand_val[i] = v;
     flag[i] = (v != 0.0f);

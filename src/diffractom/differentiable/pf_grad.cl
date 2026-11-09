@@ -29,7 +29,9 @@ __kernel void pf_param_vjp(
     __global const float *inv_sigma2, __global const float *norm_factor, __global const float *qw,
     __global const float *intens, __global float *out,
     const int My, const int Kb, const int Kstride, const int k0, const int C, const int P, const int A,
-    const int S, const int S_eta, const int normalized, const int flags, __local float *lS)
+    const int S, const int S_eta, const int normalized, const int flags, __local float *lS,
+    __global const float *w_rot, __global const float *dw_t1, __global const float *dw_t2,
+    __global const float *ax_st, __global const float *ax_ct)
 {
     __local float red[LS];
     const int row = get_group_id(0);
@@ -66,11 +68,22 @@ __kernel void pf_param_vjp(
 #else
                 const float w = 1.0f / (float)(S * S_eta);
 #endif
+#ifdef AXIS_THETA
+                const size_t cb = (((size_t)(r * S + s) * C + c) * S_eta + se) * 3;   // coords = u, no ring index
+                const size_t wb = (size_t)(r * S + s) * 3;
+                const float ux = coords[cb], uy = coords[cb + 1], uz = coords[cb + 2];
+                const float wx = w_rot[wb], wy = w_rot[wb + 1], wz = w_rot[wb + 2];
+#else
                 const size_t cb = ((((size_t)(r * S + s) * C + c) * S_eta + se) * P + p) * 3;
                 const float vx = coords[cb], vy = coords[cb + 1], vz = coords[cb + 2];
+#endif
                 for (int a = a0; a < a1; ++a) {
                     const size_t b = ((size_t)kg * A + a) * 3;
                     const float nx = poles[b], ny = poles[b + 1], nz = poles[b + 2];
+#ifdef AXIS_THETA
+                    const float ct = ax_ct[a], st = ax_st[a];
+                    const float vx = ct * ux - st * wx, vy = ct * uy - st * wy, vz = ct * uz - st * wz;
+#endif
                     const float D = nx * vx + ny * vy + nz * vz;
                     const float ad = fabs(D);
                     const float x1 = (1.0f - ad) * sinv, x2 = (1.0f + ad) * sinv;
@@ -83,12 +96,23 @@ __kernel void pf_param_vjp(
                     dr2 += gd * (nx * vy - ny * vx);
                     gs += cw * (e1 + e2);
                     dgs += cw * (-(1.0f - ad) * e1 - (1.0f + ad) * e2);
+#ifdef AXIS_THETA
+                    if (w_eta) de += gd * ct * (nx * dv_eta[cb] + ny * dv_eta[cb + 1] + nz * dv_eta[cb + 2]);
+                    if (w_tilt) {
+                        dt1 += gd * (ct * (nx * dv_t1[cb] + ny * dv_t1[cb + 1] + nz * dv_t1[cb + 2])
+                                     - st * (nx * dw_t1[wb] + ny * dw_t1[wb + 1] + nz * dw_t1[wb + 2]));
+                        dt2 += gd * (ct * (nx * dv_t2[cb] + ny * dv_t2[cb + 1] + nz * dv_t2[cb + 2])
+                                     - st * (nx * dw_t2[wb] + ny * dw_t2[wb + 1] + nz * dw_t2[wb + 2]));
+                    }
+                    if (w_tth) dtt += gd * 0.5f * (-st * (nx * ux + ny * uy + nz * uz) - ct * (nx * wx + ny * wy + nz * wz));
+#else
                     if (w_eta) de += gd * (nx * dv_eta[cb] + ny * dv_eta[cb + 1] + nz * dv_eta[cb + 2]);
                     if (w_tilt) {
                         dt1 += gd * (nx * dv_t1[cb] + ny * dv_t1[cb + 1] + nz * dv_t1[cb + 2]);
                         dt2 += gd * (nx * dv_t2[cb] + ny * dv_t2[cb + 1] + nz * dv_t2[cb + 2]);
                     }
                     if (w_tth) dtt += gd * (nx * dv_tth[cb] + ny * dv_tth[cb + 1] + nz * dv_tth[cb + 2]);
+#endif
                 }
             }
         }

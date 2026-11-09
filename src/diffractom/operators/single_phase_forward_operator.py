@@ -170,6 +170,7 @@ class SinglePhaseForwardOperator:
         sparse_batch_max: int = SPARSE_BATCH_MAX,
         rings=None,
         ring_two_theta=None,
+        reflection_two_theta: bool = False,
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -210,6 +211,13 @@ class SinglePhaseForwardOperator:
         ring_two_theta : (N_rings,) array, optional
             Two-theta (radians) at which a channel's detector directions are evaluated; default: the first
             reflection's (the ring's). With ``rings``: the weighted mean of the window's reflections.
+        reflection_two_theta : bool
+            Evaluate every reflection at its own Bragg angle, instead of all reflections of a channel at the channel's
+            mean two-theta. For integration windows that hold reflections at different two-theta (low-symmetry
+            phases): a reflection a little off the window's mean diffracts at a different (omega, eta). The detector
+            directions are then stored once for all channels, n(eta, omega, theta) = cos(theta) u(eta, omega) -
+            sin(theta) w(omega), so the memory of the quadrature nodes no longer grows with the number of channels.
+            Default False: results are bitwise those of earlier versions.
         ctx, queue : optional
             Existing OpenCL context/queue; created automatically if None.
         pf_mode : {"auto", "sparse", "generated", "dense"}
@@ -348,6 +356,7 @@ class SinglePhaseForwardOperator:
                 raise ValueError("rings: every channel needs >= 1 reflection index and one weight >= 0 per index")
         self._custom_rings = rings is not None
         self._ring_two_theta = None if ring_two_theta is None else np.asarray(ring_two_theta, dtype=np.float32)
+        self.reflection_two_theta = bool(reflection_two_theta)
         self.N_peaks = len(self.ring_reflections)  # number of rings
         self.N_seg = self.N_peaks * self.N_eta
         self.Nx = self.cfg['Nx']
@@ -378,6 +387,8 @@ class SinglePhaseForwardOperator:
 
         # --- build kernels ---
         self.prg, self.k, self.pf_prg = build_all_opencl(self.ctx, ts=16)
+        if self.reflection_two_theta:
+            self.pf_cut_options = self.pf_cut_options + ["-DAXIS_THETA"]
         self.pf_prg = build_pf_program(self.ctx, self.pf_cut_options + self.quad_options)
         self.pfmatrix_eval_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval")
         self.pfpoles_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval_poles")
@@ -527,6 +538,18 @@ class SinglePhaseForwardOperator:
         N_fine_omega = self.N_Omega * self.N_Omega_subdivisions
         Rmats = R.from_rotvec(self.angles_subdivided[:, None] * k0).as_matrix()
 
+        if self.reflection_two_theta:
+            # stored once for all channels: u(omega, eta) (the in-plane part) and w(omega) (the rotated p0); the kernels
+            # form v = cos(theta) u - sin(theta) w with the Bragg angle of each pole axis
+            dirs_zero = (np.cos(eta_angles_2d)[..., np.newaxis] * det_dir_origin[np.newaxis, np.newaxis, :]
+                         + np.sin(eta_angles_2d)[..., np.newaxis] * det_dir_pos90[np.newaxis, np.newaxis, :])
+            self.coords_cpu = np.asarray(np.einsum('oij,esi->oesj', Rmats, dirs_zero).reshape(
+                self.N_Omega, self.N_Omega_subdivisions, self.N_eta, S_eta, 3), dtype=np.float32, order="C")
+            self.coords_gpu = clarray.to_device(self.queue, self.coords_cpu)
+            self.w_cpu = np.asarray(np.einsum('oij,i->oj', Rmats, p_direction_0), dtype=np.float32, order="C")
+            self.w_gpu = clarray.to_device(self.queue, self.w_cpu)
+            return
+
         coords_list = []
         for tt in self.two_theta_peaks:
             twothetahalf = tt / 2.0
@@ -667,6 +690,9 @@ class SinglePhaseForwardOperator:
 
         axes, counts, start = [], [], [0]
         self.ring_family_weights = []
+        two_theta_refl = 2.0 * np.arcsin(np.linalg.norm(np.asarray(self.material.h_vecs, dtype=np.float64), axis=1) / (4.0 * np.pi)
+                                         * (12.398 / float(self.cfg["energy"])))
+        axis_tth = []
         for refl, overlap in zip(self.ring_reflections, self.ring_overlap):
             share = (intensities[refl] if not self.normalized else multiplicity[refl]) * overlap
             if overlap.sum() <= 0:                          # an empty window (intensity 0): any valid shares
@@ -683,6 +709,7 @@ class SinglePhaseForwardOperator:
                 weights.append(np.full(len(img), w))
             images = np.concatenate(images)
             weights = np.concatenate(weights)
+            image_tth = np.repeat(two_theta_refl[refl], len(sym))
             # canonical sign: first non-zero component positive
             first = np.argmax(np.abs(images) > 1e-6, axis=1)
             images = images * np.sign(images[np.arange(len(images)), first])[:, None]
@@ -690,8 +717,16 @@ class SinglePhaseForwardOperator:
             cnt = np.bincount(inverse.ravel(), weights=weights, minlength=len(uniq))
             axes.append(uniq / np.linalg.norm(uniq, axis=1, keepdims=True))
             counts.append(cnt)
+            # Bragg angle of every axis: its reflection's (axes shared by several reflections: their weighted mean; with no
+            # weight, an empty window, the plain mean)
+            nimg = np.bincount(inverse.ravel(), minlength=len(uniq))
+            has = cnt > 0
+            tth_ax = np.bincount(inverse.ravel(), weights=image_tth, minlength=len(uniq)) / nimg
+            tth_ax[has] = np.bincount(inverse.ravel(), weights=weights * image_tth, minlength=len(uniq))[has] / cnt[has]
+            axis_tth.append(tth_ax)
             start.append(start[-1] + len(uniq))
         axes = np.concatenate(axes)
+        self.axis_two_theta_built = np.concatenate(axis_tth)  # (N_axes,) the reflections' own two-theta (radians)
         self.pole_axes_cpu = axes          # (N_axes, 3) unit axes in the crystal frame (for the differentiable model)
         self.N_axes = len(axes)
         self.axis_start_cpu = np.asarray(start, dtype=np.int32)
@@ -704,12 +739,36 @@ class SinglePhaseForwardOperator:
         self.poles_gpu = clarray.to_device(self.queue, np.ascontiguousarray(poles, dtype=np.float32))
         self.axis_start_gpu = clarray.to_device(self.queue, self.axis_start_cpu)
         self.axis_count_gpu = clarray.to_device(self.queue, self.axis_count_cpu)
+        self._transfer_axis_theta()
 
         sigma = self.sigma_cpu
         self.inv_sigma2_gpu = clarray.to_device(self.queue, (1.0 / (sigma * sigma)).astype(np.float32))
         self.norm_factor_gpu = clarray.to_device(self.queue, (1.0 / (8.0 * np.pi * sigma * sigma)).astype(np.float32))
 
 
+
+    def _transfer_axis_theta(self):
+        """sin and cos of the Bragg angle of every pole axis (reflection_two_theta), dummies otherwise. The
+        reflections' own angles, moved with their channel when the channel's two_theta was changed (set_pf_parameters)."""
+        if not self.reflection_two_theta:
+            d = clarray.to_device(self.queue, np.ones(1, np.float32))
+            self.axis_sin_gpu, self.axis_cos_gpu, self.w_gpu_or_dummy = d, d, d
+            self.axis_two_theta_cpu = None
+            return
+        tth = self.axis_two_theta_built.copy()
+        for p, shift in enumerate(self.channel_two_theta_shift()):
+            tth[self.axis_start_cpu[p]:self.axis_start_cpu[p + 1]] += shift
+        self.axis_two_theta_cpu = tth
+        th = 0.5 * tth
+        self.axis_sin_gpu = clarray.to_device(self.queue, np.sin(th).astype(np.float32))
+        self.axis_cos_gpu = clarray.to_device(self.queue, np.cos(th).astype(np.float32))
+        self.w_gpu_or_dummy = self.w_gpu
+
+    def channel_two_theta_shift(self):
+        """(N_peaks,) change of each channel's mean two-theta since the operator was built (radians)."""
+        if getattr(self, "_two_theta_built", None) is None:
+            self._two_theta_built = np.asarray(self.two_theta_peaks, np.float64).copy()
+        return np.asarray(self.two_theta_peaks, np.float64) - self._two_theta_built
 
     def allocate_coefficient_buffer(self, dense=True):
         """Pre-allocate reusable GPU buffers for forward/adjoint computation (with dense, also
@@ -1018,6 +1077,9 @@ class SinglePhaseForwardOperator:
             np.int32(self.N_eta_subdivisions),
             np.int32(k0),
             np.int32(Kb),
+            self.w_gpu_or_dummy.data,
+            self.axis_sin_gpu.data,
+            self.axis_cos_gpu.data,
         )
         if not self.normalized:
             self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, self.intens_gpu)
