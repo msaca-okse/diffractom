@@ -117,6 +117,7 @@ __kernel void pf_gen_candidates(
 {
     __local uint lmask[RPG][PPW][MAXWC];
     __local int lcount[RPG][PPW];
+    __local int lpref[RPG][MAXWC * 32 + 1];
     const int n_rows = R * Kb;
     int lid = get_local_id(0);
     int lr = lid / PPW, p = lid % PPW;
@@ -203,27 +204,28 @@ __kernel void pf_gen_candidates(
         for (int w = 0; w < MAXWC; ++w) lmask[lr][p][w] = mask[w];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    // re-partition: work-item (lr2, w2) writes the candidates in word w2 of row lr2, c then p ascending
-    if (lid >= RPG * MAXWC) return;
-    int lr2 = lid / MAXWC, w2 = lid % MAXWC;
-    int row2 = get_group_id(0) * RPG + lr2;
-    if (row2 >= n_rows) return;
-    int pos = cand_ptr[row2];
-    for (int w = 0; w < w2; ++w)
-        for (int q = 0; q < P; ++q) pos += popcount(lmask[lr2][q][w]);
-    uint lm[PPW];
-    uint uni = 0u;
-    #pragma unroll
-    for (int q = 0; q < PPW; ++q) { lm[q] = (q < P) ? lmask[lr2][q][w2] : 0u; uni |= lm[q]; }
-    while (uni) {
-        int bit = 31 - clz(uni & -uni);   // lowest set bit
-        uni &= uni - 1u;
-        int c = (w2 << 5) + bit;
-        #pragma unroll
-        for (int q = 0; q < PPW; ++q) {
-            if ((lm[q] >> bit) & 1u) {
+    // write the candidates of row lr, eta bin c ascending, then ring q ascending: every work-item of the row takes the eta
+    // bins c = p, p + PPW, ...; the candidates of bin c start at the row's offset plus the candidates of all bins below c
+    // (a prefix over the bins in local memory), so every candidate lands where a sequential pass would put it
+    for (int c = p; c < MAXWC * 32; c += PPW) {
+        int n = 0;
+        for (int q = 0; q < P; ++q) n += (lmask[lr][q][c >> 5] >> (c & 31)) & 1u;
+        lpref[lr][c + 1] = n;
+    }
+    if (p == 0) lpref[lr][0] = 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (p == 0)
+        for (int c = 1; c <= MAXWC * 32; ++c) lpref[lr][c] += lpref[lr][c - 1];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (row >= n_rows) return;
+    const int base = cand_ptr[row];
+    for (int c = p; c < MAXWC * 32; c += PPW) {
+        int pos = base + lpref[lr][c];
+        const int w = c >> 5, b = c & 31;
+        for (int q = 0; q < P; ++q) {
+            if ((lmask[lr][q][w] >> b) & 1u) {
                 cand_j[pos] = (ushort)(c * P + q);
-                cand_row[pos] = row2;
+                cand_row[pos] = row;
                 pos++;
             }
         }

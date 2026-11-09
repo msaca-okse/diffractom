@@ -141,6 +141,51 @@ __kernel void radon_backward_k(
 }
 
 
+// radon_backward_k for a list of pixels and a list of projection angles (rows, ascending): out[k, s] (Kb, npix) for
+// pixel pix[s]. Per pixel and channel the same operations in the same order as radon_backward_k restricted to these
+// angles; the angles left out add exactly zero there when their sinogram rows are zero, so the values equal
+// radon_backward_k of the row-masked sinogram bitwise.
+__kernel void radon_backward_list(
+    __global const float4 *sino,         // (R, Ns, Kstride4)
+    __global float *out,                 // (Kb, npix)
+    __constant float4 *geo,
+    __global const int *pix, __global const int *rows,
+    const int nrows, const int Nx, const int Ns, const int Kstride4, const int Kb, const int npix
+){
+    const int k4 = get_global_id(0), s = get_global_id(1);
+    if (k4 >= Kstride4 || s >= npix) return;
+    const int p = pix[s], x = p % Nx, y = p / Nx;
+    const size_t ks = (size_t)Kstride4;
+    float4 acc = (float4)(0.0f);
+    for (int ia = 0; ia < nrows; ++ia) {
+        const int a = rows[ia];
+        const float4 g = geo[a];
+        const float t = g.x * x + g.y * y + g.z;
+        const int sm = (int)floor(t);
+        const int sp = sm + 1;
+        float4 v = (float4)(0.0f);
+#ifdef TRAPEZOID
+        const float Aa = fmax(fabs(g.x), fabs(g.y)), hw = 0.5f * (1.0f + Aa), top = fmin(1.0f, Aa), iw = 1.0f / Aa;
+        const int sf = (int)floor(t - hw) + 1;
+        #pragma unroll
+        for (int j = 0; j < NTAP; ++j) {
+            const int sj = sf + j;
+            if (sj >= 0 && sj < Ns) v += (clamp(hw - fabs(t - sj), 0.0f, top) * iw) * sino[((size_t)a * Ns + sj) * ks + k4];
+        }
+#else
+        if (sm >= 0 && sm < Ns) v += (1.0f - (t - sm)) * sino[((size_t)a * Ns + sm) * ks + k4];
+        if (sp >= 0 && sp < Ns) v += (1.0f - (sp - t)) * sino[((size_t)a * Ns + sp) * ks + k4];
+#endif
+        acc += g.w * v;
+    }
+    const int k = 4 * k4;
+    if (k < Kb) out[(size_t)k * npix + s] = acc.x;
+    if (k + 1 < Kb) out[(size_t)(k + 1) * npix + s] = acc.y;
+    if (k + 2 < Kb) out[(size_t)(k + 2) * npix + s] = acc.z;
+    if (k + 3 < Kb) out[(size_t)(k + 3) * npix + s] = acc.w;
+}
+
+
 // Scatter channels k < Kb of a channel-fastest (Npix, Kstride) array into a
 // (Ktot, Npix) C-order array (the coefficients (K, Ny, Nx)) at channel offset k0 (the inverse of
 // gather_channels_k_fastest), tiled through local memory.
