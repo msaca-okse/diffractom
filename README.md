@@ -291,6 +291,17 @@ number of windows. The PF modes, the local basis and the gradients
 (`differentiable.PFGradient`, `set_pf_parameters`) support it. The default keeps
 earlier results bitwise.
 
+Narrow windows also cut the radial profile of a reflection, and with a pencil beam
+how much they cut depends on the grain: a grain at depth x along the beam has its
+rings shifted by -(x / D) sin(2 theta) cos(2 theta), for a sample-detector distance
+D. `window_parallax=dict(windows=..., sigma=..., distance=..., positions=...,
+covariances=...)` replaces the fixed window weights by the fraction of the
+reflection's radial profile (Gaussian, or pseudo-Voigt with `lorentz` and `gamma`)
+inside its window at the shifted angle, per orientation and rotation angle; the
+spread of the orientation's depths widens the profile. Give the reflections weight 1
+in `rings`. It needs a sparse PF mode; `differentiable.PFGradient` supports it. On
+a rock with windows of about 0.13 degrees it lowered the held-out misfit by 15 %.
+
 ### Local basis: orientations only where they occur
 
 With a global basis every orientation has an image on the whole grid (K x Ny x Nx

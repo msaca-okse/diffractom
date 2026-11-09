@@ -65,6 +65,8 @@ __kernel void pf_param_vjp(
     const float4 wpc = wp_cov[kg];
     const float wpx = wpq.x * wpb.x + wpq.y * wpb.y;
     const float wpv = wpc.x * wpb.x * wpb.x + 2.0f * wpc.y * wpb.x * wpb.y + wpc.z * wpb.y * wpb.y;
+    int wp_last = -1;                           // per row the fraction depends on the axis only
+    float wp_fr = 1.0f;
 #endif
     const float sinv = inv_sigma2[kg];
     const float sig = rsqrt(sinv);
@@ -115,7 +117,9 @@ __kernel void pf_param_vjp(
                     const float e1 = x1 < PF_CUT ? exp(-x1) : 0.0f;
                     const float e2 = x2 < PF_CUT ? exp(-x2) : 0.0f;
 #ifdef WINDOW_PARALLAX
-                    const float cw = w * axis_count[a] * wp_frac(wp_ax[a], wpx, wpv, wp_ch[p], wp_invD, wp_eta);
+                    if (e1 == 0.0f && e2 == 0.0f) continue;     // no contribution of this axis at this node
+                    if (a != wp_last) { wp_last = a; wp_fr = wp_frac(wp_ax[a], wpx, wpv, wp_ch[p], wp_invD, wp_eta); }
+                    const float cw = w * axis_count[a] * wp_fr;
 #else
                     const float cw = w * axis_count[a];
 #endif

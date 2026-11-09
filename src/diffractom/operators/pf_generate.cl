@@ -74,6 +74,8 @@ inline float pf_entry(__global const float *coords, __global const float *poles,
     const float wx = wq.x * wb.x + wq.y * wb.y;
     const float wvar = wc.x * wb.x * wb.x + 2.0f * wc.y * wb.x * wb.y + wc.z * wb.y * wb.y;
     const float2 wlh = wp_ch[p];
+    int wp_last = -1;                       // the fraction depends on the axis only here: evaluated once per axis that contributes
+    float wp_fr = 1.0f;
 #endif
     for (int s = 0; s < S; ++s) {
         for (int se = 0; se < S_eta; ++se) {
@@ -103,17 +105,20 @@ inline float pf_entry(__global const float *coords, __global const float *poles,
                 float e2 = (1.0f + d) * inv_sig2;
                 if (e2 < PF_CUT) t += exp(-e2);
 #ifdef WINDOW_PARALLAX
-                {
-                    const float4 aw = wp_ax[a];
-                    const float sh = aw.x - wx * wp_invD * aw.y;
-                    const float g = aw.y * wp_invD;
-                    const float is = rsqrt(2.0f * (aw.z + g * g * wvar));
-                    const float zh = (wlh.y - sh) * is, zl = (wlh.x - sh) * is;      // fraction in [lo, hi]; erfc in the tails
-                    float fr = (zl > 0.0f) ? 0.5f * (erfc(zl) - erfc(zh)) : (zh < 0.0f) ? 0.5f * (erfc(-zh) - erfc(-zl))
-                                                                    : 0.5f * (erf(zh) - erf(zl));
-                    if (wp_eta > 0.0f)                                   // pseudo-Voigt: a Lorentzian share (half width aw.w)
-                        fr = (1.0f - wp_eta) * fr + wp_eta * (atan((wlh.y - sh) / aw.w) - atan((wlh.x - sh) / aw.w)) * 0.31830988618f;
-                    t *= fr;
+                if (t > 0.0f) {
+                    if (a != wp_last) {
+                        const float4 aw = wp_ax[a];
+                        const float sh = aw.x - wx * wp_invD * aw.y;
+                        const float g = aw.y * wp_invD;
+                        const float is = rsqrt(2.0f * (aw.z + g * g * wvar));
+                        const float zh = (wlh.y - sh) * is, zl = (wlh.x - sh) * is;      // fraction in [lo, hi]; erfc in the tails
+                        float fr = (zl > 0.0f) ? 0.5f * (erfc(zl) - erfc(zh)) : (zh < 0.0f) ? 0.5f * (erfc(-zh) - erfc(-zl))
+                                                                        : 0.5f * (erf(zh) - erf(zl));
+                        if (wp_eta > 0.0f)                               // pseudo-Voigt: a Lorentzian share (half width aw.w)
+                            fr = (1.0f - wp_eta) * fr + wp_eta * (atan((wlh.y - sh) / aw.w) - atan((wlh.x - sh) / aw.w)) * 0.31830988618f;
+                        wp_fr = fr; wp_last = a;
+                    }
+                    t *= wp_fr;
                 }
 #endif
 #ifdef QUAD_WEIGHTED
