@@ -317,6 +317,19 @@ class ParallelRadon:
                       np.int32(self.Nx), np.int32(self.Ny), np.int32(self.Ns), np.int32(self.R),
                       np.int32(Kstride // 4), np.int32(k4), np.int32(n4))
 
+    def backward_list(self, sino_k, out, pix, rows, n_rows, Kstride, Kb):
+        """out (Kb, npix) = the backward projection of sino_k (R, Ns, Kstride) at the pixels pix (int32 device array,
+        p = x + Nx*y) over the projection angles rows (int32 device array, ascending, n_rows of them): the values of
+        backward() of the sinogram with the other angles' rows set to zero, at these pixels, bitwise."""
+        assert Kstride % 4 == 0, "Kstride must be a multiple of 4"
+        if getattr(self, "_bwd_l", None) is None:
+            self._bwd_l = cl.Kernel(self.prg, "radon_backward_list")
+        npix = int(pix.size)
+        K4 = Kstride // 4
+        self._bwd_l(self.queue, (_round_up(K4, 32), npix), (32, 1), sino_k.data, out.data, self.geo_gpu.data, pix.data,
+                    rows.data, np.int32(n_rows), np.int32(self.Nx), np.int32(self.Ns), np.int32(K4), np.int32(Kb),
+                    np.int32(npix))
+
     def _slices(self, Kstride, cpl):
         """(first, count) of the channel slices of cpl channels, in float4 units."""
         K4, c4 = Kstride // 4, min(cpl, Kstride) // 4

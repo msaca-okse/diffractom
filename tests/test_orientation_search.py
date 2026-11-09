@@ -63,6 +63,31 @@ def test_adjoint_multi_equals_masked_adjoints(pf_mode):
             assert np.array_equal(got[i, s], _adjoint(op, dm)), (pf_mode, i, s)
 
 
+@pytest.mark.parametrize("nrhs,rows_per_group", [(1, 24), (2, 7), (3, 12), (4, 12)])
+def test_adjoint_multi_pixels_and_groupings(nrhs, rows_per_group):
+    """The pixel-list back-projection over listed angles and every grouping of the products give the masked adjoint's
+    values at those pixels, bitwise."""
+    import pyopencl.array as clarray
+    from scipy.spatial.transform import Rotation
+    ctx, q = _context()
+    op = _operator(ctx, q, Rotation.random(40, random_state=4).as_matrix(), "generated")
+    rng = np.random.default_rng(5)
+    datas = [rng.normal(size=op.data_shape).astype(np.float32) for _ in range(3)]
+    fit = (np.arange(op.N_Omega) % 5) != 2
+    masks = [fit, ~fit, None]
+    pix = np.array([0, 5, 17, 40, 41, 100, 150, op.Nx * op.Ny - 1], np.int32)
+    got = np.zeros((len(datas), len(masks), op.K, len(pix)), np.float32)
+
+    def consume(i, s, k0, Kb, block):
+        got[i, s, k0:k0 + Kb] = block.get()[:Kb * len(pix)].reshape(Kb, len(pix))
+    op.adjoint_multi_cl([clarray.to_device(q, d) for d in datas], consume, row_masks=masks, pixels=pix, nrhs=nrhs,
+                        rows_per_group=rows_per_group)
+    for i, d in enumerate(datas):
+        for s, m in enumerate(masks):
+            dm = d if m is None else d * m[:, None, None].astype(np.float32)
+            assert np.array_equal(got[i, s], _adjoint(op, dm).reshape(op.K, -1)[:, pix]), (nrhs, i, s)
+
+
 def test_score_candidates_equals_reference():
     import pyopencl.array as clarray
     from scipy.spatial.transform import Rotation

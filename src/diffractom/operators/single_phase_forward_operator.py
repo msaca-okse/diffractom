@@ -2,6 +2,7 @@ from __future__ import annotations
 import numpy as np
 import time
 import gc
+from pathlib import Path
 from typing import Any, Mapping
 import pyopencl as cl
 import pyopencl.array as clarray
@@ -132,6 +133,26 @@ __kernel void zero_rows(__global float *data, __global const int *omegas, const 
 """
 SPARSE_BATCH_MAX = 1024  # largest batch of the sparse modes (sparse_batch_size)
 SPARSE_MIN_BATCHES = 4   # sparse modes: at least this many batches, if they hold at least the dense batch
+
+
+def _rotate_axes(rot, axes, block=2000):
+    """einsum("kij,aj->kai", rot, axes), on blocks of orientations in a thread pool (numpy releases the GIL)."""
+    rot = np.asarray(rot, dtype=np.float64)
+    K = len(rot)
+    if K <= block:
+        return np.einsum("kij,aj->kai", rot, axes)
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    out = np.empty((K, len(axes), 3), dtype=np.result_type(rot, axes))
+    try:
+        n = len(os.sched_getaffinity(0))
+    except AttributeError:
+        n = os.cpu_count() or 1
+    def run(lo):
+        out[lo:lo + block] = np.einsum("kij,aj->kai", rot[lo:lo + block], axes)
+    with ThreadPoolExecutor(max(1, min(8, n))) as ex:
+        list(ex.map(run, range(0, K, block)))
+    return out
 
 
 class SinglePhaseForwardOperator:
@@ -734,8 +755,9 @@ class SinglePhaseForwardOperator:
         assert np.all(np.diff(self.axis_start_cpu) > 0)
         assert np.allclose(np.add.reduceat(self.axis_count_cpu, self.axis_start_cpu[:-1]), len(sym))
 
-        # poles[k, a] = U_k @ axis_a, since dot(S_g h, U_k^-1 v) = dot(U_k S_g h, v)
-        poles = np.einsum("kij,aj->kai", self.grid_rot_cpu, axes)
+        # poles[k, a] = U_k @ axis_a, since dot(S_g h, U_k^-1 v) = dot(U_k S_g h, v); the same einsum on blocks of
+        # orientations in threads (each element is computed the same way: bitwise equal to one call)
+        poles = _rotate_axes(self.grid_rot_cpu, axes)
         self.poles_gpu = clarray.to_device(self.queue, np.ascontiguousarray(poles, dtype=np.float32))
         self.axis_start_gpu = clarray.to_device(self.queue, self.axis_start_cpu)
         self.axis_count_gpu = clarray.to_device(self.queue, self.axis_count_cpu)
@@ -1142,6 +1164,7 @@ class SinglePhaseForwardOperator:
         R = int(self.N_Omega)
         CP = int(self.N_eta * self.N_peaks)
         auto = mode == "auto"
+        self._batch_cand = {}
 
         # column indices are stored as 16 bit (orientation within a batch, segment)
         if self.K_batch_max > 65535 or CP > 65535:
@@ -1185,7 +1208,10 @@ class SinglePhaseForwardOperator:
         # larger batches than a dense PF batch allows; no dense batch buffer
         self._rebatch(self.sparse_batch_size(fill))
         gen = SparsePFGenerator(self, self.K_batch_max)
-        n_cand = gen.count_candidates(self.batches)
+        # generated mode keeps the candidate offsets of every batch when they fit (below): count and keep them in one pass
+        cache_now = mode == "generated" and (max_gb is None or gen.cache_bytes(self.batches) <= max_gb * 1024**3)
+        n_cand = gen.count_candidates(self.batches, cache=cache_now)
+        self._batch_cand = {int(b["k_start"]): (int(b["K_batch"]), int(n)) for b, n in zip(self.batches, n_cand)}  # generate(cap=)
         ratio = nnz0 / max(n0, 1)  # non-zeros per candidate
         nnz_est = [int(np.ceil(n * ratio)) for n in n_cand]
         nb = len(self.batches)
@@ -1334,7 +1360,10 @@ class SinglePhaseForwardOperator:
         sb = self.sparse_batches[ib]
         b = self.batches[ib]
         if sb is None:
-            return self.pf_gen.generate(b["k_start"], b["K_batch"], forward=forward)
+            # the batch's own candidate count bounds the per-candidate passes (the scratch is sized for the largest)
+            kn = getattr(self, "_batch_cand", {}).get(int(b["k_start"]))
+            cap = kn[1] if kn is not None and kn[0] == int(b["K_batch"]) else None
+            return self.pf_gen.generate(b["k_start"], b["K_batch"], forward=forward, cap=cap)
         if forward and "row_ptr_f" not in sb:
             return self.pf_gen.transpose(sb, b["K_batch"])
         return sb
@@ -1749,20 +1778,24 @@ class SinglePhaseForwardOperator:
             self._adjoint_batch(data, ib, out_batch, 0, self.K_batch_max)
             update(b["k_start"], b["K_batch"])
 
-    def adjoint_multi_cl(self, datas, consume, row_masks=(None,), batch_done=None):
+    def adjoint_multi_cl(self, datas, consume, row_masks=(None,), batch_done=None, pixels=None, nrhs=4, rows_per_group=12):
         """Several adjoints in one pass over the orientation batches, sharing each batch's PF matrix.
 
         For every orientation batch k0 .. k0+Kb-1 the PF matrix is made once (stored, or generated once) and its
-        transpose applied to every array in ``datas`` (all angle rows); each product is then back-projected once per
-        entry of ``row_masks`` (None: all rows; else an (N_Omega,) bool array of the rows that count) and handed to
-        ``consume(i, s, k0, Kb, img_k)``: data array i, row mask s, img_k = the batch image block (Nx*Ny, K_batch_max),
-        pixel-major (img_k[p, k], pixel p = x + Nx*y, columns k < Kb valid), overwritten by the next call.
-        ``batch_done(k0, Kb)`` follows every batch.
+        transpose applied to every array in ``datas`` (all angle rows; ``nrhs`` arrays per launch, reading the PF
+        entries once for all of them); each product is then back-projected once per entry of ``row_masks`` (None: all
+        rows; else an (N_Omega,) bool array of the rows that count) and handed to ``consume(i, s, k0, Kb, block)``:
+        data array i, row mask s. ``batch_done(k0, Kb)`` follows every batch.
+
+        pixels None: block = the batch image (Nx*Ny, K_batch_max), pixel-major (block[p, k], pixel p = x + Nx*y,
+        columns k < Kb valid). pixels = (npix,) flat pixel indices: only these pixels are back-projected, block =
+        (K_batch_max, npix) orientation-major (block[k, s] for pixel pixels[s], rows k < Kb valid), and the angles
+        outside a mask are skipped instead of zeroed. Blocks are overwritten by the next batch.
 
         consume(i, s, ...) receives the values adjoint_cl(datas[i] with the rows outside mask s set to zero) has for
-        these orientations, bitwise: the PF product of an angle row depends only on that row's data, and the other
-        rows reach the back-projection as zeros in both cases. The difference is the cost: the PF matrix is made once
-        for all len(datas) x len(row_masks) adjoints, and the product runs once per data array.
+        these orientations (and pixels), bitwise: the PF product of an angle row depends only on that row's data and is
+        summed in the same order for any nrhs / rows_per_group, and the other rows reach the back-projection as zeros
+        (or are skipped, which adds the same nothing).
 
         Needs pf_mode "sparse" or "generated", the native projector and the (K, Ny, Nx) coefficient layout.
         """
@@ -1775,6 +1808,7 @@ class SinglePhaseForwardOperator:
         R, My, Kmax = int(self.N_Omega), int(self.My), self.K_batch_max
         CP = int(self.N_eta * self.N_peaks)
         alpha = R / np.pi
+        q = self.queue
         masks = []
         for m in row_masks:
             if m is None:
@@ -1783,35 +1817,91 @@ class SinglePhaseForwardOperator:
             m = np.asarray(m, dtype=bool).reshape(-1)
             if m.size != R:
                 raise ValueError(f"a row mask needs {R} entries (one per rotation angle), not {m.size}")
-            masks.append(clarray.to_device(self.queue, m.astype(np.int8)))
-        sino_m = None
-        if any(m is not None for m in masks):
-            from pyopencl.elementwise import ElementwiseKernel
-            if getattr(self, "_k_mask_rows", None) is None:
-                self._k_mask_rows = ElementwiseKernel(self.ctx, "float *out, const float *inp, const char *keep, const long row",
-                                                      "out[i] = keep[i / row] ? inp[i] : 0.0f;", "mask_rows")
-            sino_m = clarray.empty(self.queue, self.coeffs_sino_C.shape, np.float32)
-        ls, chunk = self._spmm_setup()
-        jc = min(CP, chunk)
+            masks.append(m)
+        nrhs = max(1, min(int(nrhs), 4, len(datas)))
+        tym = max(1, int(rows_per_group))
+        if getattr(self, "_spmm_multi", None) is None:
+            self._spmm_multi = {}
+        key = (nrhs, tym)
+        if key not in self._spmm_multi:
+            src = (Path(__file__).with_name("spmm_multi.cl")).read_text()
+            prg = cl.Program(self.ctx, src).build(options=[f"-DNRHS={nrhs}", f"-DTYM={tym}"])
+            kern = cl.Kernel(prg, "spmm_pf_adjoint_multi")
+            ls = min(512, kern.get_work_group_info(cl.kernel_work_group_info.WORK_GROUP_SIZE, q.device))
+            ls = max(32, 1 << (ls.bit_length() - 1))
+            jc = max(32, min(CP, (min(44 * 1024, q.device.local_mem_size - 4096) // 4) // (nrhs * tym)))
+            self._spmm_multi[key] = (kern, min(ls, 256), jc)
+        kern, ls_m, jc_m = self._spmm_multi[key]
+        sinos = [self.coeffs_sino_C] + [clarray.empty(q, self.coeffs_sino_C.shape, np.float32) for _ in range(nrhs - 1)]
+        yr = None
+        if pixels is not None:
+            pix = clarray.to_device(q, np.ascontiguousarray(pixels, dtype=np.int32))
+            npix = int(pix.size)
+            # detector positions the listed pixels can read at each angle (with a margin of 3 bins: a superset of the
+            # kernel's taps); the products of the other positions are never read, so they are not computed
+            geo = self.radon.geo_gpu.get().reshape(-1, 4).astype(np.float64)
+            pxy = np.asarray(pixels, np.int64)
+            xs, ys = (pxy % int(self.Nx)).astype(np.float64), (pxy // int(self.Nx)).astype(np.float64)
+            t = geo[:, :1] * xs[None] + geo[:, 1:2] * ys[None] + geo[:, 2:3]
+            hw = 0.5 * (1.0 + np.maximum(np.abs(geo[:, 0]), np.abs(geo[:, 1])))
+            lo = np.floor(t.min(axis=1) - np.maximum(hw, 1.0)) - 3
+            hi = np.floor(t.max(axis=1) + np.maximum(hw, 1.0)) + 3
+            yr = clarray.to_device(q, np.ascontiguousarray(np.stack([np.clip(lo, 0, My - 1), np.clip(hi, 0, My - 1)], 1).astype(np.int32)))
+            rows = [clarray.to_device(q, (np.arange(R) if m is None else np.nonzero(m)[0]).astype(np.int32)) for m in masks]
+            n_rows = [R if m is None else int(m.sum()) for m in masks]
+            blocks = [[clarray.empty(q, (Kmax * npix,), np.float32) for _ in masks] for _ in range(nrhs)]
+        else:
+            sino_m = None
+            if any(m is not None for m in masks):
+                from pyopencl.elementwise import ElementwiseKernel
+                if getattr(self, "_k_mask_rows", None) is None:
+                    self._k_mask_rows = ElementwiseKernel(self.ctx, "float *out, const float *inp, const char *keep, const long row",
+                                                          "out[i] = keep[i / row] ? inp[i] : 0.0f;", "mask_rows")
+                sino_m = clarray.empty(q, self.coeffs_sino_C.shape, np.float32)
+            masks_d = [None if m is None else clarray.to_device(q, m.astype(np.int8)) for m in masks]
         for ib, b in enumerate(self.batches):
             k0, Kb = b["k_start"], b["K_batch"]
             sb = self._pf_batch(ib, forward=False)          # made once for all the data arrays of this batch
-            for i, data in enumerate(datas):
-                self.k.spmm_pf_adjoint_c(
-                    self.queue, (-(-Kb // ls) * ls, -(-My // SPMM_TY), R), (ls, 1, 1),
-                    data.data, sb["row_ptr_a"].data, sb["col_j"].data, sb["val_a"].data, self.coeffs_sino_C.data,
-                    np.int32(R), np.int32(My), np.int32(Kb), np.int32(CP), np.int32(Kmax), np.float32(alpha),
-                    np.int32(jc), cl.LocalMemory(4 * SPMM_TY * jc))
-                for s, m in enumerate(masks):
-                    src = self.coeffs_sino_C
-                    if m is not None:
-                        self._k_mask_rows(sino_m, self.coeffs_sino_C, m, np.int64(My * Kmax))
-                        src = sino_m
-                    self.radon.backward(src, self._img_k, Kmax)
-                    consume(i, s, k0, Kb, self._img_k)
+            for g0 in range(0, len(datas), nrhs):
+                group = list(range(g0, min(g0 + nrhs, len(datas))))
+                ds = [datas[group[min(n, len(group) - 1)]].data for n in range(4)]
+                ss = [sinos[min(n, len(group) - 1)].data for n in range(4)]
+                if len(group) < nrhs:                       # a short last group: a kernel for its size
+                    kk = (len(group), tym)
+                    if kk not in self._spmm_multi:
+                        src = (Path(__file__).with_name("spmm_multi.cl")).read_text()
+                        prg = cl.Program(self.ctx, src).build(options=[f"-DNRHS={len(group)}", f"-DTYM={tym}"])
+                        k2 = cl.Kernel(prg, "spmm_pf_adjoint_multi")
+                        jc2 = max(32, min(CP, (min(44 * 1024, q.device.local_mem_size - 4096) // 4) // (len(group) * tym)))
+                        self._spmm_multi[kk] = (k2, ls_m, jc2)
+                    kern_g, ls_g, jc_g = self._spmm_multi[kk]
+                else:
+                    kern_g, ls_g, jc_g = kern, ls_m, jc_m
+                kern_g(q, (-(-Kb // ls_g) * ls_g, -(-My // tym), R), (ls_g, 1, 1), *ds, sb["row_ptr_a"].data,
+                       sb["col_j"].data, sb["val_a"].data, *ss, np.int32(R), np.int32(My), np.int32(Kb), np.int32(CP),
+                       np.int32(Kmax), np.float32(alpha), np.int32(jc_g), cl.LocalMemory(4 * len(group) * tym * jc_g),
+                       (yr if yr is not None else sb["row_ptr_a"]).data, np.int32(yr is not None))
+                for n, i in enumerate(group):
+                    for s_, m in enumerate(masks):
+                        if pixels is not None:
+                            self.radon.backward_list(sinos[n], blocks[n][s_], pix, rows[s_], n_rows[s_], Kmax, Kb)
+                            consume(i, s_, k0, Kb, blocks[n][s_])
+                        else:
+                            src_ = sinos[n]
+                            if m is not None:
+                                self._k_mask_rows(sino_m, sinos[n], masks_d[s_], np.int64(My * Kmax))
+                                src_ = sino_m
+                            self.radon.backward(src_, self._img_k, Kmax)
+                            consume(i, s_, k0, Kb, self._img_k)
             if batch_done is not None:
                 batch_done(k0, Kb)
-        if sino_m is not None:
+        for a_ in sinos[1:]:
+            a_.base_data.release()
+        if pixels is not None:
+            for row in blocks:
+                for a_ in row:
+                    a_.base_data.release()
+        elif sino_m is not None:
             sino_m.base_data.release()
 
     def _adjoint_batch(self, data, ib, target, k_target, K_target, subset=None):

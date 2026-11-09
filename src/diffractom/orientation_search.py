@@ -19,8 +19,8 @@ statistics and model errors.
 ``score_candidates`` scores a list of candidate orientations (e.g. a uniform grid over the fundamental zone) in chunks,
 for several (e, d) pairs at once (e.g. real and scrambled) and several row sets (fitted / held-out angles), and keeps
 per pixel the ``top_k`` candidates with the largest z on the first row set. Each chunk's operator makes its PF matrix
-once for all inputs (``SinglePhaseForwardOperator.adjoint_multi_cl``); the result equals separate adjoints of the
-row-masked inputs bitwise.
+once for all inputs and back-projects only the scored pixels (``SinglePhaseForwardOperator.adjoint_multi_cl``); the
+result equals separate adjoints of the row-masked inputs bitwise.
 """
 from __future__ import annotations
 
@@ -34,13 +34,18 @@ from .utils.arrays import check_device
 
 __all__ = ["poisson_score_inputs", "scramble_eta", "score_candidates"]
 
-_GATHER = r"""
-__kernel void gather_pixels(__global const float *img, __global const int *pix, __global float *out,
-                            const int npix, const int Kb, const int Kstride)
-{   // out[k, s] = img[pix[s], k] for k < Kb  (img: (Npix, Kstride) pixel-major, out: (Kb, npix))
-    const int s = get_global_id(0), k = get_global_id(1);
-    if (s >= npix || k >= Kb) return;
-    out[(long)k * npix + s] = img[(long)pix[s] * Kstride + k];
+_SCORE = r"""
+// z = E / sqrt(max(D, 1e-30)), 0 where D <= 0: the host's float32 expression (correctly rounded division and square
+// root, NaN propagated as numpy.maximum does), so the scores equal the host's bitwise
+__kernel void score_z(__global const float *E, __global const float *D, __global float *Z, const int n)
+{
+    const int i = get_global_id(0);
+    if (i >= n) return;
+    const float d = D[i];
+    const float m = (d != d) ? d : fmax(d, 1e-30f);
+    float z = E[i] / sqrt(m);
+    if (d <= 0.0f) z = 0.0f;
+    Z[i] = z;
 }
 """
 
@@ -62,19 +67,26 @@ def scramble_eta(a, n_eta, n_channels, block=12, seed=1, margin=10, mask=None):
     the azimuth of every channel turned by a random number of bins (margin .. n_eta - margin) per block of ``block``
     rotation angles. Breaks the link between orientation and pattern, keeps the counting statistics. mask: optional
     array multiplied in (e.g. the segment weights > 0)."""
+    from concurrent.futures import ThreadPoolExecutor
     No = a.shape[0]
     shifts = np.random.default_rng(seed).integers(margin, n_eta - margin, size=(No // block + 1, n_channels))
     out = np.empty_like(a)
-    for b_ in range(0, No, block):
+
+    def run(b_):                      # every block of rows is its own permutation copy (blocks in threads: same values)
         s = shifts[b_ // block]
         perm = np.empty(n_eta * n_channels, np.int64)
         for r in range(n_channels):
             perm[np.arange(n_eta) * n_channels + r] = ((np.arange(n_eta) + s[r]) % n_eta) * n_channels + r
         out[b_:b_ + block] = a[b_:b_ + block][:, :, perm]
-    return out if mask is None else out * mask
+        if mask is not None:
+            out[b_:b_ + block] *= mask
+    with ThreadPoolExecutor(8) as ex:
+        list(ex.map(run, range(0, No, block)))
+    return out
 
 
-def score_candidates(make_operator, rotations, inputs, row_masks, pixels, top_k=64, chunk=30000, verbose=False):
+def score_candidates(make_operator, rotations, inputs, row_masks, pixels, top_k=64, chunk=30000, verbose=False,
+                     reuse_operator=True, nrhs=4, rows_per_group=16, gpu_scores=True):
     """Score test of candidate orientations per pixel; keep the best ``top_k`` per pixel.
 
     Parameters
@@ -88,13 +100,24 @@ def score_candidates(make_operator, rotations, inputs, row_masks, pixels, top_k=
     row_masks : list of (N_Omega,) bool arrays: the angle rows of each score (e.g. fitted, held-out). Candidates are
         ranked by the first.
     pixels : (npix,) flat pixel indices (x + Nx * y) of the operator's image to score.
-    top_k, chunk : candidates kept per pixel; candidates per operator.
+    top_k, chunk : candidates kept per pixel; at most this many candidates per operator.
+    reuse_operator : build the operator once and move it to the next chunk's orientations (set_pf_parameters). A last
+        chunk at most 10 % shorter is padded with copies of its last orientation (their scores are dropped); a shorter one
+        gets its own operator. The chunks are always those of ``chunk``, so exactly tied scores are ordered the same way. Needs candidates that
+        share the operator's kernel widths; False calls make_operator for every chunk. Same scores either way.
+    nrhs, rows_per_group : how adjoint_multi_cl splits the products (speed only; the scores do not change).
+    gpu_scores : compute z on the GPU (correctly rounded division and square root: the host's values bitwise) and copy
+        only z to the host (half the transfers); False computes it on the host.
 
     Returns
     -------
     list (one per input pair) of dicts: "idx" (npix, top_k) int32 candidate indices (-1: none), "z" (n_rows, npix,
     top_k) float32 (z[0] ranks, descending).
+
+    The selection (score test, top-k per pixel of each chunk merged with the kept ones) runs on the host in a worker
+    thread while the GPU scores the next chunk; the result is the same as computing every chunk in turn.
     """
+    from concurrent.futures import ThreadPoolExecutor
     rotations = np.asarray(rotations, np.float64)
     K_all = len(rotations)
     pixels = np.asarray(pixels, np.int32)
@@ -102,46 +125,94 @@ def score_candidates(make_operator, rotations, inputs, row_masks, pixels, top_k=
     top = [(np.full((npix, top_k), -1, np.int32), [np.full((npix, top_k), -np.inf, np.float32)] +
             [np.zeros((npix, top_k), np.float32) for _ in range(nr - 1)]) for _ in range(ni)]
     t0 = time.perf_counter()
-    prg = None
-    for c0 in range(0, K_all, chunk):
-        Rc = rotations[c0:c0 + chunk]
-        K = len(Rc)
-        op = make_operator(Rc)
-        q = op.queue
-        if prg is None or prg.context != op.ctx:
-            prg = cl.Program(op.ctx, _GATHER).build()
-            k_gather = cl.Kernel(prg, "gather_pixels")
-            pix_d = clarray.to_device(q, pixels)
-        datas = [a for pair in inputs for a in pair]
-        for a in datas:
-            check_device(a, op.data_shape, "input")
-        # host blocks (K, npix) per (data array, row mask), as one adjoint per masked input would give
-        host = [[np.empty((K, npix), np.float32) for _ in range(nr)] for _ in datas]
-        buf = clarray.empty(q, (op.K_batch_max * npix,), np.float32)
 
-        def consume(i, s, k0, Kb, img_k):
-            k_gather(q, (-(-npix // 64) * 64, Kb), (64, 1), img_k.data, pix_d.data, buf.data,
-                              np.int32(npix), np.int32(Kb), np.int32(op.K_batch_max))
-            cl.enqueue_copy(q, host[i][s][k0:k0 + Kb], buf.data, is_blocking=True)
+    def merge_rows(host, K, c0, j, p0, p1):
+        """The selection of input pair j for pixels p0..p1 (every pixel's own computation, as for all pixels at once)."""
+        z = []
+        for s in range(nr):
+            if gpu_scores:
+                z.append(host[j][s][:K, p0:p1])
+                continue
+            e_, d_ = host[2 * j][s][:K, p0:p1], host[2 * j + 1][s][:K, p0:p1]
+            zz = e_ / np.sqrt(np.maximum(d_, 1e-30))
+            zz[d_ <= 0] = 0
+            z.append(zz)
+        i0, z0 = top[j]
+        cand_i = np.concatenate([i0[p0:p1], np.tile((np.arange(K) + c0)[:, None].T, (p1 - p0, 1))], axis=1)
+        cand_z = [np.concatenate([z0[s][p0:p1], z[s].T], axis=1) for s in range(nr)]
+        o_ = np.argpartition(-cand_z[0], top_k - 1, axis=1)[:, :top_k]
+        return (np.take_along_axis(cand_i, o_, 1).astype(np.int32),
+                [np.take_along_axis(cand_z[s], o_, 1).astype(np.float32) for s in range(nr)])
 
-        op.adjoint_multi_cl(datas, consume, row_masks=row_masks)
-        buf.base_data.release()
-        for j in range(ni):
-            E_, D_ = host[2 * j], host[2 * j + 1]
-            z = []
-            for s in range(nr):
-                zz = E_[s] / np.sqrt(np.maximum(D_[s], 1e-30))
-                zz[D_[s] <= 0] = 0
-                z.append(zz)
-            i0, z0 = top[j]
-            cand_i = np.concatenate([i0, np.tile((np.arange(K) + c0)[:, None].T, (npix, 1))], axis=1)
-            cand_z = [np.concatenate([z0[s], z[s].T], axis=1) for s in range(nr)]
-            o_ = np.argpartition(-cand_z[0], top_k - 1, axis=1)[:, :top_k]
-            top[j] = (np.take_along_axis(cand_i, o_, 1).astype(np.int32),
-                      [np.take_along_axis(cand_z[s], o_, 1).astype(np.float32) for s in range(nr)])
-        del op, host
-        if verbose:
-            print(f"  candidates {c0}..{c0 + K} scored ({time.perf_counter() - t0:.0f} s)", flush=True)
+    try:
+        n_thr = max(1, min(8, len(__import__("os").sched_getaffinity(0))))
+    except AttributeError:
+        n_thr = 4
+    blocks_p = [(p, min(p + -(-npix // n_thr), npix)) for p in range(0, npix, -(-npix // n_thr))]
+
+    def merge(host, K, c0):
+        with ThreadPoolExecutor(n_thr) as pool:
+            for j in range(ni):
+                parts = list(pool.map(lambda pb: merge_rows(host, K, c0, j, *pb), blocks_p))
+                top[j] = (np.concatenate([p_[0] for p_ in parts]), [np.concatenate([p_[1][s] for p_ in parts]) for s in range(nr)])
+
+    op = None
+    pending = None
+    score_prg = {}
+    with ThreadPoolExecutor(1) as worker:
+        for c0 in range(0, K_all, chunk):
+            Rc = rotations[c0:c0 + chunk]
+            K = len(Rc)
+            if op is None or not reuse_operator or op.K - K > op.K // 10:
+                # a fresh operator (the first, or a last chunk much shorter than the others: padding it would waste
+                # more than building one)
+                op = None
+                op = make_operator(Rc)
+            else:
+                from .differentiable.update import set_pf_parameters
+                Rp = Rc if K == op.K else np.concatenate([Rc, np.repeat(Rc[-1:], op.K - K, axis=0)])
+                set_pf_parameters(op, rotations=Rp)
+            q = op.queue
+            datas = [a for pair in inputs for a in pair]
+            for a in datas:
+                check_device(a, op.data_shape, "input")
+            if pending is not None:          # at most two chunks' host blocks at a time
+                pending.result()
+            if gpu_scores:
+                host = [[np.empty((op.K, npix), np.float32) for _ in range(nr)] for _ in range(ni)]
+                if score_prg.get("ctx") is not op.ctx:
+                    prg_ = cl.Program(op.ctx, _SCORE).build(options=["-cl-fp32-correctly-rounded-divide-sqrt"])
+                    score_prg.update(ctx=op.ctx, k=cl.Kernel(prg_, "score_z"),
+                                     e=[clarray.empty(q, (op.K_batch_max * npix,), np.float32) for _ in range(nr)],
+                                     z=clarray.empty(q, (op.K_batch_max * npix,), np.float32))
+                if score_prg["e"][0].size < op.K_batch_max * npix:
+                    score_prg["e"] = [clarray.empty(q, (op.K_batch_max * npix,), np.float32) for _ in range(nr)]
+                    score_prg["z"] = clarray.empty(q, (op.K_batch_max * npix,), np.float32)
+
+                def consume(i, s, k0, Kb, block, host=host):
+                    n = Kb * npix
+                    if i % 2 == 0:       # E: keep it until its D arrives (another group may reuse the block)
+                        cl.enqueue_copy(q, score_prg["e"][s].data, block.data, byte_count=4 * n)
+                        return
+                    score_prg["k"](q, (-(-n // 256) * 256,), (256,), score_prg["e"][s].data, block.data,
+                                   score_prg["z"].data, np.int32(n))
+                    cl.enqueue_copy(q, host[i // 2][s][k0:k0 + Kb], score_prg["z"].data, is_blocking=True)
+            else:
+                host = [[np.empty((op.K, npix), np.float32) for _ in range(nr)] for _ in datas]
+
+                def consume(i, s, k0, Kb, block, host=host):
+                    cl.enqueue_copy(q, host[i][s][k0:k0 + Kb], block.data, is_blocking=True)
+
+            op.adjoint_multi_cl(datas, consume, row_masks=row_masks, pixels=pixels, nrhs=nrhs,
+                                rows_per_group=rows_per_group)
+            pending = worker.submit(merge, host, K, c0)
+            if not reuse_operator:
+                del op
+                op = None
+            if verbose:
+                print(f"  candidates {c0}..{c0 + K} scored ({time.perf_counter() - t0:.0f} s)", flush=True)
+        if pending is not None:
+            pending.result()
     out = []
     for i_, z_ in top:
         o_ = np.argsort(-z_[0], axis=1)

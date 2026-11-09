@@ -151,12 +151,20 @@ class SparsePFGenerator:
                 a.base_data.release()
         self.ptr_cache = {}
 
-    def count_candidates(self, batches, sub=None):
-        """Number of candidates of every batch (reads them back; for sizing); sub: of the rows of these angles."""
-        out = []
-        for b in batches:
+    def count_candidates(self, batches, sub=None, cache=False):
+        """Number of candidates of every batch (for sizing; read back once for all batches); sub: of the rows of these
+        angles. cache: also keep the candidate offsets of the batches (as cache_counts, from the same counting pass)."""
+        if not batches:
+            return []
+        totals = clarray.empty(self.q, (len(batches),), np.int32)
+        for ib, b in enumerate(batches):
             n_rows, ptr = self._sub_offsets(b["k_start"], b["K_batch"], sub)
-            out.append(int(ptr[n_rows:n_rows + 1].get()[0]))
+            cl.enqueue_copy(self.q, totals.data, ptr.data, byte_count=4, src_offset=4 * n_rows, dst_offset=4 * ib)
+            k0 = int(b["k_start"])
+            if cache and sub is None and k0 not in self.ptr_cache:
+                self.ptr_cache[k0] = (int(b["K_batch"]), ptr[:n_rows + 1].copy())
+        out = [int(v) for v in totals.get()]
+        totals.base_data.release()
         return out
 
     def _sub_offsets(self, k0, Kb, sub=None):
