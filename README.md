@@ -331,17 +331,17 @@ phase). Not supported: streaming (not needed), projectors other than the native 
 ### Searching the residual for missing orientations
 
 A basis built from indexing or from a bulk texture misses crystals. `diffractom.orientation_search`
-looks for them in the residual of a fit: for every candidate orientation (e.g. a uniform grid over
-the fundamental zone) and every pixel of a coarse image grid it computes the Poisson score test
+looks for them in the residual of a fit. For every candidate orientation (e.g. a uniform grid over the
+fundamental zone) and every pixel of a coarse image grid it computes the Poisson score test
 z = (A^T e) / sqrt(A^T d), with e = w/g (b/mu - 1) and d = w/(g mu) from the data b, the fit's
-prediction mu, the gain g and the weights w (`poisson_score_inputs`), and keeps the best candidates
-per pixel (`score_candidates`). A real crystal scores high on the fitted angles and on held-out angles;
-the same residual with its azimuths scrambled (`scramble_eta`) gives the size of z that orientation-free
-structure reaches. Candidates that pass go into the basis and the model is refitted.
+prediction mu, the gain g and the weights w (`poisson_score_inputs`). A real crystal scores high on
+the fitted angles and on held-out angles; the same residual with its azimuths scrambled (`scramble_eta`)
+gives the size of z that structure without an orientation reaches.
 
 ```python
 import pyopencl.array as cl_array
-from diffractom.orientation_search import poisson_score_inputs, scramble_eta, score_candidates
+from diffractom.orientation_search import (poisson_score_inputs, scramble_eta, score_candidates,
+                                           select_candidates, refine_candidates, candidate_support)
 
 e, d = poisson_score_inputs(b, mu, gain, weights)
 e0, d0 = scramble_eta(e, N_eta, N_rings), scramble_eta(d, N_eta, N_rings)
@@ -351,11 +351,22 @@ dev = [cl_array.to_device(queue, a) for a in (e, d, e0, d0)]
 fitted = (np.arange(N_Omega) // 5) % 5 != 2
 real, null = score_candidates(make_op, grid_rotations, [(dev[0], dev[1]), (dev[2], dev[3])],
                               [fitted, ~fitted], pixels)
+found = select_candidates(real, null, grid_rotations, pixels, (Ny_coarse, Nx_coarse), symmetry,
+                          ratio=1.5, min_tiles=1)
+found = refine_candidates(make_local_operator, found, e, d, fitted, tile_size, (Ny, Nx))
+k, iy, ix = candidate_support(found, tile_size, (Ny, Nx), dilate=4)     # voxels for a LocalSupport
 ```
+
+Added orientations cost little in the fit, so a liberal selection (`ratio=1.5, min_tiles=1`) with the joint
+fit deciding finds more crystals than a strict one (`ratio=2, min_tiles=2`), and as many as a much finer
+search grid. Start the added orientations with narrow kernels and let the Gauss-Newton steps set their width
+(the score test cannot choose a width); with kernels several times wider than the spots most small crystals
+are lost in the refit, even when their exact orientations are known. After the fit `orientation_weights`
+and `prune_added` drop the additions it left empty.
 
 Each chunk of candidates makes its PF matrix once for all inputs and row sets
 (`SinglePhaseForwardOperator.adjoint_multi_cl`), with the same values as one adjoint per masked input:
-on a V100, 30 000 candidates against two (e, d) pairs and two row sets took 50 s instead of 147 s.
+on a V100, 30 000 candidates against two (e, d) pairs and two row sets took 27 s instead of 147 s.
 
 ## License
 

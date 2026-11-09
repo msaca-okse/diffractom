@@ -25,14 +25,19 @@ result equals separate adjoints of the row-masked inputs bitwise.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import pyopencl as cl
 import pyopencl.array as clarray
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial.transform import Rotation
 
 from .utils.arrays import check_device
 
-__all__ = ["poisson_score_inputs", "scramble_eta", "score_candidates"]
+__all__ = ["poisson_score_inputs", "scramble_eta", "score_candidates", "Candidates", "select_candidates", "refine_candidates",
+           "candidate_support", "orientation_weights", "prune_added"]
 
 _SCORE = r"""
 // z = E / sqrt(max(D, 1e-30)), 0 where D <= 0: the host's float32 expression (correctly rounded division and square
@@ -218,3 +223,249 @@ def score_candidates(make_operator, rotations, inputs, row_masks, pixels, top_k=
         o_ = np.argsort(-z_[0], axis=1)
         out.append({"idx": np.take_along_axis(i_, o_, 1), "z": np.stack([np.take_along_axis(a, o_, 1) for a in z_])})
     return out
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# From the per-pixel top lists to candidates of the basis
+# ---------------------------------------------------------------------------------------------------------------------
+@dataclass
+class Candidates:
+    """Orientations proposed by the search: rotations (n, 3, 3), score (n,) (sum of the fitted z of their tile peaks),
+    tiles (list of n arrays: flat indices x + Nx y in the scoring image, shape ``tile_shape`` = (Ny, Nx))."""
+    rotations: np.ndarray
+    score: np.ndarray
+    tiles: list
+    tile_shape: tuple
+
+    def __len__(self):
+        return len(self.rotations)
+
+    def subset(self, keep):
+        keep = np.asarray(keep)
+        idx = np.nonzero(keep)[0] if keep.dtype == bool else keep
+        return Candidates(self.rotations[idx], self.score[idx], [self.tiles[i] for i in idx], self.tile_shape)
+
+
+def _proper_rotations(symmetry):
+    """(G, 4) quaternions (x, y, z, w) of the proper rotations of a point group given as matrices (G, 3, 3) (improper ones
+    are dropped) or a scipy Rotation."""
+    if isinstance(symmetry, Rotation):
+        return symmetry.as_quat()
+    m = np.asarray(symmetry, np.float64).reshape(-1, 3, 3)
+    return Rotation.from_matrix(m[np.linalg.det(m) > 0]).as_quat()
+
+
+def _equivalents(q, S):
+    """(n, G, 4): q (n, 4) times every symmetry rotation on the crystal side (quaternions x, y, z, w)."""
+    x1, y1, z1, w1 = np.moveaxis(q[:, None], -1, 0)
+    x2, y2, z2, w2 = np.moveaxis(S[None], -1, 0)
+    return np.stack([w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2, w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                     w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2, w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2], axis=-1)
+
+
+def _close(qa, Qb, cos_half):
+    """(len(qa), len(Qb)) bool: misorientation below the angle whose cos(angle / 2) is cos_half. Qb: equivalents (m, G, 4)."""
+    return np.abs(np.einsum("ac,bgc->abg", qa, Qb)).max(axis=2) > cos_half
+
+
+def select_candidates(real, null, rotations, pixels, tile_shape, symmetry, ratio=2.0, sep_deg=8.0, link_deg=5.0, max_per_tile=3,
+                      min_tiles=2):
+    """Candidates from the per-pixel top lists of ``score_candidates``.
+
+    A peak of a tile counts if its fitted z (row set 0) is at least ``ratio`` x the best z of the null in that tile and
+    its z on the other row set (held-out angles) reaches the null's best there; a tile keeps at most ``max_per_tile`` peaks,
+    ``sep_deg`` apart. Peaks of neighbouring tiles (8-neighbourhood) within ``link_deg`` form one candidate, with the
+    orientation of its strongest peak; candidates spanning fewer than ``min_tiles`` tiles are dropped.
+
+    A strict selection (ratio 2, min_tiles 2) keeps the false candidates few. Because added orientations cost little in the
+    fit, a liberal one (e.g. ratio 1.5, min_tiles 1) with the joint fit deciding finds more crystals.
+
+    real, null : dicts of score_candidates ("idx" (npix, top_k), "z" (n_rows, npix, top_k)); rotations: the candidate list
+    they index; pixels: (npix,) flat indices of the scoring image (shape tile_shape = (Ny, Nx)); symmetry: proper rotations
+    of the crystal (matrices or scipy Rotation). Returns Candidates, the largest score first.
+    """
+    pixels = np.asarray(pixels, np.int64)
+    idx, z0, z1 = real["idx"], real["z"][0], real["z"][1]
+    null0, null1 = null["z"][0].max(axis=1), null["z"][1].max(axis=1)
+    ok = (idx >= 0) & (z0 >= ratio * null0[:, None]) & (z1 >= null1[:, None])
+    Ny, Nx = tile_shape
+    empty = Candidates(np.zeros((0, 3, 3)), np.zeros(0), [], tuple(tile_shape))
+    if not ok.any():
+        return empty
+    uniq, inv = np.unique(idx[ok], return_inverse=True)
+    q = Rotation.from_matrix(np.asarray(rotations, np.float64)[uniq]).as_quat()
+    Q = _equivalents(q, _proper_rotations(symmetry))
+    cos_sep, cos_link = np.cos(np.deg2rad(sep_deg) / 2), np.cos(np.deg2rad(link_deg) / 2)
+    uidx = np.full(idx.shape, -1, np.int64)
+    uidx[ok] = inv
+    # peaks of every tile: greedy in rank order, sep_deg apart
+    per_tile = {}
+    for t in np.nonzero(ok.any(axis=1))[0]:
+        rk = np.nonzero(ok[t])[0]
+        u = uidx[t, rk]
+        near = _close(q[u], Q[u], cos_sep)
+        got = []
+        for i in range(len(rk)):
+            if not near[i, got].any():
+                got.append(i)
+                if len(got) >= max_per_tile:
+                    break
+        per_tile[int(pixels[t])] = (u[got], z0[t, rk[got]], len(per_tile))
+    # peaks of neighbouring tiles within link_deg are linked
+    off = np.cumsum([0] + [len(v[0]) for v in per_tile.values()])
+    start = {p: off[v[2]] for p, v in per_tile.items()}
+    ei, ej = [], []
+    for p, (u, _, _) in per_tile.items():
+        y, x = p // Nx, p % Nx
+        for dy, dx in ((0, 0), (0, 1), (1, -1), (1, 0), (1, 1)):
+            y2, x2 = y + dy, x + dx
+            if not (0 <= y2 < Ny and 0 <= x2 < Nx):
+                continue
+            p2 = int(y2) * Nx + int(x2)
+            if p2 not in per_tile:
+                continue
+            u2 = per_tile[p2][0]
+            a, b = np.nonzero(_close(q[u], Q[u2], cos_link))
+            ei.append(start[p] + a)
+            ej.append(start[p2] + b)
+    n = int(off[-1])
+    ei, ej = np.concatenate(ei), np.concatenate(ej)
+    _, lab = connected_components(coo_matrix((np.ones(len(ei), bool), (ei, ej)), shape=(n, n)), directed=False)
+    us = np.concatenate([v[0] for v in per_tile.values()])
+    zs = np.concatenate([v[1] for v in per_tile.values()]).astype(np.float64)
+    ts = np.repeat(list(per_tile.keys()), [len(v[0]) for v in per_tile.values()])
+    order = np.argsort(lab, kind="stable")
+    bounds = np.r_[0, np.nonzero(np.diff(lab[order]))[0] + 1, n]
+    rot, score, tiles = [], [], []
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        g = order[a:b]
+        tl = np.unique(ts[g])
+        if len(tl) >= min_tiles:
+            rot.append(uniq[us[g[np.argmax(zs[g])]]])
+            score.append(zs[g].sum())
+            tiles.append(tl)
+    if not rot:
+        return empty
+    o = np.argsort(-np.array(score), kind="stable")
+    return Candidates(np.asarray(rotations, np.float64)[np.array(rot)[o]], np.array(score)[o], [tiles[i] for i in o], tuple(tile_shape))
+
+
+def _tile_voxels(tile, tile_shape, tile_size, shape):
+    """(iy, ix) of the image voxels of tiles (flat indices of the scoring image); tile_size voxels per tile edge."""
+    ty, tx = tile // tile_shape[1], tile % tile_shape[1]
+    a, b = np.meshgrid(np.arange(tile_size), np.arange(tile_size), indexing="ij")
+    iy = (ty[:, None] * tile_size + a.ravel()[None]).ravel()
+    ix = (tx[:, None] * tile_size + b.ravel()[None]).ravel()
+    ok = (iy < shape[0]) & (ix < shape[1])
+    return iy[ok], ix[ok]
+
+
+DEFAULT_LEVELS = ((1.25, 6.0, 1.0), (0.4, 1.6, 0.4))
+
+
+def refine_candidates(make_local_operator, candidates, e, d, row_mask, tile_size, shape, levels=DEFAULT_LEVELS, verbose=False):
+    """Move every candidate to the best orientation of finer lattices around it.
+
+    At each level (spacing, radius, sigma in degrees) the rotation vectors of a cubic lattice (spacing) within radius are
+    applied to the candidate on the crystal side, and the score test z = sum E / sqrt(sum D) over the candidate's voxels
+    (fitted angles) picks the best. The score cannot choose a kernel width (it grows as the kernel narrows, because it is
+    normalised by A^T d, not (A^2)^T d): start the added orientations narrow and let the fit's Gauss-Newton steps set the width.
+
+    make_local_operator(rotations, sigmas (radians), k, iy, ix) -> a LocalSinglePhaseForwardOperator (possibly wrapped) with
+    these orientations on the pairs (k, iy, ix). e, d: (N_Omega, My, N_seg) NumPy arrays in that operator's data space.
+    row_mask: (N_Omega,) bool, the fitted angles. tile_size: voxels per tile edge of the scoring image; shape (Ny, Nx) of the
+    image. Returns new Candidates (same tiles, refined rotations).
+    """
+    if len(candidates) == 0:
+        return candidates
+    n = len(candidates)
+    R = np.asarray(candidates.rotations, np.float64).copy()
+    mask = np.asarray(row_mask, np.float32)[:, None, None]
+    em, dm = (np.ascontiguousarray(a * mask, np.float32) for a in (e, d))
+    vox = [_tile_voxels(t, candidates.tile_shape, tile_size, shape) for t in candidates.tiles]
+
+    def scores(rots, sigs, rep):
+        """z per entry of rots; rep (len(rots),): the candidate of each entry."""
+        ks, iys, ixs = [], [], []
+        order = np.argsort(rep, kind="stable")
+        start = np.searchsorted(rep[order], np.arange(n + 1))
+        for j in range(n):
+            cj = order[start[j]:start[j + 1]]
+            iy, ix = vox[j]
+            ks.append(np.repeat(cj, len(iy)))
+            iys.append(np.tile(iy, len(cj)))
+            ixs.append(np.tile(ix, len(cj)))
+        k, iy, ix = (np.concatenate(a) for a in (ks, iys, ixs))
+        op = make_local_operator(rots, sigs, k, iy, ix)
+        q = op.queue
+
+        def adj(arr):
+            a = clarray.to_device(q, arr)
+            g = clarray.zeros(q, op.coeff_shape, np.float32)
+            op.adjoint_cl(a, g)
+            kk, _, _, v = op.to_coo(g)
+            a.base_data.release()
+            g.base_data.release()
+            return np.bincount(kk, weights=v.astype(np.float64), minlength=len(rots))
+        E, D = adj(em), adj(dm)
+        del op
+        return E / np.sqrt(np.maximum(D, 1e-30))
+
+    def best_per(rep, z):
+        order = np.lexsort((-z, rep))
+        return order[np.searchsorted(rep[order], np.arange(n))]
+
+    for spacing, radius, sig in levels:
+        m = int(np.ceil(radius / spacing))
+        gv = np.stack(np.meshgrid(*[np.arange(-m, m + 1) * spacing] * 3, indexing="ij"), -1).reshape(-1, 3)
+        gv = gv[np.linalg.norm(gv, axis=1) <= radius + 1e-9]
+        dR = Rotation.from_rotvec(np.deg2rad(gv)).as_matrix()
+        rots = (R[:, None] @ dR[None]).reshape(-1, 3, 3)
+        rep = np.repeat(np.arange(n), len(gv))
+        z = scores(rots, np.full(len(rots), np.deg2rad(sig)), rep)
+        R = rots[best_per(rep, z)]
+        if verbose:
+            print(f"  level {spacing} deg (sigma {sig}): {len(rots)} orientations", flush=True)
+    return Candidates(R, candidates.score, candidates.tiles, candidates.tile_shape)
+
+
+def candidate_support(candidates, tile_size, shape, dilate=0, mask=None):
+    """(k, iy, ix) of the voxels of every candidate (k = its index): its tiles, grown by ``dilate`` voxels and cut to the
+    (Ny, Nx) bool ``mask`` if given, as a LocalSupport needs them."""
+    from scipy import ndimage as ndi
+    ks, iys, ixs = [], [], []
+    for j, t in enumerate(candidates.tiles):
+        iy, ix = _tile_voxels(t, candidates.tile_shape, tile_size, shape)
+        im = np.zeros(shape, bool)
+        im[iy, ix] = True
+        if dilate:
+            im = ndi.binary_dilation(im, iterations=int(dilate))
+        if mask is not None:
+            im &= mask
+        y, x = np.nonzero(im)
+        ks.append(np.full(len(y), j, np.int64))
+        iys.append(y)
+        ixs.append(x)
+    return tuple(np.concatenate(a) if a else np.zeros(0, np.int64) for a in (ks, iys, ixs))
+
+
+def orientation_weights(coefficients, k=None):
+    """Total coefficient of every orientation: from a dense (K, Ny, Nx) array, or, with k, from the values and orientation
+    indices of a local basis (to_coo)."""
+    c = np.asarray(coefficients, np.float64)
+    if k is not None:
+        return np.bincount(np.asarray(k), weights=np.maximum(c, 0))
+    return np.maximum(c, 0).reshape(c.shape[0], -1).sum(axis=1)
+
+
+def prune_added(weights, n_old, rel=0.1):
+    """Bool (len(weights),): keep the first n_old orientations and the added ones with a total weight of at least ``rel`` x
+    the median of the added ones that received any: after the joint fit, orientations it left (almost) empty go."""
+    w = np.asarray(weights, np.float64)
+    keep = np.ones(len(w), bool)
+    add = w[n_old:]
+    if (add > 0).any():
+        keep[n_old:] = add >= rel * np.median(add[add > 0])
+    else:
+        keep[n_old:] = False
+    return keep
