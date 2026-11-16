@@ -198,6 +198,13 @@ Three solvers minimise it, all for non-negative coefficients (`prox_kind`
   preconditioned, no line search).
 - `FISTAPoisson`: FISTA in a diagonal (separable quadratic surrogate) metric
   with backtracking, because the likelihood has no global Lipschitz constant.
+- `OSEMPoisson(op, subsets=M)`: expectation maximization (ordered subsets of
+  the angles; `subsets=None` is MLEM). The update is multiplicative, so there is
+  no step size; it cannot move a coefficient that is zero (`start_floor` lifts
+  the start) and does not converge exactly with many subsets. On dense problems
+  where many orientations overlap in every column it can beat SPDHG: on a
+  phyllite slice 10 OSEM epochs lowered the held-out deviance from 45.6 to 41.7,
+  more than SPDHG with Gauss-Newton steps (42.06). Coefficients stay on the GPU.
 
 `run(x0, b, ..., gain=..., background=..., weights=...)`. A NumPy `x0` keeps
 the coefficient arrays in host memory and streams them through the GPU (build
@@ -251,6 +258,41 @@ that do not fit on the GPU (x, z = A^T y, the step sizes; `resident="auto"`)
 stay in host memory and are streamed through it. Passing lists of angle indices
 that leave some angles out fits the others only (e.g. to hold angles out for
 validation). The local-basis operator below has subsets too.
+
+### Held-out evaluation, scale factors and orientation refinement
+
+Model choices are compared on rotation angles the fit did not see.
+`diffractom.evaluation.block_split(N_Omega)` holds out every fifth block of 5
+angles, `interleaved_subsets(fitted, M)` makes solver subsets of the rest, and
+`poisson_deviance(b, A x, gain=..., weights=..., background=..., rows=~fitted,
+per_point=True)` is the held-out deviance per data point (lower is better; a
+perfect model gives about 0.5 at high counts).
+
+```python
+from diffractom import OSEMPoisson, SPDHGPoisson, em_scales, LocalSupport
+from diffractom.differentiable import OrientationRefiner
+from diffractom.evaluation import block_split, interleaved_subsets, poisson_deviance
+
+fitted = block_split(N_Omega)
+subs = interleaved_subsets(fitted, 8)
+x = SPDHGPoisson(op, subsets=subs).run(x, b, 30, gain=gain, weights=weights)
+# Gauss-Newton steps on every orientation's rotation and kernel width, each followed by a refit
+ref = OrientationRefiner(op, b, gain=gain, weights=weights, fit_rows=fitted, max_rot_deg=0.2, sigma_min_deg=0.1)
+x = ref.run(x, lambda x: SPDHGPoisson(op, subsets=subs).run(x, b, 20, gain=gain, weights=weights), n_steps=6)
+held_out = poisson_deviance(b, op.direct(x), gain=gain, weights=weights, rows=~fitted, per_point=True)
+```
+
+- `OrientationRefiner` takes damped Gauss-Newton steps per orientation (rotation and width, from the
+  `PFGradient` blocks), limited to a trust region, with a line search at fixed coefficients. It needs
+  `pf_mode` "sparse" or "generated". On Al1050 it predicted the held-out angles 2.3 % better than an
+  equally long fit without it (docs/differentiable_model.md).
+- `em_scales(queue, [A_1 x_1, A_2 x_2, ...], b, channels=window_of_segment, ties=...)` fits a scale per
+  component and channel by EM, with the components fixed: phase intensity shares, window scales shared
+  by all phases (`ties`), per-phase window scales, a background level. Fit them on the fitted angles
+  (`rows=fitted`).
+- `LocalSupport.from_coefficients(x_global, top=3, dilate=2)` turns a fit with a global basis (a uniform
+  10-15 degree grid or a bulk-ODF basis) into a local basis: the largest orientations of every voxel,
+  grown by 2 voxels.
 
 ### Ring intensities from structure factors
 

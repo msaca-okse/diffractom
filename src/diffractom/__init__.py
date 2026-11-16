@@ -18,6 +18,8 @@ from .optimization.fista_l2 import FISTAL2
 from .optimization.fista_poisson import FISTAPoisson
 from .optimization.pdhg_poisson import PDHGPoisson
 from .optimization.spdhg_poisson import SPDHGPoisson
+from .optimization.osem_poisson import OSEMPoisson
+from .optimization.em_scales import em_scales
 from .optimization.orientation_tree import OrientationTree
 from .optimization.fista_sum import FISTASum, estimate_L_sum
 from .optimization.streaming import estimate_L_power_streamed
@@ -52,6 +54,8 @@ __all__ = [
     "FISTAPoisson",
     "PDHGPoisson",
     "SPDHGPoisson",
+    "OSEMPoisson",
+    "em_scales",
     "OrientationTree",
     "FISTASum",
     "estimate_L_sum",

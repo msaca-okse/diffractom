@@ -94,6 +94,46 @@ class LocalSupport:
         sup = cls(ks, np.repeat(np.asarray(iy), n), np.repeat(np.asarray(ix), n), K, shape)
         return sup.dilate(dilate) if dilate > 0 else sup
 
+    @classmethod
+    def from_coefficients(cls, coeffs, top=3, rel=0.0, dilate=2, mask=None, min_voxel=0.0, chunk_elems=50_000_000):
+        """From a fit with a global (or coarse) basis: orientation k is allowed in voxel (iy, ix) if its coefficient
+        there is positive, among the `top` largest of the voxel, and at least rel x the voxel's largest, in voxels
+        whose largest coefficient is at least min_voxel x the largest of all (empty voxels get none); then each
+        orientation's voxels are grown by `dilate` voxels (a disc) and cut to the (Ny, Nx) bool mask if given. This
+        is how the rock fits (DanMAX 2026) went from a global fit on a uniform 10-15 deg grid or a bulk-ODF basis to a
+        local basis (top 3, grown by 2 voxels), before Gauss-Newton steps and the residual search; Al1050
+        (localdiff/refine_local.py): top 3, rel 0.05, min_voxel 1e-3, dilate 2.
+
+        coeffs : (K, Ny, Nx) dense coefficients (NumPy), the basis order of the new operator's grid.
+        """
+        c = np.asarray(coeffs)
+        if c.ndim != 3:
+            raise ValueError("coeffs must have shape (K, Ny, Nx)")
+        K, Ny, Nx = c.shape
+        top = max(1, min(int(top), K))
+        flat = c.reshape(K, -1)
+        npix = flat.shape[1]
+        step = max(1, int(chunk_elems) // K)
+        floor = float(min_voxel) * float(flat.max()) if min_voxel else 0.0
+        ks, ps = [], []
+        for p0 in range(0, npix, step):
+            blk = np.asarray(flat[:, p0:p0 + step], np.float32)
+            idx = np.argpartition(-blk, top - 1, axis=0)[:top] if top < K else \
+                np.broadcast_to(np.arange(K)[:, None], blk.shape)
+            vals = np.take_along_axis(blk, idx, axis=0)
+            vmax = blk.max(axis=0)
+            keep = (vals > 0) & (vals >= rel * vmax[None]) & (vmax[None] >= floor)
+            ks.append(idx[keep].astype(np.int64))
+            ps.append((np.broadcast_to(np.arange(blk.shape[1])[None], idx.shape)[keep] + p0).astype(np.int64))
+        k = np.concatenate(ks) if ks else np.zeros(0, np.int64)
+        p = np.concatenate(ps) if ps else np.zeros(0, np.int64)
+        sup = cls(k, p // Nx, p % Nx, K, (Ny, Nx))
+        if dilate > 0:
+            sup = sup.dilate(dilate)
+        if mask is not None:
+            sup = sup.restrict(mask)
+        return sup
+
     # ------------------------------------------------------------------ operations
 
     def dilate(self, radius):
