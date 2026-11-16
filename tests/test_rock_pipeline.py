@@ -25,6 +25,8 @@ def test_local_support_from_coefficients():
     assert sorted(zip(s.k.tolist(), s.iy.tolist(), s.ix.tolist())) == [(0, 1, 1), (1, 1, 1), (2, 3, 4), (3, 1, 1)]
     s = LocalSupport.from_coefficients(c, top=1, dilate=1)
     assert s.n_pairs == 10   # two discs of radius 1 (5 voxels each)
+    s = LocalSupport.from_coefficients(c, top=4, dilate=0, min_voxel=0.6)   # voxel (1, 1): largest 1.0 < 0.6 x 2.0
+    assert sorted(zip(s.k.tolist(), s.iy.tolist(), s.ix.tolist())) == [(2, 3, 4)]
 
 
 def test_poisson_term_matches_host_deviance():
